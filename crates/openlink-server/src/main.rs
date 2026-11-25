@@ -2,11 +2,14 @@
 //!
 //! Runs the headset session in the background and shows a settings/status window.
 //! `openlink --headless` runs the session without a window (for servers or debugging).
+//! `openlink --dump-video PATH` (Linux) also writes every encoded frame to PATH as raw H.265.
 
 mod config;
 mod encoder;
 mod gui;
 mod session;
+#[cfg(target_os = "linux")]
+mod video;
 
 use config::Settings;
 use session::{Session, Status};
@@ -15,7 +18,16 @@ use std::sync::{Arc, Mutex};
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let headless = std::env::args().any(|a| a == "--headless");
+    let args: Vec<String> = std::env::args().collect();
+    let headless = args.iter().any(|a| a == "--headless");
+    #[cfg(target_os = "linux")]
+    if let Some(i) = args.iter().position(|a| a == "--encode-selftest") {
+        if let Err(e) = video::selftest(&args[i + 1..]) {
+            log::error!("selftest: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let settings = Arc::new(Mutex::new(Settings::load()));
     let status = Arc::new(Mutex::new(Status::default()));
 
@@ -27,6 +39,22 @@ fn main() {
             log::error!("{msg}");
             status.lock().unwrap().last_error = Some(msg);
             None
+        }
+    };
+
+    #[cfg(target_os = "linux")]
+    let _video = {
+        let dump = args
+            .iter()
+            .position(|a| a == "--dump-video")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from);
+        match video::VideoService::start(status.clone(), settings.clone(), dump) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::error!("cannot listen for the driver's video link: {e}");
+                None
+            }
         }
     };
 

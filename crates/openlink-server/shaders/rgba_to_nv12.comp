@@ -1,0 +1,54 @@
+#version 450
+// Both eyes of a compositor frame -> one side-by-side NV12 frame (BT.709, limited range).
+// One invocation per chroma sample, i.e. per 2x2 block of luma.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D left_eye;
+layout(set = 0, binding = 1) uniform sampler2D right_eye;
+layout(set = 0, binding = 2, r8) uniform writeonly image2D y_plane;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D cbcr_plane;
+
+layout(push_constant) uniform Push {
+    // uMin, vMin, uMax, vMax of each eye's image within its texture.
+    vec4 bounds[2];
+    // Output pixels per eye; the frame is two of these side by side, then black padding up to
+    // the coded size.
+    ivec2 eye_size;
+} pc;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 sample_frame(ivec2 p) {
+    if (p.x >= 2 * pc.eye_size.x || p.y >= pc.eye_size.y) {
+        return vec3(0.0);
+    }
+    int eye = p.x >= pc.eye_size.x ? 1 : 0;
+    vec2 local = (vec2(p.x - eye * pc.eye_size.x, p.y) + 0.5) / vec2(pc.eye_size);
+    vec4 b = pc.bounds[eye];
+    vec2 uv = mix(b.xy, b.zw, local);
+    return eye == 0 ? textureLod(left_eye, uv, 0.0).rgb : textureLod(right_eye, uv, 0.0).rgb;
+}
+
+void main() {
+    ivec2 c = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(cbcr_plane);
+    if (c.x >= size.x || c.y >= size.y) {
+        return;
+    }
+    vec3 sum = vec3(0.0);
+    for (int dy = 0; dy < 2; dy++) {
+        for (int dx = 0; dx < 2; dx++) {
+            ivec2 p = 2 * c + ivec2(dx, dy);
+            vec3 rgb = sample_frame(p);
+            float y = dot(rgb, LUMA);
+            imageStore(y_plane, p, vec4((16.0 + 219.0 * y) / 255.0));
+            sum += rgb;
+        }
+    }
+    vec3 rgb = sum * 0.25;
+    float y = dot(rgb, LUMA);
+    float cb = (rgb.b - y) / 1.8556;
+    float cr = (rgb.r - y) / 1.5748;
+    imageStore(cbcr_plane, c, vec4((128.0 + 224.0 * cb) / 255.0, (128.0 + 224.0 * cr) / 255.0, 0.0, 0.0));
+}

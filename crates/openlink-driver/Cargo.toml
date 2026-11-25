@@ -14,3 +14,6 @@ openlink-protocol.workspace = true
 openlink-tracking.workspace = true
 glam.workspace = true
 log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

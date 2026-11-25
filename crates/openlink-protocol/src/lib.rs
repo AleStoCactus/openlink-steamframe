@@ -8,10 +8,15 @@
 //!   lives inside `vrserver` and never touches the network itself; it only receives tracking that
 //!   the server has already converted into the PC clock domain.
 //!
+//! * **driver -> server video** (Linux): [`video_ipc`], a Unix socket carrying the compositor's
+//!   dmabufs and per-frame metadata.
+//!
 //! Every datagram is `[MAGIC: 4][PROTOCOL_VERSION: u16 LE][postcard payload]`.
 
 pub mod clock;
 pub mod time;
+#[cfg(target_os = "linux")]
+pub mod video_ipc;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 

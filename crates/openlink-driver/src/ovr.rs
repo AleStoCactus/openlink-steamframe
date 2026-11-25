@@ -294,6 +294,38 @@ pub struct SubmitLayerPerEye_t {
     pub flHmdPosePredictionTimeInSecondsFromNow: f32,
 }
 
+pub const MaxDmabufPlaneCount: usize = 4;
+pub const VRApplication_Other: i32 = 0;
+pub const VRApplication_Scene: i32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DmabufPlane_t {
+    pub unOffset: u32,
+    pub unStride: u32,
+    /// Not consumed: SteamVR dups it.
+    pub nFd: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DmabufAttributes_t {
+    /// Must be null.
+    pub pNext: *mut c_void,
+    pub unWidth: u32,
+    pub unHeight: u32,
+    pub unDepth: u32,
+    pub unMipLevels: u32,
+    pub unArrayLayers: u32,
+    pub unSampleCount: u32,
+    /// `DRM_FORMAT_*`
+    pub unFormat: u32,
+    /// `DRM_FORMAT_MOD_*`
+    pub ulModifier: u64,
+    pub unPlaneCount: u32,
+    pub plane: [DmabufPlane_t; MaxDmabufPlaneCount],
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Throttling_t {
@@ -439,9 +471,21 @@ pub struct IVRIPCResourceManagerClient_Vtbl {
     pub RefResource:
         unsafe extern "C" fn(this: *mut Iface<Self>, handle: SharedTextureHandle_t, new_ipc: *mut u64) -> bool,
     pub UnrefResource: unsafe extern "C" fn(this: *mut Iface<Self>, handle: SharedTextureHandle_t) -> bool,
-    pub GetDmabufFormats: *const c_void,
-    pub GetDmabufModifiers: *const c_void,
-    pub ImportDmabuf: *const c_void,
+    pub GetDmabufFormats:
+        unsafe extern "C" fn(this: *mut Iface<Self>, count: *mut u32, formats: *mut u32) -> bool,
+    pub GetDmabufModifiers: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        app_type: i32,
+        drm_format: u32,
+        count: *mut u32,
+        modifiers: *mut u64,
+    ) -> bool,
+    pub ImportDmabuf: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        app_type: i32,
+        attrs: *mut DmabufAttributes_t,
+        out: *mut SharedTextureHandle_t,
+    ) -> bool,
     pub ReceiveSharedFd: unsafe extern "C" fn(this: *mut Iface<Self>, ipc: u64, out_fd: *mut i32) -> bool,
 }
 
@@ -570,6 +614,11 @@ mod layout {
         assert_eq!(offset_of!(SubmitLayerPerEye_t, mProjection), 32);
         assert_eq!(offset_of!(SubmitLayerPerEye_t, mHmdPose), 96);
         assert_eq!(offset_of!(SubmitLayerPerEye_t, flHmdPosePredictionTimeInSecondsFromNow), 144);
+        assert_eq!(size_of::<DmabufPlane_t>(), 12);
+        assert_eq!(size_of::<DmabufAttributes_t>(), 104);
+        assert_eq!(offset_of!(DmabufAttributes_t, ulModifier), 40);
+        assert_eq!(offset_of!(DmabufAttributes_t, unPlaneCount), 48);
+        assert_eq!(offset_of!(DmabufAttributes_t, plane), 52);
         assert_eq!(size_of::<Throttling_t>(), 8);
         assert_eq!(size_of::<DriverDirectMode_FrameTiming>(), 20);
         #[cfg(target_os = "linux")]

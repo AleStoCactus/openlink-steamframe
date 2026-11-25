@@ -151,6 +151,36 @@ impl Host {
         }
     }
 
+    /// DRM modifiers the compositor can render into for `drm_format` (`DRM_FORMAT_MOD_INVALID`
+    /// filtered out). Empty if unsupported.
+    pub fn dmabuf_modifiers(&self, drm_format: u32) -> Vec<u64> {
+        const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+        let Some(ipc) = self.ipc() else { return Vec::new() };
+        let mut n = 0u32;
+        // SAFETY: valid interface; Vulkan-style two-call enumeration.
+        unsafe {
+            if !call!(ipc, GetDmabufModifiers, VRApplication_Scene, drm_format, &mut n, std::ptr::null_mut()) {
+                return Vec::new();
+            }
+            let mut mods = vec![0u64; n as usize];
+            if !call!(ipc, GetDmabufModifiers, VRApplication_Scene, drm_format, &mut n, mods.as_mut_ptr()) {
+                return Vec::new();
+            }
+            mods.truncate(n as usize);
+            mods.retain(|&m| m != DRM_FORMAT_MOD_INVALID);
+            mods
+        }
+    }
+
+    /// Hands a dmabuf to SteamVR. The fds in `attrs` are dup'ed, not consumed.
+    pub fn import_dmabuf(&self, attrs: &mut DmabufAttributes_t) -> Option<SharedTextureHandle_t> {
+        let ipc = self.ipc()?;
+        let mut h = 0;
+        // SAFETY: valid interface, attributes and out pointer.
+        let ok = unsafe { call!(ipc, ImportDmabuf, VRApplication_Scene, attrs, &mut h) };
+        (ok && h != 0).then_some(h)
+    }
+
     pub fn vsync_event(&self, offset_s: f64) {
         // SAFETY: valid interface.
         unsafe { call!(self.server, VsyncEvent, offset_s) }
@@ -265,3 +295,4 @@ impl log::Log for VrLogger {
     }
     fn flush(&self) {}
 }
+

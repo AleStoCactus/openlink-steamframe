@@ -62,6 +62,7 @@ unsafe extern "C" fn debug_request(_: *mut c_void, _: *const c_char, resp: *mut 
 pub struct Hmd {
     vtable: &'static ITrackedDeviceServerDriver_Vtbl,
     display: DisplayObj,
+    #[cfg(target_os = "linux")]
     direct_mode: crate::direct_mode::DirectModeObj,
 }
 
@@ -84,6 +85,7 @@ impl Default for Hmd {
             display: DisplayObj {
                 vtable: &DISPLAY_VTBL,
             },
+            #[cfg(target_os = "linux")]
             direct_mode: crate::direct_mode::DirectModeObj::default(),
         }
     }
@@ -119,6 +121,7 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.set_bool(c, prop::DeviceIsWireless_Bool, true);
         h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, true);
         h.pose_updated(id, &DriverPose_t::disconnected());
+        #[cfg(target_os = "linux")]
         if use_direct_mode() {
             let vsync = crate::direct_mode::VsyncThread::start(|| shared().display.lock().unwrap().refresh_rate);
             *crate::VSYNC.lock().unwrap() = Some(vsync);
@@ -129,6 +132,7 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
 }
 
 unsafe extern "C" fn hmd_deactivate(_this: *mut c_void) {
+    #[cfg(target_os = "linux")]
     crate::VSYNC.lock().unwrap().take();
     shared()
         .hmd_id
@@ -140,6 +144,7 @@ unsafe extern "C" fn hmd_get_component(this: *mut c_void, name: *const c_char) -
         let hmd = this.cast::<Hmd>();
         return std::ptr::addr_of_mut!((*hmd).display).cast();
     }
+    #[cfg(target_os = "linux")]
     if component_is(name, IVRDriverDirectModeComponent_Version) && use_direct_mode() {
         let hmd = this.cast::<Hmd>();
         return std::ptr::addr_of_mut!((*hmd).direct_mode).cast();
