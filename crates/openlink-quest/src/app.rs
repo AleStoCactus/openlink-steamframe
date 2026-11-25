@@ -502,7 +502,7 @@ impl Stats {
     /// Every few seconds: logs, and returns a vsync shift (ns) that moves pictures' arrival
     /// to `TARGET_SLACK_MS` before they are needed.
     fn report(&mut self, client: Option<&Arc<Mutex<ClientState>>>) -> Option<i64> {
-        const TARGET_SLACK_MS: f32 = 4.0;
+        const TARGET_SLACK_MS: f32 = 6.0;
         let elapsed = self.since.elapsed().as_secs_f32();
         if elapsed < 5.0 {
             return None;
