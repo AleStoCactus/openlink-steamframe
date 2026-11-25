@@ -111,6 +111,8 @@ pub struct Shared {
     pub vsync_period_ns: std::sync::atomic::AtomicI64,
     /// Measured vsync-to-photon latency (microseconds) that controller poses are predicted over.
     pub photon_latency_us: AtomicU32,
+    /// A headset is streaming tracking (blocks SteamVR's standby).
+    pub tracking_active: std::sync::atomic::AtomicBool,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -129,6 +131,7 @@ pub fn shared() -> &'static Shared {
             prediction: PredictionConfig::default(),
             vsync_period_ns: std::sync::atomic::AtomicI64::new(0),
             photon_latency_us: AtomicU32::new(0),
+            tracking_active: std::sync::atomic::AtomicBool::new(false),
         }
     })
 }

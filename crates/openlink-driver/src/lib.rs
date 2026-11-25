@@ -153,8 +153,10 @@ unsafe extern "C" fn provider_run_frame(_this: *mut c_void) {
     })
 }
 
+/// While a headset streams tracking, SteamVR should not go to standby (it judges use by the
+/// head's motion, which reaches it with scaled-down velocity; see `link`).
 unsafe extern "C" fn provider_block_standby(_this: *mut c_void) -> bool {
-    false
+    state::shared().tracking_active.load(std::sync::atomic::Ordering::Acquire)
 }
 
 unsafe extern "C" fn provider_noop(_this: *mut c_void) {}

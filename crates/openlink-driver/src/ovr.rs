@@ -67,6 +67,7 @@ pub mod prop {
     pub const DeviceIsWireless_Bool: i32 = 1010;
     pub const DeviceIsCharging_Bool: i32 = 1011;
     pub const DeviceBatteryPercentage_Float: i32 = 1012;
+    pub const ContainsProximitySensor_Bool: i32 = 1025;
     pub const DeviceProvidesBatteryStatus_Bool: i32 = 1026;
     pub const InputProfilePath_String: i32 = 1037;
     pub const SecondsFromVsyncToPhotons_Float: i32 = 2001;

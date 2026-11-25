@@ -66,6 +66,8 @@ struct Texture {
 
 struct TextureSet {
     pid: u32,
+    /// Allocated for SteamVR's compositor (rather than an application).
+    compositor: bool,
     desc: SwapTextureSetDesc_t,
     drm_format: u32,
     textures: Vec<Texture>,
@@ -142,12 +144,20 @@ struct Compositor {
     next_frame_id: u64,
     frames_sent: u64,
     starved: u64,
+    /// Texture of the last streamed frame's left eye, and how many presents brought a new one
+    /// (a new frame from the game or compositor) versus repeated the last.
+    last_texture: SharedTextureHandle_t,
+    new_content: u32,
+    repeated_content: u32,
 }
 
 impl Default for Compositor {
     fn default() -> Self {
         Self {
             last_layer_shape: None,
+            last_texture: 0,
+            new_content: 0,
+            repeated_content: 0,
             sets: Vec::new(),
             pending: Vec::new(),
             presents: VecDeque::new(),
@@ -380,7 +390,8 @@ unsafe extern "C" fn create_swap_texture_set(
         with(|c| {
             // Only the compositor can use our GBM dmabufs: applications (e.g. games under
             // Proton) reject them, compressed or not, and ask again in an endless loop.
-            let dmabuf = if is_compositor(pid) { create_dmabuf_textures(c, &desc, true) } else { None };
+            let compositor = is_compositor(pid);
+            let dmabuf = if compositor { create_dmabuf_textures(c, &desc, true) } else { None };
             let (drm_format, textures) = match dmabuf {
                 Some(t) => t,
                 None => match create_steamvr_textures(&desc) {
@@ -396,7 +407,7 @@ unsafe extern "C" fn create_swap_texture_set(
                     }
                 },
             };
-            let set = TextureSet { pid, desc, drm_format, textures };
+            let set = TextureSet { pid, compositor: is_compositor(pid), desc, drm_format, textures };
             log::info!(
                 "swap texture set for pid {pid}: {}x{} format {} -> {:x?} ({})",
                 desc.nWidth,
@@ -534,7 +545,30 @@ unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHan
                 log::info!("layers this frame (left/right texture index, streamable): {layout:x?}");
                 c.last_layer_shape = Some(shape);
             }
-            if let Some(base) = layers.iter().find(|l| l.iter().all(|e| streamable(e.hTexture))) {
+            // The scene is the largest application layer. Applications also submit small extra
+            // layers (Beat Saber a 16x16 one), and the compositor's own layer then holds only
+            // overlays: streaming "the first readable layer" showed those, every few frames.
+            // Without an application, the compositor's layer is the scene.
+            let area = |s: &TextureSet| s.desc.nWidth as u64 * s.desc.nHeight as u64;
+            let eye_area = c.sets.iter().filter(|s| s.compositor).map(area).max().unwrap_or(0);
+            let rank = |h: SharedTextureHandle_t| {
+                c.sets.iter().find(|s| s.textures.iter().any(|t| t.handle == h)).map_or((false, 0), |s| {
+                    // An application layer is the scene only if it is eye-sized (a game's
+                    // placeholder layers while it loads are tiny).
+                    (!s.compositor && area(s) * 4 >= eye_area, area(s))
+                })
+            };
+            if let Some(base) = layers
+                .iter()
+                .filter(|l| l.iter().all(|e| streamable(e.hTexture)))
+                .max_by_key(|l| rank(l[0].hTexture))
+            {
+                if base[0].hTexture == c.last_texture {
+                    c.repeated_content += 1;
+                } else {
+                    c.new_content += 1;
+                    c.last_texture = base[0].hTexture;
+                }
                 send_frame(c, base, now_ns);
             }
             c.layer_counts.push_back(layers.len());
@@ -547,6 +581,15 @@ unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHan
             }
             let due = c.last_log.is_none_or(|t| now - t > Duration::from_secs(5));
             if due {
+                if let Some(t) = c.last_log {
+                    let secs = (now - t).as_secs_f32();
+                    log::info!(
+                        "content: {:.1} new frames/s, {:.1} repeats/s (the streamed layer's texture unchanged since the last present)",
+                        c.new_content as f32 / secs,
+                        c.repeated_content as f32 / secs
+                    );
+                }
+                (c.new_content, c.repeated_content) = (0, 0);
                 c.last_log = Some(now);
             }
             due

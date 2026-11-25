@@ -7,7 +7,7 @@ use crate::devices::{self, to_ovr_pose};
 use crate::host::host;
 use crate::ovr::{k_unTrackedDeviceIndexInvalid, DriverPose_t};
 use crate::state::{shared, DisplayConfig};
-use openlink_protocol::{self as proto, time::monotonic_ns, FromDriver, Hand, MotionFlags, ToDriver};
+use openlink_protocol::{self as proto, time::monotonic_ns, FromDriver, Hand, ToDriver};
 use openlink_tracking::{controller_raw_from_grip, to_driver_pose, ControllerModel};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,10 +94,14 @@ fn run(socket: UdpSocket, server: SocketAddr, stop: Arc<AtomicBool>) {
         if last_tracking.is_some_and(|t| t.elapsed() > TRACKING_TIMEOUT) {
             log::info!("tracking timed out; marking devices disconnected");
             last_tracking = None;
+            shared().tracking_active.store(false, Ordering::Release);
             report_disconnected();
         }
     }
 }
+
+/// What SteamVR is told of the head's velocity (see the head in `handle`).
+const HMD_VELOCITY_SCALE: f64 = 0.01;
 
 /// Share of the measured photon latency controllers are predicted over.
 const CONTROLLER_PREDICTION: f64 = 0.6;
@@ -120,10 +124,12 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
         }
         ToDriver::HeadsetDisconnected => {
             *last_tracking = None;
+            s.tracking_active.store(false, Ordering::Release);
             report_disconnected();
         }
         ToDriver::Tracking(sample) => {
             *last_tracking = Some(Instant::now());
+            s.tracking_active.store(true, Ordering::Release);
             let h = host();
             let now = monotonic_ns();
             let model = *s.controller_model.lock().unwrap();
@@ -132,15 +138,17 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
             // An invalid head sample carries no pose (identity, at the floor): SteamVR has been
             // seen rendering an eye from it anyway. Keep the last good head pose instead.
             if hmd_id != k_unTrackedDeviceIndexInvalid && sample.hmd.flags.is_valid() {
-                // The head is reported without velocity, so SteamVR does not extrapolate it.
-                // SteamVR samples the head pose more than once per frame (the pose it reports
-                // for a frame is not always the one it rendered with); with velocities, each new
-                // sample re-predicts and the two drift apart frame to frame, which the headset
-                // sees as world jitter. Without them the frame's reported pose is the latest
-                // sample, and the headset's reprojection corrects the head's motion since.
-                let mut hmd = sample.hmd;
-                hmd.flags.0 &= !(MotionFlags::LINEAR_VELOCITY_VALID | MotionFlags::ANGULAR_VELOCITY_VALID);
-                let st = to_driver_pose(&hmd, None, sample.sample_time_ns, now, &s.prediction);
+                // The head's velocity is reported scaled right down, so SteamVR practically does
+                // not extrapolate it: SteamVR samples the head pose more than once per frame
+                // (the pose it reports for a frame is not the one it rendered with), and with
+                // real velocities each new sample re-predicts and the two drift apart frame to
+                // frame, which the headset sees as world jitter. The headset predicts the head
+                // itself and its reprojection corrects the rest.
+                // Not zero: with zero velocity and a fast-moving pose SteamVR kept putting the
+                // headset into standby (frames dropped to 0, then black) mid-game.
+                let mut st = to_driver_pose(&sample.hmd, None, sample.sample_time_ns, now, &s.prediction);
+                st.velocity *= HMD_VELOCITY_SCALE;
+                st.angular_velocity *= HMD_VELOCITY_SCALE;
                 crate::render_pose::record(now, st.position.as_vec3(), st.rotation.as_quat());
                 h.pose_updated(hmd_id, &to_ovr_pose(&st));
             }
@@ -213,4 +221,5 @@ fn report_disconnected() {
         h.pose_updated(id, &DriverPose_t::disconnected());
     }
 }
+
 
