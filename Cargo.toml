@@ -6,6 +6,7 @@ members = [
     "crates/openlink-driver",
     "crates/openlink-server",
     "crates/openlink-client",
+    "crates/openlink-quest",
 ]
 
 [workspace.package]

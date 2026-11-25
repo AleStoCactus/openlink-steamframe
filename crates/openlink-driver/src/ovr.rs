@@ -135,6 +135,18 @@ impl HmdQuaternion_t {
     };
 }
 
+/// `vr::TrackedDevicePose_t`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrackedDevicePose_t {
+    pub mDeviceToAbsoluteTracking: [[f32; 4]; 3],
+    pub vVelocity: [f32; 3],
+    pub vAngularVelocity: [f32; 3],
+    pub eTrackingResult: i32,
+    pub bPoseIsValid: bool,
+    pub bDeviceIsConnected: bool,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DriverPose_t {
@@ -382,7 +394,12 @@ pub struct IVRServerDriverHost_Vtbl {
     pub IsExiting: unsafe extern "C" fn(this: *mut Iface<Self>) -> bool,
     pub PollNextEvent:
         unsafe extern "C" fn(this: *mut Iface<Self>, ev: *mut VREvent_t, size: u32) -> bool,
-    pub GetRawTrackedDevicePoses: *const c_void,
+    pub GetRawTrackedDevicePoses: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        predicted_seconds_from_now: f32,
+        poses: *mut TrackedDevicePose_t,
+        count: u32,
+    ),
     pub RequestRestart: *const c_void,
     pub GetFrameTimings: *const c_void,
     pub SetDisplayEyeToHead: *const c_void,

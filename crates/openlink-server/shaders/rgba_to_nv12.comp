@@ -27,7 +27,23 @@ vec3 sample_frame(ivec2 p) {
     vec2 local = (vec2(p.x - eye * pc.eye_size.x, p.y) + 0.5) / vec2(pc.eye_size);
     vec4 b = pc.bounds[eye];
     vec2 uv = mix(b.xy, b.zw, local);
-    return eye == 0 ? textureLod(left_eye, uv, 0.0).rgb : textureLod(right_eye, uv, 0.0).rgb;
+    // The eye textures are larger than the output (SteamVR supersamples). One bilinear tap
+    // per output pixel would alias (shimmering edges, crawling grid lines), so average four
+    // taps spread over the pixel's footprint: a tent filter about 2 source texels wide.
+    vec2 q = 0.25 * (b.zw - b.xy) / vec2(pc.eye_size);
+    vec3 c = vec3(0.0);
+    if (eye == 0) {
+        c += textureLod(left_eye, uv + vec2(-q.x, -q.y), 0.0).rgb;
+        c += textureLod(left_eye, uv + vec2(q.x, -q.y), 0.0).rgb;
+        c += textureLod(left_eye, uv + vec2(-q.x, q.y), 0.0).rgb;
+        c += textureLod(left_eye, uv + vec2(q.x, q.y), 0.0).rgb;
+    } else {
+        c += textureLod(right_eye, uv + vec2(-q.x, -q.y), 0.0).rgb;
+        c += textureLod(right_eye, uv + vec2(q.x, -q.y), 0.0).rgb;
+        c += textureLod(right_eye, uv + vec2(-q.x, q.y), 0.0).rgb;
+        c += textureLod(right_eye, uv + vec2(q.x, q.y), 0.0).rgb;
+    }
+    return c * 0.25;
 }
 
 void main() {

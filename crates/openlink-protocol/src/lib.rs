@@ -23,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -235,6 +235,22 @@ pub enum HeadsetMessage {
     VideoLoss {
         frame: u32,
     },
+    /// A video frame reached the display for the first time. `present_ns` is echoed from
+    /// [`video::FrameInfo`] (server clock); the rest are headset clock: frame complete off the
+    /// network, handed to the decoder, decoded, photons. Together they give the true
+    /// present-to-photon latency and where it goes.
+    FrameDisplayed {
+        present_ns: i64,
+        received_ns: i64,
+        queued_ns: i64,
+        decoded_ns: i64,
+        display_ns: i64,
+    },
+    /// The display's measured frame period (headset clock), more exact than its nominal rate.
+    /// SteamVR is paced to it so frames are produced exactly as fast as they are shown.
+    DisplayPeriod {
+        period_ns: i64,
+    },
     Disconnect,
 }
 
@@ -265,6 +281,15 @@ pub enum ToDriver {
         left: f32,
         right: f32,
         charging: bool,
+    },
+    /// Measured time from `Present` to photons on the headset. SteamVR predicts poses this far
+    /// past vsync, so what the user sees matches where things are when they see it.
+    PhotonLatency {
+        seconds: f32,
+    },
+    /// Pace SteamVR's vsync to this period (the headset display's measured one).
+    DisplayPeriod {
+        period_ns: i64,
     },
 }
 

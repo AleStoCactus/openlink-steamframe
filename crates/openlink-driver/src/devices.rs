@@ -123,7 +123,14 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.pose_updated(id, &DriverPose_t::disconnected());
         #[cfg(target_os = "linux")]
         if use_direct_mode() {
-            let vsync = crate::direct_mode::VsyncThread::start(|| shared().display.lock().unwrap().refresh_rate);
+            let vsync = crate::direct_mode::VsyncThread::start(|| {
+                let measured = shared().vsync_period_ns.load(Ordering::Acquire);
+                if measured > 0 {
+                    (1e9 / measured as f64) as f32
+                } else {
+                    shared().display.lock().unwrap().refresh_rate
+                }
+            });
             *crate::VSYNC.lock().unwrap() = Some(vsync);
         }
         log::info!("HMD activated as device {id} (direct mode: {})", use_direct_mode());
@@ -258,6 +265,16 @@ unsafe extern "C" fn disp_inverse_distortion(
 ) -> bool {
     (*out).v = [u, v];
     true
+}
+
+/// How far past vsync SteamVR predicts poses: the measured present-to-photon latency.
+pub fn set_photon_latency(seconds: f32) {
+    let id = shared().hmd_id.load(Ordering::Acquire);
+    if id == k_unTrackedDeviceIndexInvalid {
+        return;
+    }
+    let h = host();
+    h.set_f32(h.container(id), prop::SecondsFromVsyncToPhotons_Float, seconds.clamp(0.0, 0.2));
 }
 
 /// Push new display parameters (from the headset's Hello) to SteamVR at runtime.

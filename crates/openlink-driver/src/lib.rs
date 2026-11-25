@@ -14,6 +14,7 @@ mod gbm;
 pub mod host;
 pub mod link;
 pub mod ovr;
+pub mod render_pose;
 pub mod state;
 #[cfg(target_os = "linux")]
 mod video;

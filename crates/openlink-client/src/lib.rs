@@ -94,6 +94,8 @@ impl Client {
                             let mut st = rx_state.lock().unwrap();
                             if st.welcome.is_none() {
                                 log::info!("server accepted us: {cfg:?}");
+                                // A new session: its video starts over.
+                                reassembler.restart();
                             }
                             st.welcome = Some(cfg);
                         }
@@ -121,6 +123,11 @@ impl Client {
     /// Complete, decodable video frames (starting at an IDR), oldest first. Can be taken once.
     pub fn video_frames(&mut self) -> Option<Receiver<video::Frame>> {
         self.video.take()
+    }
+
+    /// For the render thread: reports when frames reach the display.
+    pub fn frame_reporter(&self) -> std::io::Result<FrameReporter> {
+        Ok(FrameReporter { sock: self.sock.try_clone()? })
     }
 
     /// Live session state (welcome, video statistics), shared with the receive thread.
@@ -192,8 +199,9 @@ fn on_video(
             let frame = reassembler.stats.lost_frames as u32;
             let _ = sock.send(&proto::encode(&HeadsetMessage::VideoLoss { frame }));
         }
-        Err(video::Event::Pending) => return,
+        Err(video::Event::Pending) => {}
     }
+    // Published on every datagram: drops while waiting for an IDR must be visible too.
     state.lock().unwrap().video = reassembler.stats;
 }
 
@@ -218,4 +226,52 @@ fn set_recv_buffer(sock: &UdpSocket, bytes: i32) {
     }
     #[cfg(not(unix))]
     let _ = (sock, bytes);
+}
+
+/// Finds a server on the LAN: broadcasts `Hello` until one answers with `Welcome`, for up to
+/// `timeout`. The server then simply sees the real client's `Hello` as a reconnect.
+pub fn discover(info: &HeadsetInfo, timeout: Duration) -> std::io::Result<Option<SocketAddr>> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_broadcast(true)?;
+    sock.set_read_timeout(Some(Duration::from_millis(250)))?;
+    let hello = proto::encode(&HeadsetMessage::Hello(info.clone()));
+    let target = SocketAddr::from(([255, 255, 255, 255], proto::SERVER_PORT));
+    let start = Instant::now();
+    let mut buf = [0u8; 2048];
+    while start.elapsed() < timeout {
+        sock.send_to(&hello, target)?;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    if let Ok(ServerMessage::Welcome(_)) = proto::decode::<ServerMessage>(&buf[..n]) {
+                        let _ = sock.send_to(&proto::encode(&HeadsetMessage::Disconnect), from);
+                        return Ok(Some(from));
+                    }
+                }
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Tells the server when video frames actually reach the display, so it can measure the
+/// present-to-photon latency SteamVR should predict across.
+pub struct FrameReporter {
+    sock: UdpSocket,
+}
+
+impl FrameReporter {
+    /// The display's measured frame period, headset clock.
+    pub fn display_period(&self, period_ns: i64) {
+        let _ = self.sock.send(&proto::encode(&HeadsetMessage::DisplayPeriod { period_ns }));
+    }
+
+    /// `present_ns` from the frame's info; the rest on this device's monotonic clock.
+    pub fn displayed(&self, present_ns: i64, received_ns: i64, queued_ns: i64, decoded_ns: i64, display_ns: i64) {
+        let msg = HeadsetMessage::FrameDisplayed { present_ns, received_ns, queued_ns, decoded_ns, display_ns };
+        let _ = self.sock.send(&proto::encode(&msg));
+    }
 }

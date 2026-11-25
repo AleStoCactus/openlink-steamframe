@@ -38,7 +38,9 @@ impl Default for Settings {
             codec: CodecPreference::Auto,
             encoder: crate::encoder::BackendPreference::Auto,
             bitrate_mbps: 200,
-            resolution_scale: 1.0,
+            // Per-eye size relative to the headset's recommended one. Quest runtimes recommend
+            // less than panel resolution (Quest 3: 1680x1760 for a 2064x2208 panel).
+            resolution_scale: 1.2,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
         }

@@ -74,7 +74,7 @@ pub enum DriverVideoMsg {
         eyes: [EyeLayer; 2],
         /// Row-major 3x4 HMD pose the frame was rendered with.
         hmd_pose: [[f32; 4]; 3],
-        /// `time::monotonic_ns` at `Present`.
+        /// The vsync this frame was presented for (`time::monotonic_ns`).
         present_ns: i64,
     },
 }

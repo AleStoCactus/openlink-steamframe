@@ -101,11 +101,13 @@ preferred wired path.
 
 ## Open questions
 
-- **Angular velocity frame.** The OpenVR headers do not say whether
-  `DriverPose_t::vecAngularVelocity` is in world or local space.
-  `PredictionConfig::angular_velocity_space` switches between them. Settle it with
-  `mock-headset --spin-tilted --delay-ms 50`: with the right space the spinning controller stays
-  smooth in SteamVR, and with the wrong one it wobbles.
+- **Angular velocity frame.** Resolved: **local**. The OpenVR headers do not say whether
+  `DriverPose_t::vecAngularVelocity` is in world or local space. Reading SteamVR's own
+  prediction back (`GetRawTrackedDevicePoses`) while `mock-headset --spin-tilted` spins the
+  controllers showed it computes `q * exp(w dt)`: within 0.02 deg of the local reading, 37 deg
+  from the world one after 100 ms at 6 rad/s. Sending world-space velocities made swings
+  predicted about the wrong axis (a controller swung from its butt end flopped instead of
+  rotating about the hand).
 - **Frame capture on Linux.** Confirmed in testing on SteamVR 2.19 under Wayland: the current
   `IVRDisplayComponent` ("display on desktop") path fails with `CHmdWindowSDL: VR requires direct
   mode` / `VRInitError_Compositor_CannotDRMLeaseDisplay`. vrserver and tracking work, but the

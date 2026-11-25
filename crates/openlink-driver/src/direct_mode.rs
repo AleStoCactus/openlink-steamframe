@@ -24,7 +24,7 @@ use openlink_protocol::video_ipc::{self as vipc, DmabufPlane, DmabufTexture};
 use std::collections::VecDeque;
 use std::ffi::{c_void, CString};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -462,8 +462,8 @@ fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) 
     let msg = vipc::DriverVideoMsg::Frame {
         frame_id,
         eyes: [eye(&base[0]), eye(&base[1])],
-        hmd_pose: base[0].mHmdPose,
-        present_ns: now_ns,
+        hmd_pose: crate::render_pose::correct(&base[0].mHmdPose, VSYNC_PERIOD_NS.load(Ordering::Acquire)),
+        present_ns: target_vsync_ns(now_ns),
     };
     if !video::send_frame(&msg) {
         return;
@@ -523,6 +523,22 @@ unsafe extern "C" fn get_frame_timing(_this: *mut c_void, timing: *mut DriverDir
     (*timing).m_nReprojectionFlags = 0;
 }
 
+/// When the last vsync event fired and the period, for stamping frames with the vsync they
+/// were presented for.
+static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
+static VSYNC_PERIOD_NS: AtomicI64 = AtomicI64::new(0);
+
+/// The vsync a frame presented at `now_ns` is for: SteamVR's compositor starts at a vsync and
+/// presents for the next one, which is also where SteamVR's `SecondsFromVsyncToPhotons` counts
+/// from.
+fn target_vsync_ns(now_ns: i64) -> i64 {
+    let (last, period) = (LAST_VSYNC_NS.load(Ordering::Acquire), VSYNC_PERIOD_NS.load(Ordering::Acquire));
+    if last == 0 || period <= 0 || now_ns < last {
+        return now_ns;
+    }
+    last + ((now_ns - last) / period + 1) * period
+}
+
 /// Without a physical display SteamVR has no vsync, so the driver supplies it.
 pub struct VsyncThread {
     stop: Arc<AtomicBool>,
@@ -547,6 +563,8 @@ impl VsyncThread {
                         } else {
                             next = now;
                         }
+                        LAST_VSYNC_NS.store(monotonic_ns(), Ordering::Release);
+                        VSYNC_PERIOD_NS.store(period.as_nanos() as i64, Ordering::Release);
                         host().vsync_event(0.0);
                     }
                 })

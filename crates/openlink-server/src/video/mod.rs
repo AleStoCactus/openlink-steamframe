@@ -97,6 +97,36 @@ impl Drop for VideoService {
     }
 }
 
+/// Rate frames are sent at: well above the stream's average (so a frame still leaves in a
+/// couple of milliseconds) but below what Wi-Fi absorbs in one burst.
+const PACING_BPS: f64 = 1.2e9;
+
+/// Sends frames to the headset from its own thread, paced: Wi-Fi access points drop from a
+/// few hundred back-to-back datagrams once their queue fills. Ends when the sender is dropped.
+fn spawn_sender(sink: Option<Arc<VideoSink>>) -> std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(video::FrameInfo, Vec<u8>)>(1);
+    std::thread::Builder::new()
+        .name("video-send".into())
+        .spawn(move || {
+            let mut packetizer = video::Packetizer::default();
+            for (info, bitstream) in rx {
+                let Some((sink, addr)) = sink.as_deref().and_then(|s| Some((s, s.headset()?))) else { continue };
+                let start = Instant::now();
+                let mut sent = 0usize;
+                packetizer.packetize(&info, &bitstream, |d| {
+                    let due = Duration::from_secs_f64(sent as f64 * 8.0 / PACING_BPS);
+                    while start.elapsed() < due {
+                        std::hint::spin_loop();
+                    }
+                    let _ = sink.send(d, addr);
+                    sent += d.len();
+                });
+            }
+        })
+        .expect("spawn video sender");
+    tx
+}
+
 struct Frame {
     id: u64,
     eyes: [vipc::EyeLayer; 2],
@@ -117,12 +147,13 @@ impl Target {
     fn current(shared: &Shared) -> Self {
         let settings = shared.settings.lock().unwrap().clone();
         let status = shared.status.lock().unwrap();
-        // Before a headset connects, encode at Quest 3 size so the pipeline can be tested.
+        // Before a headset connects, encode at Quest 3's recommended size so the pipeline can
+        // be tested.
         let (w, h, fps) = status
             .headset
             .as_ref()
             .map(|h| (h.info.eye_width, h.info.eye_height, h.info.current_refresh_rate))
-            .unwrap_or((2064, 2208, settings.refresh_rate));
+            .unwrap_or((1680, 1760, settings.refresh_rate));
         let even = |v: f32| ((v.round() as u32) & !1).max(2);
         Self {
             eye_width: even(w as f32 * settings.resolution_scale),
@@ -166,6 +197,8 @@ struct Pipeline {
     converted: avk::Semaphore,
     /// Receive the compositor's write fences, one per eye.
     fence_sems: [avk::Semaphore; 2],
+    /// Compositor write fences seen: already signalled, still pending, unavailable.
+    fence_stats: (u32, u32, u32),
 }
 
 impl Pipeline {
@@ -197,6 +230,7 @@ impl Pipeline {
             fence: ctx.fence()?,
             converted: ctx.semaphore()?,
             fence_sems: [ctx.semaphore()?, ctx.semaphore()?],
+            fence_stats: (0, 0, 0),
         })
     }
 
@@ -220,7 +254,15 @@ impl Pipeline {
         // Wait for the compositor's rendering into the textures (implicit dmabuf fences).
         let mut waits = Vec::new();
         for (eye, sem) in eyes.iter().zip(self.fence_sems) {
-            let Some(sync) = eye.write_fence() else { continue };
+            let Some(sync) = eye.write_fence() else {
+                self.fence_stats.2 += 1;
+                continue;
+            };
+            // Diagnostics: is the compositor's write still in flight when we get here?
+            let mut pfd = libc::pollfd { fd: sync.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: valid fd and pollfd.
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } == 1;
+            if signaled { self.fence_stats.0 += 1 } else { self.fence_stats.1 += 1 }
             let info = avk::ImportSemaphoreFdInfoKHR::default()
                 .semaphore(sem)
                 .flags(avk::SemaphoreImportFlags::TEMPORARY)
@@ -318,9 +360,14 @@ struct Connection<'a> {
     imports: HashMap<u64, Imported>,
     pipeline: Option<Pipeline>,
     dump: Option<std::fs::File>,
-    packetizer: video::Packetizer,
+    /// `<dump>.poses`: one line per dumped frame.
+    dump_poses: Option<std::fs::File>,
+    stats_frames_total: u64,
+    /// Frames for the sender thread, which paces them onto the network.
+    sender: std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)>,
     stats: Stats,
     failed: bool,
+    eye_layout: Option<String>,
 }
 
 impl<'a> Connection<'a> {
@@ -335,15 +382,23 @@ impl<'a> Connection<'a> {
                 None
             }
         });
+        let dump_poses = shared
+            .dump
+            .as_ref()
+            .filter(|_| dump.is_some())
+            .and_then(|p| std::fs::File::create(p.with_extension("poses")).ok());
         Self {
             shared,
+            dump_poses,
+            stats_frames_total: 0,
             ctx: None,
             imports: HashMap::new(),
             pipeline: None,
             dump,
-            packetizer: video::Packetizer::default(),
+            sender: spawn_sender(shared.sink.clone()),
             stats: Stats::default(),
             failed: false,
+            eye_layout: None,
         }
     }
 
@@ -464,6 +519,21 @@ impl<'a> Connection<'a> {
             release(frame.id);
             return Ok(());
         };
+        // What SteamVR submits per eye, logged when it changes (texture sharing, sizes, bounds).
+        let layout = format!(
+            "left {}x{} bounds {:?}, right {}x{} bounds {:?}, {}",
+            left.width,
+            left.height,
+            frame.eyes[0].bounds,
+            right.width,
+            right.height,
+            frame.eyes[1].bounds,
+            if left.handle == right.handle { "one shared texture" } else { "separate textures" }
+        );
+        if self.eye_layout.as_deref() != Some(&layout) {
+            log::info!("video: eyes: {layout}");
+            self.eye_layout = Some(layout);
+        }
         let target = Target::current(self.shared);
         if self.pipeline.as_ref().is_some_and(|p| p.requested != target) {
             ctx.wait_idle();
@@ -486,36 +556,46 @@ impl<'a> Connection<'a> {
         let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;
         let t2 = Instant::now();
 
-        if let Some((sink, addr)) = sink.and_then(|s| Some((s, s.headset()?))) {
-            let info = video::FrameInfo {
-                idr,
-                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
-                present_ns: frame.present_ns,
-            };
-            let mut send_errors = 0;
-            self.packetizer.packetize(&info, &bitstream, |d| {
-                if sink.send(d, addr).is_err() {
-                    send_errors += 1;
-                }
-            });
-            self.stats.send_errors += send_errors;
-        }
-
         if let Some(f) = &mut self.dump {
             if let Err(e) = f.write_all(&bitstream) {
                 log::error!("video: dump write failed: {e}");
                 self.dump = None;
             }
+            // Beside the stream: each frame's render pose, for checking labels against content.
+            if let Some(poses) = &mut self.dump_poses {
+                let p = proto::Pose::from_matrix34(&frame.hmd_pose);
+                let _ = writeln!(
+                    poses,
+                    "{} {} {} {:?} {:?}",
+                    self.stats_frames_total, frame.present_ns, idr as u8, p.orientation, p.position
+                );
+            }
+            self.stats_frames_total += 1;
+        }
+        let bytes = bitstream.len();
+        if sink.is_some_and(|s| s.headset().is_some()) {
+            let info = video::FrameInfo {
+                idr,
+                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
+                present_ns: frame.present_ns,
+            };
+            if self.sender.try_send((info, bitstream)).is_err() {
+                self.stats.send_errors += 1; // the sender is still busy with the previous frame
+            }
         }
         let s = &mut self.stats;
         let since = *s.since.get_or_insert(t0);
         s.frames += 1;
-        s.bytes += bitstream.len() as u64;
+        s.bytes += bytes as u64;
         s.convert += t1 - t0;
         s.encode += t2 - t1;
         let elapsed = t2 - since;
         if elapsed >= Duration::from_secs(5) {
             let n = s.frames.max(1);
+            if let Some(p) = &mut self.pipeline {
+                let (sig, pend, none) = std::mem::take(&mut p.fence_stats);
+                log::info!("video: compositor write fences: {sig} already signalled, {pend} pending, {none} unavailable");
+            }
             log::info!(
                 "video: {:.1} fps, {:.1} Mbit/s, {:.0} KB/frame, convert {:.2} ms, encode {:.2} ms, {} skipped, {} send errors",
                 s.frames as f64 / elapsed.as_secs_f64(),
@@ -558,9 +638,10 @@ impl<'a> Connection<'a> {
     }
 }
 
-/// `openlink --encode-selftest WxH FRAMES [OUT]`: drives the encoder alone (no SteamVR),
-/// on an uninitialised source picture, to debug Vulkan Video without the rest of the
-/// pipeline.
+/// `openlink --encode-selftest WxH FRAMES [OUT [SOURCE.yuv]]`: drives the encoder alone (no
+/// SteamVR) to debug Vulkan Video without the rest of the pipeline. The source is a scrolling
+/// test pattern, identical in the left and right halves (so per-half quality can be compared);
+/// SOURCE.yuv receives it as raw NV12 for `ffmpeg -lavfi psnr`.
 pub fn selftest(args: &[String]) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let size = args.first().ok_or("usage: --encode-selftest WxH FRAMES [OUT]")?;
@@ -568,6 +649,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let (width, height): (u32, u32) = (w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?);
     let frames: u32 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(300);
     let mut out = args.get(2).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
+    let mut source_out = args.get(3).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
     let rdev = std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev();
     let ctx = Context::new(rdev)?;
     let mut enc = encode::Encoder::new(&ctx, &encode::EncoderConfig { width, height, fps: 90.0, bitrate_bps: 200_000_000 })?;
@@ -576,6 +658,25 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let cmd = ctx.command_buffer(pool)?;
     let fence = ctx.fence()?;
     let sem = ctx.semaphore()?;
+    // Staging buffer for the pattern, coded size (the encoder's source image is coded size).
+    let (cw, ch) = (enc.layout.coded_width as usize, enc.layout.coded_height as usize);
+    let nv12_len = cw * ch * 3 / 2;
+    // SAFETY: valid create info.
+    let staging = check(
+        unsafe {
+            d.create_buffer(
+                &avk::BufferCreateInfo::default().size(nv12_len as u64).usage(avk::BufferUsageFlags::TRANSFER_SRC),
+                None,
+            )
+        },
+        "vkCreateBuffer (staging)",
+    )?;
+    let staging_mem =
+        ctx.bind_buffer_memory(staging, avk::MemoryPropertyFlags::HOST_VISIBLE | avk::MemoryPropertyFlags::HOST_COHERENT)?;
+    // SAFETY: host-visible memory we just bound, mapped whole.
+    let staging_ptr = check(unsafe { d.map_memory(staging_mem, 0, avk::WHOLE_SIZE, avk::MemoryMapFlags::empty()) }, "vkMapMemory")?
+        as *mut u8;
+    let mut pattern = vec![0u8; nv12_len];
     let barrier = avk::ImageMemoryBarrier2::default()
         .image(enc.src)
         .subresource_range(color_range())
@@ -587,10 +688,31 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let mut bytes = 0usize;
     let result = (|| -> Result<()> {
         for i in 0..frames {
-            // SAFETY: our idle command buffer; valid handles.
+            fill_pattern(&mut pattern, cw, ch, width as usize / 2, i);
+            if let Some(f) = &mut source_out {
+                f.write_all(&pattern).map_err(|e| e.to_string())?;
+            }
+            // SAFETY: our idle command buffer; valid handles; staging is not in use (we wait for
+            // every submission).
             unsafe {
+                std::ptr::copy_nonoverlapping(pattern.as_ptr(), staging_ptr, nv12_len);
                 check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
                 d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)));
+                let plane = |aspect, offset: usize, w: usize, h: usize| avk::BufferImageCopy {
+                    buffer_offset: offset as u64,
+                    buffer_row_length: w as u32,
+                    buffer_image_height: h as u32,
+                    image_subresource: avk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                    image_offset: avk::Offset3D::default(),
+                    image_extent: avk::Extent3D { width: w as u32, height: h as u32, depth: 1 },
+                };
+                d.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging,
+                    enc.src,
+                    avk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[plane(avk::ImageAspectFlags::PLANE_0, 0, cw, ch), plane(avk::ImageAspectFlags::PLANE_1, cw * ch, cw / 2, ch / 2)],
+                );
                 check(d.end_command_buffer(cmd), "vkEndCommandBuffer")?;
                 let (cmds, signal) = ([cmd], [sem]);
                 let submit = avk::SubmitInfo::default().command_buffers(&cmds).signal_semaphores(&signal);
@@ -618,9 +740,42 @@ pub fn selftest(args: &[String]) -> Result<()> {
     unsafe {
         let _ = d.device_wait_idle();
         d.destroy_semaphore(sem, None);
+        d.destroy_buffer(staging, None);
+        d.free_memory(staging_mem, None);
         d.destroy_fence(fence, None);
         d.destroy_command_pool(pool, None);
     }
     enc.destroy(&ctx);
     result
+}
+
+/// A detailed, moving NV12 test pattern whose left and right halves (each `half` pixels wide)
+/// are identical: fine noise, edges and gradients scrolling diagonally.
+fn fill_pattern(buf: &mut [u8], w: usize, h: usize, half: usize, frame: u32) {
+    let hash = |x: u32, y: u32| {
+        let mut v = x.wrapping_mul(0x9E37_79B1) ^ y.wrapping_mul(0x85EB_CA77);
+        v ^= v >> 15;
+        v = v.wrapping_mul(0x2C1B_3C6D);
+        (v ^ (v >> 12)) as u8
+    };
+    let (dx, dy) = (frame * 3, frame * 2);
+    for y in 0..h {
+        for x in 0..w {
+            let lx = (x % half) as u32 + dx;
+            let ly = y as u32 + dy;
+            let checker = if ((lx / 32) + (ly / 32)) % 2 == 0 { 40 } else { 0 };
+            let ramp = ((lx % 256) / 4) as u8;
+            let noise = hash(lx / 2, ly / 2) / 4;
+            buf[y * w + x] = 60u8.saturating_add(checker).saturating_add(ramp).saturating_add(noise);
+        }
+    }
+    let uv = &mut buf[w * h..];
+    for y in 0..h / 2 {
+        for x in 0..w / 2 {
+            let lx = ((2 * x) % half) as u32 + dx;
+            let ly = (2 * y) as u32 + dy;
+            uv[y * w + 2 * x] = 128u8.wrapping_add(((lx / 64) % 4 * 12) as u8);
+            uv[y * w + 2 * x + 1] = 128u8.wrapping_sub(((ly / 64) % 4 * 12) as u8);
+        }
+    }
 }

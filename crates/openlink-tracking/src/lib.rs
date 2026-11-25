@@ -69,13 +69,15 @@ impl std::ops::Mul for Isometry {
 
 /// Which frame SteamVR interprets `DriverPose_t::vecAngularVelocity` in.
 ///
-/// The OpenVR headers do not say. Getting this wrong is invisible for pure yaw and very visible
-/// for wrist flicks, so it is configurable until the spin test (`mock-headset --spin-tilted`)
-/// settles it; see docs/ARCHITECTURE.md, "Open questions".
+/// The OpenVR headers do not say. Measured (SteamVR 2.19, `mock-headset --spin-tilted`, reading
+/// SteamVR's own prediction back with `GetRawTrackedDevicePoses`): **local**. SteamVR's 100 ms
+/// prediction matched `q * exp(w dt)` to 0.02 deg and missed `exp(w dt) * q` by 37 deg. With
+/// world-space velocities every swing was predicted about the wrong axis, so a controller
+/// swung from its butt end moved as if shoved rather than rotated about the hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AngularVelocitySpace {
-    #[default]
     World,
+    #[default]
     Local,
 }
 
@@ -90,7 +92,7 @@ pub struct PredictionConfig {
 impl Default for PredictionConfig {
     fn default() -> Self {
         Self {
-            angular_velocity_space: AngularVelocitySpace::World,
+            angular_velocity_space: AngularVelocitySpace::Local,
             stale_after_s: 0.1,
         }
     }

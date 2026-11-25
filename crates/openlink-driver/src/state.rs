@@ -56,15 +56,21 @@ impl DisplayConfig {
         }
     }
 
-    /// OpenVR raw projection: tangents, with *top negative* (OpenVR's Y points down here).
+    /// OpenVR raw projection: tangents of the four half-angles.
+    ///
+    /// OpenVR's "top" is the tangent of the **downward** extent (negative) and "bottom" that of
+    /// the upward one: SteamVR builds `m[1][2] = (bottom + top) / (bottom - top)`, which only
+    /// maps both vertical edges to NDC +-1 this way round. Swapping them mirrors an asymmetric
+    /// frustum (the Quest looks further down than up): the picture stretches at one end and
+    /// squashes at the other.
     pub fn projection(&self, eye: usize) -> HmdRect2_t {
         let f = self.fov[eye];
         HmdRect2_t {
             vTopLeft: HmdVector2_t {
-                v: [f.angle_left.tan(), -f.angle_up.tan()],
+                v: [f.angle_left.tan(), f.angle_down.tan()],
             },
             vBottomRight: HmdVector2_t {
-                v: [f.angle_right.tan(), -f.angle_down.tan()],
+                v: [f.angle_right.tan(), f.angle_up.tan()],
             },
         }
     }
@@ -100,6 +106,9 @@ pub struct Shared {
     pub display: Mutex<DisplayConfig>,
     pub controller_model: Mutex<ControllerModel>,
     pub prediction: PredictionConfig,
+    /// The headset display's measured frame period, once known (0 until then): the vsync we
+    /// give SteamVR runs at exactly this rate, not the nominal refresh rate.
+    pub vsync_period_ns: std::sync::atomic::AtomicI64,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -116,6 +125,7 @@ pub fn shared() -> &'static Shared {
             display: Mutex::new(DisplayConfig::default()),
             controller_model: Mutex::new(ControllerModel::QuestPlus),
             prediction: PredictionConfig::default(),
+            vsync_period_ns: std::sync::atomic::AtomicI64::new(0),
         }
     })
 }
@@ -124,10 +134,24 @@ pub fn shared() -> &'static Shared {
 mod tests {
     use super::*;
 
+    /// SteamVR's projection (OpenVR's `ComposeProjection`) applied to a direction with vertical
+    /// tangent `tan_y`, at z = -1: NDC y.
+    fn ndc_y(r: &HmdRect2_t, tan_y: f32) -> f32 {
+        let (top, bottom) = (r.vTopLeft.v[1], r.vBottomRight.v[1]);
+        let idy = 1.0 / (bottom - top);
+        // y_clip = 2*idy*y + (bottom+top)*idy*z, w = -z.
+        2.0 * idy * tan_y - (bottom + top) * idy
+    }
+
     #[test]
-    fn projection_follows_openvr_sign_convention() {
-        let r = DisplayConfig::default().projection(0);
+    fn vertical_fov_edges_map_to_ndc_bounds() {
+        // Quest 3: looks further down than up, which exposes a swapped top/bottom.
+        let mut d = DisplayConfig::default();
+        d.fov[0].angle_up = 0.768;
+        d.fov[0].angle_down = -0.960;
+        let r = d.projection(0);
+        assert!((ndc_y(&r, 0.768f32.tan()) - 1.0).abs() < 1e-5);
+        assert!((ndc_y(&r, (-0.960f32).tan()) + 1.0).abs() < 1e-5);
         assert!(r.vTopLeft.v[0] < 0.0 && r.vBottomRight.v[0] > 0.0);
-        assert!(r.vTopLeft.v[1] < 0.0 && r.vBottomRight.v[1] > 0.0);
     }
 }

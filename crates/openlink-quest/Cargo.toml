@@ -1,0 +1,24 @@
+[package]
+name = "openlink-quest"
+description = "OpenLink headset app for Meta Quest (OpenXR, Android NativeActivity)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "android")'.dependencies]
+openlink-protocol.workspace = true
+openlink-client = { path = "../openlink-client" }
+log.workspace = true
+glam.workspace = true
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+ndk = { version = "0.9", features = ["media", "api-level-30", "nativewindow"] }
+ndk-sys = "0.6"
+openxr = { version = "0.22", features = ["loaded"] }
+khronos-egl = { version = "6", features = ["static", "no-pkg-config"] }
+glow = "0.18"
+libc = "0.2"

@@ -12,6 +12,9 @@
 //! * `--spin-tilted`: controllers spin at a constant rate about an axis tilted away from every
 //!   world and body axis. Used to settle whether `DriverPose_t::vecAngularVelocity` is in
 //!   world or local space: with the wrong space, the spin wobbles instead of staying on-axis.
+//! * `--yaw-deg A --yaw-hz F`: head yaw oscillation (default 8.6 deg at 0.2 Hz); with
+//!   `--yaw-steps` the head jumps between -A and +A instead, holding still in between.
+//! * `--still-controllers`: controllers hold still, as world-fixed reference points.
 //! * `--video-out PATH`: write the received video stream (Annex B) to PATH. Either way, video
 //!   statistics and the frames' render poses are logged every few seconds.
 
@@ -29,6 +32,12 @@ struct Mock {
     start_ns: i64,
     delay_ns: i64,
     spin_tilted: bool,
+    /// Head yaw oscillation: amplitude (rad) and frequency (Hz).
+    yaw: (f64, f64),
+    /// Jump between the yaw extremes instead of oscillating smoothly.
+    yaw_steps: bool,
+    /// Controllers hold still (world-fixed reference points for checking video against poses).
+    still_controllers: bool,
 }
 
 fn motion(p: DVec3, q: DQuat, v: DVec3, w: DVec3) -> Motion {
@@ -55,7 +64,7 @@ impl Mock {
             motion(center, q, DVec3::ZERO, axis * omega)
         } else {
             // theta(t) = A sin(wt): a vertical saber swing pivoting around the elbow.
-            let (a, f, r) = (1.2, 1.5 + 0.1 * side, 0.18);
+            let (a, f, r) = (if self.still_controllers { 0.0 } else { 1.2 }, 1.5 + 0.1 * side, 0.18);
             let wt = TAU * f * t;
             let theta = a * wt.sin();
             let theta_dot = a * TAU * f * wt.cos();
@@ -110,9 +119,13 @@ impl TrackingSource for Mock {
     fn sample(&mut self, now_ns: i64) -> TrackingSample {
         let sample_time_ns = now_ns - self.delay_ns;
         let t = (sample_time_ns - self.start_ns) as f64 * 1e-9;
-        let (amp, f) = (0.15, 0.2);
-        let yaw = amp * (TAU * f * t).sin();
-        let yaw_dot = amp * TAU * f * (TAU * f * t).cos();
+        let (amp, f) = self.yaw;
+        let (yaw, yaw_dot) = if self.yaw_steps {
+            // Hold at -amp, then +amp, each for half a period: no velocity to predict with.
+            (if (t * f).fract() < 0.5 { -amp } else { amp }, 0.0)
+        } else {
+            (amp * (TAU * f * t).sin(), amp * TAU * f * (TAU * f * t).cos())
+        };
         TrackingSample {
             sample_time_ns,
             hmd: motion(
@@ -147,6 +160,9 @@ fn main() {
     let mut delay_ms = 0.0;
     let mut spin_tilted = false;
     let mut video_out: Option<String> = None;
+    let (mut yaw_deg, mut yaw_hz) = (8.6, 0.2);
+    let mut yaw_steps = false;
+    let mut still_controllers = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--rate" => rate = args.next().and_then(|v| v.parse().ok()).expect("--rate HZ"),
@@ -158,6 +174,10 @@ fn main() {
             }
             "--spin-tilted" => spin_tilted = true,
             "--video-out" => video_out = Some(args.next().expect("--video-out PATH")),
+            "--yaw-deg" => yaw_deg = args.next().and_then(|v| v.parse().ok()).expect("--yaw-deg DEG"),
+            "--yaw-steps" => yaw_steps = true,
+            "--still-controllers" => still_controllers = true,
+            "--yaw-hz" => yaw_hz = args.next().and_then(|v| v.parse().ok()).expect("--yaw-hz HZ"),
             "-h" | "--help" => {
                 println!(
                     "usage: mock-headset [SERVER_ADDR] [--rate HZ] [--delay-ms MS] [--spin-tilted] [--video-out PATH]"
@@ -177,6 +197,9 @@ fn main() {
         start_ns: openlink_protocol::time::monotonic_ns(),
         delay_ns: (delay_ms * 1e6) as i64,
         spin_tilted,
+        yaw: (f64::to_radians(yaw_deg), yaw_hz),
+        yaw_steps,
+        still_controllers,
     };
     let mut client = Client::connect(addr).expect("open socket");
     log::info!(

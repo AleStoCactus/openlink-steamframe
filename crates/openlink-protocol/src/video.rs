@@ -27,7 +27,8 @@ pub struct FrameInfo {
     /// HMD pose the frame was rendered with, in the headset's tracking space. The headset
     /// submits the frame with this pose so its compositor reprojects it to the current one.
     pub render_pose: Pose,
-    /// When SteamVR presented the frame, server clock (`time::monotonic_ns`).
+    /// The vsync SteamVR presented the frame for, server clock (`time::monotonic_ns`). SteamVR's
+    /// `SecondsFromVsyncToPhotons` counts from here.
     pub present_ns: i64,
 }
 
@@ -77,16 +78,24 @@ pub struct Frame {
     pub number: u32,
     pub info: FrameInfo,
     pub bitstream: Vec<u8>,
+    /// When the last datagram arrived ([`crate::time::monotonic_ns`]).
+    pub received_ns: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     /// Nothing complete yet.
     Pending,
-    /// One or more frames before `next` were lost. Frames are dropped until the next IDR;
-    /// the headset should tell the server (once per `Loss`).
+    /// The stream needs an IDR (frames were lost, or none has arrived yet); frames are
+    /// dropped until one comes. The headset should tell the server (once per `Loss`).
     Loss,
 }
+
+/// While waiting for an IDR, ask again every this many dropped frames, in case the IDR the
+/// server sent was lost too (or the server never heard the first request).
+const IDR_REQUEST_INTERVAL: u64 = 30;
+/// Frames further behind the last one than this are a restarted count, not reordering.
+const RESTART_DISTANCE: i32 = 300;
 
 /// Rebuilds frames from datagrams that may arrive lost or reordered (within a frame).
 ///
@@ -127,6 +136,12 @@ impl Reassembler {
         self.need_idr = true;
     }
 
+    /// Forgets the stream so far (a new session): the next IDR starts it again. Keeps stats.
+    pub fn restart(&mut self) {
+        let stats = self.stats;
+        *self = Self { stats, ..Self::default() };
+    }
+
     /// Feeds one datagram. Returns a complete, decodable frame, or what happened instead.
     pub fn push(&mut self, datagram: &[u8]) -> Result<Frame, Event> {
         if !is_video(datagram) || u16::from_le_bytes([datagram[4], datagram[5]]) != PROTOCOL_VERSION {
@@ -137,6 +152,11 @@ impl Reassembler {
         let chunks = u16::from_le_bytes([datagram[12], datagram[13]]) as usize;
         if chunk >= chunks {
             return Err(Event::Pending);
+        }
+        // A frame number far behind the last one means the sender restarted its count (new
+        // server): start over rather than treat every new frame as stale.
+        if self.last.is_some_and(|l| (number.wrapping_sub(l) as i32) < -RESTART_DISTANCE) {
+            self.restart();
         }
         // Ignore anything not newer than the last finished frame (wrapping compare).
         if self.last.is_some_and(|l| (number.wrapping_sub(l) as i32) <= 0) {
@@ -191,11 +211,11 @@ impl Reassembler {
         let Some((info, start)) = parsed else { return Err(Event::Pending) };
         if self.need_idr && !info.idr {
             self.stats.dropped_frames += 1;
-            return Err(Event::Pending);
+            return Err(if self.stats.dropped_frames % IDR_REQUEST_INTERVAL == 1 { Event::Loss } else { Event::Pending });
         }
         self.need_idr = false;
         self.stats.frames += 1;
-        Ok(Frame { number: p.number, info, bitstream: data[start..].to_vec() })
+        Ok(Frame { number: p.number, info, bitstream: data[start..].to_vec(), received_ns: crate::time::monotonic_ns() })
     }
 }
 
@@ -262,6 +282,38 @@ mod tests {
         let f4 = packets(&mut p, true, 3000);
         assert!(f4.iter().map(|d| r.push(d)).any(|x| x.is_ok()));
         assert_eq!(r.stats.frames, 2);
+    }
+
+    #[test]
+    fn keeps_asking_for_an_idr_while_waiting() {
+        // The first IDR never arrives: the headset must not wait silently forever.
+        let mut p = Packetizer::default();
+        let mut r = Reassembler::default();
+        let _lost_idr = packets(&mut p, true, 10);
+        let mut requests = 0;
+        for _ in 0..100 {
+            for d in packets(&mut p, false, 10) {
+                if r.push(&d) == Err(Event::Loss) {
+                    requests += 1;
+                }
+            }
+        }
+        assert!(requests >= 3, "{requests} IDR requests in 100 dropped frames");
+        assert!(packets(&mut p, true, 10).iter().map(|d| r.push(d)).any(|x| x.is_ok()));
+    }
+
+    #[test]
+    fn follows_a_restarted_sender() {
+        let mut old = Packetizer::default();
+        let mut r = Reassembler::default();
+        for i in 0..1000 {
+            for d in packets(&mut old, i == 0, 10) {
+                let _ = r.push(&d);
+            }
+        }
+        // A new server counts from 0 again.
+        let mut new = Packetizer::default();
+        assert!(packets(&mut new, true, 10).iter().map(|d| r.push(d)).any(|x| x.is_ok()));
     }
 
     #[test]

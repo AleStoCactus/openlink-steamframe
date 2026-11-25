@@ -87,6 +87,14 @@ impl Host {
         )
     }
 
+    /// SteamVR's own prediction of every device, `seconds` from now (diagnostics).
+    pub fn raw_poses(&self, seconds: f32) -> Vec<TrackedDevicePose_t> {
+        let mut poses = vec![TrackedDevicePose_t::default(); 16];
+        // SAFETY: valid interface; the array has the length we pass.
+        unsafe { call!(self.server, GetRawTrackedDevicePoses, seconds, poses.as_mut_ptr(), poses.len() as u32) };
+        poses
+    }
+
     pub fn pose_updated(&self, id: u32, pose: &DriverPose_t) {
         // SAFETY: valid interface and pose.
         unsafe {

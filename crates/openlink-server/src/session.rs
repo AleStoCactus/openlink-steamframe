@@ -40,6 +40,8 @@ pub struct HeadsetStatus {
     pub tracking_hz: f32,
     /// Age of the newest tracking sample when it reached the server.
     pub sample_age_ms: f32,
+    /// Present-to-photon latency of the video, as measured by the headset.
+    pub photon_latency_ms: Option<f32>,
 }
 
 struct Shared {
@@ -182,9 +184,16 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
         .unwrap_or(Codec::H264);
     let scale = settings.resolution_scale.clamp(0.25, 2.0);
     let even = |v: f32| ((v as u32) + 1) & !1;
+    // The configured rate if the headset has it, else its closest one.
+    let refresh_rate = info
+        .refresh_rates
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - settings.refresh_rate).abs().total_cmp(&(b - settings.refresh_rate).abs()))
+        .unwrap_or(settings.refresh_rate);
     StreamConfig {
         codec,
-        refresh_rate: settings.refresh_rate,
+        refresh_rate,
         eye_width: even(info.eye_width as f32 * scale),
         eye_height: even(info.eye_height as f32 * scale),
         bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
@@ -197,6 +206,10 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
     let mut rate_window = (Instant::now(), 0u32);
+    let mut latency = LatencyMeter::default();
+    let mut invalid_hmd = 0u32;
+    // Controller samples, with angular velocity flagged valid, peak |w| and |v| (diagnostics).
+    let mut ctrl_stats = (0u32, 0u32, 0f32, 0f32);
 
     while !shared.stop.load(Ordering::Acquire) {
         let current = *shared.headset_addr.lock().unwrap();
@@ -252,6 +265,11 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 shared.idr_requested.store(true, Ordering::Release);
             }
             let cfg = stream_config(&shared.settings.lock().unwrap(), info);
+            // The headset switches to the stream's rate on Welcome; everything here (SteamVR,
+            // the encoder) runs at that rate, not the one it happened to report.
+            let mut info = info.clone();
+            info.current_refresh_rate = cfg.refresh_rate;
+            let info = &info;
             let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg)), from);
             *shared.headset_addr.lock().unwrap() = Some(from);
             *shared.headset_info.lock().unwrap() = Some(info.clone());
@@ -263,12 +281,18 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 min_rtt_ns: None,
                 tracking_hz: 0.0,
                 sample_age_ms: 0.0,
+                photon_latency_ms: None,
             });
             last_rx = Instant::now();
             continue;
         }
         if current != Some(from) {
-            continue; // not our headset (or it has not said Hello yet)
+            // Not our headset, or one still streaming to a previous run of the server: make it
+            // start over with Hello.
+            if !matches!(msg, HeadsetMessage::Disconnect) {
+                let _ = sock.send_to(&proto::encode(&ServerMessage::Disconnect), from);
+            }
+            continue;
         }
         last_rx = Instant::now();
 
@@ -289,11 +313,38 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 };
                 let mut sample = sample;
                 sample.sample_time_ns = pc_time;
+                if !sample.hmd.flags.is_valid() {
+                    invalid_hmd += 1;
+                }
+                for c in sample.controllers.iter().flatten() {
+                    let m = &c.motion;
+                    let norm = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    ctrl_stats.0 += 1;
+                    if m.flags.has(proto::MotionFlags::ANGULAR_VELOCITY_VALID) {
+                        ctrl_stats.1 += 1;
+                    }
+                    ctrl_stats.2 = ctrl_stats.2.max(norm(m.angular_velocity));
+                    ctrl_stats.3 = ctrl_stats.3.max(norm(m.linear_velocity));
+                }
                 to_driver(&driver_sock, &ToDriver::Tracking(sample));
 
                 rate_window.1 += 1;
                 let elapsed = rate_window.0.elapsed();
                 if elapsed >= Duration::from_secs(1) {
+                    if ctrl_stats.2 > 1.0 {
+                        log::info!(
+                            "controllers: {} of {} samples with angular velocity; peak {:.1} rad/s, {:.2} m/s",
+                            ctrl_stats.1,
+                            ctrl_stats.0,
+                            ctrl_stats.2,
+                            ctrl_stats.3
+                        );
+                    }
+                    ctrl_stats = (0, 0, 0.0, 0.0);
+                    if invalid_hmd > 0 {
+                        log::warn!("headset sent {invalid_hmd} tracking samples without a valid head pose");
+                        invalid_hmd = 0;
+                    }
                     if let Some(h) = shared.status.lock().unwrap().headset.as_mut() {
                         h.tracking_hz = rate_window.1 as f32 / elapsed.as_secs_f32();
                         h.sample_age_ms = (t_rx - pc_time) as f32 * 1e-6;
@@ -317,6 +368,26 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                     },
                 );
             }
+            HeadsetMessage::FrameDisplayed { present_ns, received_ns, queued_ns, decoded_ns, display_ns } => {
+                let Some(received_pc) = clock.headset_to_pc(received_ns) else {
+                    continue;
+                };
+                let stages = [
+                    received_pc - present_ns,
+                    queued_ns - received_ns,
+                    decoded_ns - queued_ns,
+                    display_ns - decoded_ns,
+                ];
+                if let Some(seconds) = latency.push(stages) {
+                    to_driver(&driver_sock, &ToDriver::PhotonLatency { seconds });
+                    if let Some(h) = shared.status.lock().unwrap().headset.as_mut() {
+                        h.photon_latency_ms = Some(seconds * 1e3);
+                    }
+                }
+            }
+            HeadsetMessage::DisplayPeriod { period_ns } => {
+                to_driver(&driver_sock, &ToDriver::DisplayPeriod { period_ns });
+            }
             HeadsetMessage::VideoLoss { frame } => {
                 log::debug!("headset lost video at frame {frame}");
                 shared.idr_requested.store(true, Ordering::Release);
@@ -326,6 +397,58 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 disconnect(shared, &driver_sock, &mut clock);
             }
         }
+    }
+}
+
+/// Smooths per-frame present-to-photon latencies (median over a window) and decides when
+/// SteamVR's prediction horizon needs updating.
+#[derive(Default)]
+struct LatencyMeter {
+    /// Per frame: present -> received (encode + network), received -> queued into the
+    /// decoder, queued -> decoded, decoded -> photons.
+    window: Vec<[i64; 4]>,
+    applied: Option<f32>,
+    last_log: Option<Instant>,
+}
+
+impl LatencyMeter {
+    const WINDOW: usize = 180;
+    /// Changes smaller than this are not worth re-telling SteamVR.
+    const HYSTERESIS_S: f32 = 0.002;
+
+    /// Returns a new latency (seconds) to apply, when it moved enough.
+    fn push(&mut self, stages: [i64; 4]) -> Option<f32> {
+        let total: i64 = stages.iter().sum();
+        if !(0..1_000_000_000).contains(&total) {
+            return None; // clock not converged yet, or nonsense
+        }
+        self.window.push(stages);
+        if self.window.len() < Self::WINDOW {
+            return None;
+        }
+        let window = std::mem::take(&mut self.window);
+        let median_ms = |f: &dyn Fn(&[i64; 4]) -> i64| {
+            let mut v: Vec<i64> = window.iter().map(f).collect();
+            v.sort_unstable();
+            v[v.len() / 2] as f32 * 1e-6
+        };
+        let total_ms = median_ms(&|s| s.iter().sum());
+        let median = total_ms * 1e-3;
+        if self.last_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            log::info!(
+                "present-to-photon {total_ms:.1} ms (medians: encode+network {:.1}, wait for decoder {:.1}, decode {:.1}, render + display {:.1})",
+                median_ms(&|s| s[0]),
+                median_ms(&|s| s[1]),
+                median_ms(&|s| s[2]),
+                median_ms(&|s| s[3]),
+            );
+            self.last_log = Some(Instant::now());
+        }
+        if self.applied.is_some_and(|a| (a - median).abs() < Self::HYSTERESIS_S) {
+            return None;
+        }
+        self.applied = Some(median);
+        Some(median)
     }
 }
 
