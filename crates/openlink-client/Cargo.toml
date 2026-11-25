@@ -1,0 +1,16 @@
+[package]
+name = "openlink-client"
+description = "OpenLink headset client core (platform-independent) and a mock headset for PC-side testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mock-headset"
+path = "src/bin/mock_headset.rs"
+
+[dependencies]
+openlink-protocol.workspace = true
+glam.workspace = true
+log.workspace = true
+env_logger.workspace = true

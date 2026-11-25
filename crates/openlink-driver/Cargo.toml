@@ -1,0 +1,16 @@
+[package]
+name = "openlink-driver"
+description = "OpenLink SteamVR driver (loaded into vrserver)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "driver_openlink"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openlink-protocol.workspace = true
+openlink-tracking.workspace = true
+glam.workspace = true
+log.workspace = true

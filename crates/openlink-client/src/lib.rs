@@ -1,0 +1,145 @@
+//! Platform-independent headset client.
+//!
+//! The Quest app supplies a [`TrackingSource`] backed by OpenXR; the `mock-headset` binary
+//! supplies a synthetic one so the whole PC side can be exercised without a headset.
+//!
+//! Threading mirrors what the real app needs:
+//! * the **tracking thread** (the caller of [`Client::run`]) samples at a fixed high rate and
+//!   sends immediately;
+//! * a **receive thread** answers clock pings the instant they arrive, so the `t1`/`t2`
+//!   timestamps are not inflated by waiting for the next tracking tick.
+
+use openlink_protocol::{
+    self as proto, time::monotonic_ns, HapticPulse, HeadsetInfo, HeadsetMessage, ServerMessage,
+    StreamConfig, TrackingSample,
+};
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub trait TrackingSource {
+    fn info(&self) -> HeadsetInfo;
+    /// Sample every device **at** `time_ns` (headset clock). No forward prediction.
+    fn sample(&mut self, time_ns: i64) -> TrackingSample;
+    fn haptics(&mut self, _pulse: HapticPulse) {}
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientState {
+    pub welcome: Option<StreamConfig>,
+}
+
+pub struct Client {
+    sock: UdpSocket,
+    server: SocketAddr,
+    state: Arc<Mutex<ClientState>>,
+    haptics: Receiver<HapticPulse>,
+}
+
+impl Client {
+    pub fn connect(server: SocketAddr) -> std::io::Result<Self> {
+        let bind: SocketAddr = if server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }
+        .parse()
+        .unwrap();
+        let sock = UdpSocket::bind(bind)?;
+        sock.connect(server)?;
+        let state = Arc::new(Mutex::new(ClientState::default()));
+        let (tx, haptics) = mpsc::channel();
+
+        let rx_sock = sock.try_clone()?;
+        let rx_state = state.clone();
+        std::thread::Builder::new()
+            .name("openlink-rx".into())
+            .spawn(move || {
+                let mut buf = [0u8; 2048];
+                loop {
+                    let n = match rx_sock.recv(&mut buf) {
+                        Ok(n) => n,
+                        // Nothing listening yet (ICMP port unreachable) or socket closed.
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
+                        Err(_) => return,
+                    };
+                    let t1 = monotonic_ns();
+                    match proto::decode::<ServerMessage>(&buf[..n]) {
+                        Ok(ServerMessage::ClockPing { t0 }) => {
+                            let pong = HeadsetMessage::ClockPong {
+                                t0,
+                                t1,
+                                t2: monotonic_ns(),
+                            };
+                            let _ = rx_sock.send(&proto::encode(&pong));
+                        }
+                        Ok(ServerMessage::Welcome(cfg)) => {
+                            let mut st = rx_state.lock().unwrap();
+                            if st.welcome.is_none() {
+                                log::info!("server accepted us: {cfg:?}");
+                            }
+                            st.welcome = Some(cfg);
+                        }
+                        Ok(ServerMessage::Haptics(p)) => {
+                            let _ = tx.send(p);
+                        }
+                        Ok(ServerMessage::Disconnect) => {
+                            log::info!("server closed the session");
+                            rx_state.lock().unwrap().welcome = None;
+                        }
+                        Err(e) => log::debug!("bad datagram: {e}"),
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            sock,
+            server,
+            state,
+            haptics,
+        })
+    }
+
+    pub fn server(&self) -> SocketAddr {
+        self.server
+    }
+
+    /// Run until `stop` is set: say Hello until welcomed, then stream tracking at `rate_hz`.
+    pub fn run(&mut self, source: &mut impl TrackingSource, rate_hz: f64, stop: &AtomicBool) {
+        let period = Duration::from_secs_f64(1.0 / rate_hz);
+        let mut next = Instant::now();
+        let mut last_hello: Option<Instant> = None;
+        let mut seq = 0u32;
+
+        while !stop.load(Ordering::Acquire) {
+            let welcomed = self.state.lock().unwrap().welcome.is_some();
+            if !welcomed && last_hello.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
+                let _ = self
+                    .sock
+                    .send(&proto::encode(&HeadsetMessage::Hello(source.info())));
+                last_hello = Some(Instant::now());
+            }
+            if welcomed {
+                let sample = source.sample(monotonic_ns());
+                let _ = self
+                    .sock
+                    .send(&proto::encode(&HeadsetMessage::Tracking { seq, sample }));
+                seq = seq.wrapping_add(1);
+            }
+            while let Ok(p) = self.haptics.try_recv() {
+                source.haptics(p);
+            }
+
+            next += period;
+            let now = Instant::now();
+            if next > now {
+                std::thread::sleep(next - now);
+            } else {
+                next = now; // fell behind; do not try to catch up with a burst
+            }
+        }
+        let _ = self.sock.send(&proto::encode(&HeadsetMessage::Disconnect));
+    }
+}

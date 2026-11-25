@@ -1,0 +1,10 @@
+[package]
+name = "openlink-tracking"
+description = "Pose math and the PC-side prediction policy that makes OpenLink controllers behave like native SteamVR devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openlink-protocol.workspace = true
+glam.workspace = true

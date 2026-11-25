@@ -1,0 +1,19 @@
+[package]
+name = "openlink-server"
+description = "OpenLink desktop app: headset session, encoder control and GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openlink"
+path = "src/main.rs"
+
+[dependencies]
+openlink-protocol.workspace = true
+serde.workspace = true
+log.workspace = true
+env_logger.workspace = true
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde_json = "1.0.154"
+dirs = "7.0.0"
