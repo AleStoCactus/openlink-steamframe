@@ -53,8 +53,11 @@ pub struct Output {
 /// Decoded pictures allowed to wait for display. One picture per display frame keeps motion
 /// smooth when decode times jitter; a longer backlog is latency, so the oldest are dropped.
 const MAX_BACKLOG: usize = 2;
-/// Display frames a standing backlog is tolerated before a picture is skipped.
-const CATCH_UP_AFTER: u32 = 4;
+/// Display frames a standing backlog is tolerated before a picture is skipped. With SteamVR's
+/// vsync phase-locked to the display (pictures arrive ~4 ms early), a backlog means one
+/// picture came late: skipping to the newest straight away costs one short hitch, whereas
+/// waiting showed a repeat and then, frames later, a skip.
+const CATCH_UP_AFTER: u32 = 1;
 /// Frame numbers further apart than this belong to different server sessions.
 const RESTART_DISTANCE: i32 = 300;
 

@@ -504,6 +504,8 @@ fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) 
         return;
     }
     let frame_id = c.next_frame_id;
+    let from_compositor =
+        c.sets.iter().any(|s| s.compositor && s.textures.iter().any(|t| t.handle == base[0].hTexture));
     let eye = |e: &SubmitLayerPerEye_t| vipc::EyeLayer {
         texture: e.hTexture,
         bounds: [e.bounds.uMin, e.bounds.vMin, e.bounds.uMax, e.bounds.vMax],
@@ -511,7 +513,13 @@ fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) 
     let msg = vipc::DriverVideoMsg::Frame {
         frame_id,
         eyes: [eye(&base[0]), eye(&base[1])],
-        hmd_pose: crate::render_pose::correct(&base[0].mHmdPose, VSYNC_PERIOD_NS.load(Ordering::Acquire)),
+        // The compositor's own layer reports the pose one frame stale; an application's layer
+        // reports the pose it really rendered with (both measured against the mock headset).
+        hmd_pose: if from_compositor {
+            crate::render_pose::correct(&base[0].mHmdPose, VSYNC_PERIOD_NS.load(Ordering::Acquire))
+        } else {
+            base[0].mHmdPose
+        },
         present_ns: target_vsync_ns(now_ns),
     };
     if !video::send_frame(&msg) {

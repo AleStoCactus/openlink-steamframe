@@ -1,8 +1,9 @@
 //! The pose each frame was really rendered with.
 //!
-//! SteamVR's compositor reports one pose per submitted frame (`mHmdPose`), but measurements
-//! show it is one frame stale: frame N's content was rendered with the pose it reports for
-//! frame N+1. The headset reprojects every frame from its reported pose, so a stale pose turns
+//! SteamVR's compositor reports one pose per submitted frame (`mHmdPose`), but for its own
+//! layer measurements show it is one frame stale: frame N's content was rendered with the pose
+//! it reports for frame N+1. (An application's layer reports its pose correctly and is left
+//! alone: correcting it made games' frames a frame ahead of their content.) The headset reprojects every frame from its reported pose, so a stale pose turns
 //! head motion into world jitter.
 //!
 //! The head is reported to SteamVR without velocity (see `link`), so `mHmdPose` is exactly
