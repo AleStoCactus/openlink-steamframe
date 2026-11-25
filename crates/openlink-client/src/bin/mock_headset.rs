@@ -1,7 +1,7 @@
 //! A fake Quest for testing the PC side (server + SteamVR driver) without a headset.
 //!
 //! ```text
-//! mock-headset [SERVER_ADDR] [--rate HZ] [--delay-ms MS] [--spin-tilted]
+//! mock-headset [SERVER_ADDR] [--rate HZ] [--delay-ms MS] [--spin-tilted] [--video-out PATH]
 //! ```
 //!
 //! * default: head gently sways, both controllers do fast Beat Saber style vertical swings
@@ -12,6 +12,8 @@
 //! * `--spin-tilted`: controllers spin at a constant rate about an axis tilted away from every
 //!   world and body axis. Used to settle whether `DriverPose_t::vecAngularVelocity` is in
 //!   world or local space: with the wrong space, the spin wobbles instead of staying on-axis.
+//! * `--video-out PATH`: write the received video stream (Annex B) to PATH. Either way, video
+//!   statistics and the frames' render poses are logged every few seconds.
 
 use glam::{DQuat, DVec3};
 use openlink_client::{Client, TrackingSource};
@@ -144,6 +146,7 @@ fn main() {
     let mut rate = 500.0;
     let mut delay_ms = 0.0;
     let mut spin_tilted = false;
+    let mut video_out: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--rate" => rate = args.next().and_then(|v| v.parse().ok()).expect("--rate HZ"),
@@ -154,9 +157,10 @@ fn main() {
                     .expect("--delay-ms MS")
             }
             "--spin-tilted" => spin_tilted = true,
+            "--video-out" => video_out = Some(args.next().expect("--video-out PATH")),
             "-h" | "--help" => {
                 println!(
-                    "usage: mock-headset [SERVER_ADDR] [--rate HZ] [--delay-ms MS] [--spin-tilted]"
+                    "usage: mock-headset [SERVER_ADDR] [--rate HZ] [--delay-ms MS] [--spin-tilted] [--video-out PATH]"
                 );
                 return;
             }
@@ -178,6 +182,45 @@ fn main() {
     log::info!(
         "mock headset -> {addr} at {rate} Hz (delay {delay_ms} ms, spin_tilted {spin_tilted})"
     );
+    let frames = client.video_frames().expect("video receiver");
+    let state = client.state();
+    std::thread::spawn(move || video_sink(frames, state, video_out));
     let stop = AtomicBool::new(false);
     client.run(&mut mock, rate, &stop);
+}
+
+/// Stands in for the decoder: optionally writes the stream, and logs what arrives.
+fn video_sink(
+    frames: std::sync::mpsc::Receiver<openlink_protocol::video::Frame>,
+    state: std::sync::Arc<std::sync::Mutex<openlink_client::ClientState>>,
+    out: Option<String>,
+) {
+    use std::io::Write;
+    let mut file = out.map(|p| std::fs::File::create(&p).unwrap_or_else(|e| panic!("{p}: {e}")));
+    let (mut since, mut count, mut bytes, mut idrs) = (std::time::Instant::now(), 0u32, 0usize, 0u32);
+    for f in frames {
+        if let Some(file) = &mut file {
+            file.write_all(&f.bitstream).expect("write video");
+        }
+        count += 1;
+        bytes += f.bitstream.len();
+        idrs += f.info.idr as u32;
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed >= 5.0 {
+            let st = state.lock().unwrap().clone();
+            let p = f.info.render_pose;
+            log::info!(
+                "video: {:.1} fps, {:.1} Mbit/s, {idrs} IDR, total {} frames / {} lost / {} dropped / {} overflow; render pose {:.2?} {:.3?}",
+                count as f64 / elapsed,
+                bytes as f64 * 8.0 / elapsed / 1e6,
+                st.video.frames,
+                st.video.lost_frames,
+                st.video.dropped_frames,
+                st.video_overflow,
+                p.position,
+                p.orientation,
+            );
+            (since, count, bytes, idrs) = (std::time::Instant::now(), 0, 0, 0);
+        }
+    }
 }

@@ -8,8 +8,11 @@
 //!                                          compute: both eyes -> side-by-side NV12  ──┐
 //!            ◄──Release{frame}──────────  (textures free again)                       │
 //!                                          encode queue: Vulkan Video H.265  ◄─────────┘
-//!                                          -> Annex B bitstream (file dump for now)
+//!                                          -> Annex B bitstream -> UDP to the headset
 //! ```
+//!
+//! Each frame goes to the headset as [`openlink_protocol::video`] datagrams, with the HMD pose
+//! SteamVR rendered it with. New headsets and reported losses get an IDR.
 //!
 //! One frame is in flight at a time. If frames queue up while one is encoded, only the newest
 //! is processed and the older ones are released straight away.
@@ -20,11 +23,11 @@ mod import;
 mod vk;
 
 use crate::config::Settings;
-use crate::session::Status;
+use crate::session::{Status, VideoSink};
 use ash::vk as avk;
 use import::{color_range, Imported};
 use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
-use openlink_protocol::{self as proto};
+use openlink_protocol::{self as proto, video};
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
@@ -45,14 +48,21 @@ struct Shared {
     status: Arc<Mutex<Status>>,
     settings: Arc<Mutex<Settings>>,
     dump: Option<PathBuf>,
+    sink: Option<Arc<VideoSink>>,
 }
 
 impl VideoService {
     /// Listens for the driver. `dump`: append every encoded frame to this file (raw H.265).
-    pub fn start(status: Arc<Mutex<Status>>, settings: Arc<Mutex<Settings>>, dump: Option<PathBuf>) -> std::io::Result<Self> {
+    /// `sink`: where frames go (the headset session).
+    pub fn start(
+        status: Arc<Mutex<Status>>,
+        settings: Arc<Mutex<Settings>>,
+        sink: Option<VideoSink>,
+        dump: Option<PathBuf>,
+    ) -> std::io::Result<Self> {
         let listener = Listener::bind()?;
         let stop = Arc::new(AtomicBool::new(false));
-        let shared = Shared { status, settings, dump };
+        let shared = Shared { status, settings, dump, sink: sink.map(Arc::new) };
         let thread = {
             let stop = stop.clone();
             std::thread::Builder::new()
@@ -90,6 +100,8 @@ impl Drop for VideoService {
 struct Frame {
     id: u64,
     eyes: [vipc::EyeLayer; 2],
+    hmd_pose: [[f32; 4]; 3],
+    present_ns: i64,
 }
 
 /// What to encode: per-eye picture size and frame rate.
@@ -297,6 +309,7 @@ struct Stats {
     bytes: u64,
     convert: Duration,
     encode: Duration,
+    send_errors: u32,
 }
 
 struct Connection<'a> {
@@ -305,6 +318,7 @@ struct Connection<'a> {
     imports: HashMap<u64, Imported>,
     pipeline: Option<Pipeline>,
     dump: Option<std::fs::File>,
+    packetizer: video::Packetizer,
     stats: Stats,
     failed: bool,
 }
@@ -321,7 +335,16 @@ impl<'a> Connection<'a> {
                 None
             }
         });
-        Self { shared, ctx: None, imports: HashMap::new(), pipeline: None, dump, stats: Stats::default(), failed: false }
+        Self {
+            shared,
+            ctx: None,
+            imports: HashMap::new(),
+            pipeline: None,
+            dump,
+            packetizer: video::Packetizer::default(),
+            stats: Stats::default(),
+            failed: false,
+        }
     }
 
     fn run(mut self, ch: &Channel, stop: &AtomicBool) {
@@ -353,8 +376,8 @@ impl<'a> Connection<'a> {
                     Ok(DriverVideoMsg::Hello { driver_version }) => log::info!("video: driver {driver_version}"),
                     Ok(DriverVideoMsg::TextureSet(set)) => self.import_set(&set, fds),
                     Ok(DriverVideoMsg::TexturesDestroyed { handles }) => self.forget(&handles),
-                    Ok(DriverVideoMsg::Frame { frame_id, eyes, .. }) => {
-                        if let Some(old) = newest.replace(Frame { id: frame_id, eyes }) {
+                    Ok(DriverVideoMsg::Frame { frame_id, eyes, hmd_pose, present_ns }) => {
+                        if let Some(old) = newest.replace(Frame { id: frame_id, eyes, hmd_pose, present_ns }) {
                             self.stats.skipped += 1;
                             release(old.id);
                         }
@@ -456,8 +479,27 @@ impl<'a> Connection<'a> {
         release(frame.id);
         converted?;
         let t1 = Instant::now();
-        let bitstream = p.encoder.encode(ctx, p.converted)?;
+        let sink = self.shared.sink.as_deref();
+        if sink.is_some_and(VideoSink::take_idr_request) {
+            p.encoder.request_idr();
+        }
+        let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;
         let t2 = Instant::now();
+
+        if let Some((sink, addr)) = sink.and_then(|s| Some((s, s.headset()?))) {
+            let info = video::FrameInfo {
+                idr,
+                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
+                present_ns: frame.present_ns,
+            };
+            let mut send_errors = 0;
+            self.packetizer.packetize(&info, &bitstream, |d| {
+                if sink.send(d, addr).is_err() {
+                    send_errors += 1;
+                }
+            });
+            self.stats.send_errors += send_errors;
+        }
 
         if let Some(f) = &mut self.dump {
             if let Err(e) = f.write_all(&bitstream) {
@@ -475,13 +517,14 @@ impl<'a> Connection<'a> {
         if elapsed >= Duration::from_secs(5) {
             let n = s.frames.max(1);
             log::info!(
-                "video: {:.1} fps, {:.1} Mbit/s, {:.0} KB/frame, convert {:.2} ms, encode {:.2} ms, {} skipped",
+                "video: {:.1} fps, {:.1} Mbit/s, {:.0} KB/frame, convert {:.2} ms, encode {:.2} ms, {} skipped, {} send errors",
                 s.frames as f64 / elapsed.as_secs_f64(),
                 s.bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
                 s.bytes as f64 / n as f64 / 1e3,
                 s.convert.as_secs_f64() * 1e3 / n as f64,
                 s.encode.as_secs_f64() * 1e3 / n as f64,
-                s.skipped
+                s.skipped,
+                s.send_errors
             );
             *s = Stats::default();
         }
@@ -554,7 +597,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
                 check(d.queue_submit(ctx.compute_queue, &[submit], fence), "vkQueueSubmit (selftest)")?;
             }
             ctx.wait_fence(fence, "selftest prep")?;
-            let bs = enc.encode(&ctx, sem).map_err(|e| format!("frame {i}: {e}"))?;
+            let (bs, _) = enc.encode(&ctx, sem).map_err(|e| format!("frame {i}: {e}"))?;
             bytes += bs.len();
             if let Some(f) = &mut out {
                 f.write_all(&bs).map_err(|e| e.to_string())?;

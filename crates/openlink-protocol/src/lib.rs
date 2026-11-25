@@ -3,7 +3,7 @@
 //! Three links use these types:
 //!
 //! * **headset <-> server**: [`HeadsetMessage`] / [`ServerMessage`] over UDP (tracking, input,
-//!   haptics, clock sync) plus, later, the video/audio streams.
+//!   haptics, clock sync), and the [`video`] stream on the same socket.
 //! * **server <-> SteamVR driver**: [`ToDriver`] / [`FromDriver`] over loopback UDP. The driver
 //!   lives inside `vrserver` and never touches the network itself; it only receives tracking that
 //!   the server has already converted into the PC clock domain.
@@ -15,6 +15,7 @@
 
 pub mod clock;
 pub mod time;
+pub mod video;
 #[cfg(target_os = "linux")]
 pub mod video_ipc;
 
@@ -22,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -53,6 +54,27 @@ impl Pose {
         position: [0.0; 3],
         orientation: [0.0, 0.0, 0.0, 1.0],
     };
+
+    /// From a row-major 3x4 rigid transform (OpenVR's `HmdMatrix34_t`).
+    pub fn from_matrix34(m: &[[f32; 4]; 3]) -> Pose {
+        let (m00, m11, m22) = (m[0][0], m[1][1], m[2][2]);
+        let trace = m00 + m11 + m22;
+        let q = if trace > 0.0 {
+            let s = (trace + 1.0).sqrt() * 2.0;
+            [(m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s, 0.25 * s]
+        } else if m00 > m11 && m00 > m22 {
+            let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+            [0.25 * s, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s]
+        } else if m11 > m22 {
+            let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+            [(m[0][1] + m[1][0]) / s, 0.25 * s, (m[1][2] + m[2][1]) / s, (m[0][2] - m[2][0]) / s]
+        } else {
+            let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+            [(m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, 0.25 * s, (m[1][0] - m[0][1]) / s]
+        };
+        let n = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        Pose { position: [m[0][3], m[1][3], m[2][3]], orientation: q.map(|v| v / n) }
+    }
 }
 
 /// A pose plus its first derivatives, as reported by the headset runtime **at the sample time**.
@@ -208,6 +230,11 @@ pub enum HeadsetMessage {
         right: f32,
         charging: bool,
     },
+    /// Video frames were lost; the server should send an IDR. `frame` is the first number the
+    /// headset knows it missed.
+    VideoLoss {
+        frame: u32,
+    },
     Disconnect,
 }
 
@@ -322,6 +349,17 @@ mod tests {
         let bytes = encode(&msg);
         assert!(bytes.len() < MAX_DATAGRAM, "{} bytes", bytes.len());
         assert_eq!(decode::<HeadsetMessage>(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn pose_from_matrix() {
+        // 90 degrees about +Y: x -> -z.
+        let m = [[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 2.0], [-1.0, 0.0, 0.0, 3.0]];
+        let p = Pose::from_matrix34(&m);
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let expected = [0.0, h, 0.0, h];
+        assert!(p.orientation.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-6), "{p:?}");
+        assert_eq!(p.position, [1.0, 2.0, 3.0]);
     }
 
     #[test]

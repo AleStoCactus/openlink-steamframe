@@ -47,11 +47,36 @@ struct Shared {
     settings: Arc<Mutex<Settings>>,
     headset_addr: Mutex<Option<SocketAddr>>,
     headset_info: Mutex<Option<HeadsetInfo>>,
+    /// The headset needs an IDR: it just connected, or reported lost video.
+    idr_requested: AtomicBool,
     stop: AtomicBool,
+}
+
+/// Where the video thread sends frames: the session's own socket, so the headset sees one
+/// peer, and the current headset address.
+pub struct VideoSink {
+    sock: UdpSocket,
+    shared: Arc<Shared>,
+}
+
+impl VideoSink {
+    pub fn headset(&self) -> Option<SocketAddr> {
+        *self.shared.headset_addr.lock().unwrap()
+    }
+
+    pub fn send(&self, datagram: &[u8], to: SocketAddr) -> std::io::Result<()> {
+        self.sock.send_to(datagram, to).map(|_| ())
+    }
+
+    /// Whether an IDR was requested since the last call.
+    pub fn take_idr_request(&self) -> bool {
+        self.shared.idr_requested.swap(false, Ordering::AcqRel)
+    }
 }
 
 pub struct Session {
     shared: Arc<Shared>,
+    sock: UdpSocket,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -63,6 +88,8 @@ impl Session {
         let headset_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, proto::SERVER_PORT))?;
         headset_sock.set_read_timeout(Some(Duration::from_millis(10)))?;
         let driver_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT))?;
+        let video_sock = headset_sock.try_clone()?;
+        set_send_buffer(&video_sock, 8 << 20);
         driver_sock.set_read_timeout(Some(Duration::from_millis(100)))?;
 
         let shared = Arc::new(Shared {
@@ -70,6 +97,7 @@ impl Session {
             settings,
             headset_addr: Mutex::new(None),
             headset_info: Mutex::new(None),
+            idr_requested: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
 
@@ -92,8 +120,13 @@ impl Session {
         log::info!("listening for headsets on UDP {}", proto::SERVER_PORT);
         Ok(Self {
             shared,
+            sock: video_sock,
             threads: vec![headset_thread, driver_thread],
         })
+    }
+
+    pub fn video_sink(&self) -> std::io::Result<VideoSink> {
+        Ok(VideoSink { sock: self.sock.try_clone()?, shared: self.shared.clone() })
     }
 }
 
@@ -104,6 +137,29 @@ impl Drop for Session {
             let _ = t.join();
         }
     }
+}
+
+/// A frame is sent as one burst of a few hundred datagrams; the default buffer drops some.
+fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid socket and option value.
+        let r = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const bytes).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            log::warn!("cannot enlarge the UDP send buffer: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (sock, bytes);
 }
 
 fn driver_addr() -> SocketAddr {
@@ -193,6 +249,7 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
             if current != Some(from) {
                 log::info!("headset {} connected from {from}", info.model);
                 clock = ClockSync::default();
+                shared.idr_requested.store(true, Ordering::Release);
             }
             let cfg = stream_config(&shared.settings.lock().unwrap(), info);
             let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg)), from);
@@ -259,6 +316,10 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                         charging,
                     },
                 );
+            }
+            HeadsetMessage::VideoLoss { frame } => {
+                log::debug!("headset lost video at frame {frame}");
+                shared.idr_requested.store(true, Ordering::Release);
             }
             HeadsetMessage::Disconnect => {
                 log::info!("headset {from} disconnected");

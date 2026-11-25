@@ -14,3 +14,6 @@ openlink-protocol.workspace = true
 glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

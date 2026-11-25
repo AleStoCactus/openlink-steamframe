@@ -7,15 +7,16 @@
 //! * the **tracking thread** (the caller of [`Client::run`]) samples at a fixed high rate and
 //!   sends immediately;
 //! * a **receive thread** answers clock pings the instant they arrive, so the `t1`/`t2`
-//!   timestamps are not inflated by waiting for the next tracking tick.
+//!   timestamps are not inflated by waiting for the next tracking tick. It also reassembles
+//!   the video stream and hands complete frames to [`Client::video_frames`].
 
 use openlink_protocol::{
-    self as proto, time::monotonic_ns, HapticPulse, HeadsetInfo, HeadsetMessage, ServerMessage,
-    StreamConfig, TrackingSample,
+    self as proto, time::monotonic_ns, video, HapticPulse, HeadsetInfo, HeadsetMessage,
+    ServerMessage, StreamConfig, TrackingSample,
 };
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,13 +30,20 @@ pub trait TrackingSource {
 #[derive(Debug, Clone, Default)]
 pub struct ClientState {
     pub welcome: Option<StreamConfig>,
+    pub video: video::ReassemblyStats,
+    /// Complete frames dropped because the consumer of [`Client::video_frames`] fell behind.
+    pub video_overflow: u64,
 }
+
+/// Frames waiting for the decoder. More than this and the oldest are of no use anyway.
+const VIDEO_QUEUE: usize = 4;
 
 pub struct Client {
     sock: UdpSocket,
     server: SocketAddr,
     state: Arc<Mutex<ClientState>>,
     haptics: Receiver<HapticPulse>,
+    video: Option<Receiver<video::Frame>>,
 }
 
 impl Client {
@@ -49,8 +57,10 @@ impl Client {
         .unwrap();
         let sock = UdpSocket::bind(bind)?;
         sock.connect(server)?;
+        set_recv_buffer(&sock, 4 << 20);
         let state = Arc::new(Mutex::new(ClientState::default()));
         let (tx, haptics) = mpsc::channel();
+        let (video_tx, video) = mpsc::sync_channel(VIDEO_QUEUE);
 
         let rx_sock = sock.try_clone()?;
         let rx_state = state.clone();
@@ -58,6 +68,7 @@ impl Client {
             .name("openlink-rx".into())
             .spawn(move || {
                 let mut buf = [0u8; 2048];
+                let mut reassembler = video::Reassembler::default();
                 loop {
                     let n = match rx_sock.recv(&mut buf) {
                         Ok(n) => n,
@@ -65,6 +76,10 @@ impl Client {
                         Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => continue,
                         Err(_) => return,
                     };
+                    if video::is_video(&buf[..n]) {
+                        on_video(&rx_sock, &mut reassembler, &buf[..n], &video_tx, &rx_state);
+                        continue;
+                    }
                     let t1 = monotonic_ns();
                     match proto::decode::<ServerMessage>(&buf[..n]) {
                         Ok(ServerMessage::ClockPing { t0 }) => {
@@ -99,7 +114,18 @@ impl Client {
             server,
             state,
             haptics,
+            video: Some(video),
         })
+    }
+
+    /// Complete, decodable video frames (starting at an IDR), oldest first. Can be taken once.
+    pub fn video_frames(&mut self) -> Option<Receiver<video::Frame>> {
+        self.video.take()
+    }
+
+    /// Live session state (welcome, video statistics), shared with the receive thread.
+    pub fn state(&self) -> Arc<Mutex<ClientState>> {
+        self.state.clone()
     }
 
     pub fn server(&self) -> SocketAddr {
@@ -142,4 +168,54 @@ impl Client {
         }
         let _ = self.sock.send(&proto::encode(&HeadsetMessage::Disconnect));
     }
+}
+
+fn on_video(
+    sock: &UdpSocket,
+    reassembler: &mut video::Reassembler,
+    datagram: &[u8],
+    frames: &SyncSender<video::Frame>,
+    state: &Mutex<ClientState>,
+) {
+    let result = reassembler.push(datagram);
+    match result {
+        Ok(frame) => match frames.try_send(frame) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(f)) => {
+                // The next frame would reference this one: recover with an IDR.
+                state.lock().unwrap().video_overflow += 1;
+                reassembler.require_idr();
+                let _ = sock.send(&proto::encode(&HeadsetMessage::VideoLoss { frame: f.number }));
+            }
+        },
+        Err(video::Event::Loss) => {
+            let frame = reassembler.stats.lost_frames as u32;
+            let _ = sock.send(&proto::encode(&HeadsetMessage::VideoLoss { frame }));
+        }
+        Err(video::Event::Pending) => return,
+    }
+    state.lock().unwrap().video = reassembler.stats;
+}
+
+/// A frame arrives as a burst of a few hundred datagrams; the default buffer drops some.
+fn set_recv_buffer(sock: &UdpSocket, bytes: i32) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: valid socket and option value.
+        let r = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const bytes).cast(),
+                std::mem::size_of::<i32>() as libc::socklen_t,
+            )
+        };
+        if r != 0 {
+            log::warn!("cannot enlarge the UDP receive buffer: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (sock, bytes);
 }

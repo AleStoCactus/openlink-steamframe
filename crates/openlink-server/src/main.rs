@@ -49,7 +49,8 @@ fn main() {
             .position(|a| a == "--dump-video")
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from);
-        match video::VideoService::start(status.clone(), settings.clone(), dump) {
+        let sink = session.as_ref().and_then(|s| s.video_sink().ok());
+        match video::VideoService::start(status.clone(), settings.clone(), sink, dump) {
             Ok(v) => Some(v),
             Err(e) => {
                 log::error!("cannot listen for the driver's video link: {e}");

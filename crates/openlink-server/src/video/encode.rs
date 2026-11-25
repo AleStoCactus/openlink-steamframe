@@ -494,8 +494,9 @@ impl Encoder {
     }
 
     /// Encodes the picture in `src` (in `TRANSFER_DST_OPTIMAL`, written by work that signals
-    /// `wait`) and returns the Annex B bitstream. Blocks until the GPU is done.
-    pub fn encode(&mut self, ctx: &Context, wait: vk::Semaphore) -> Result<Vec<u8>> {
+    /// `wait`) and returns the Annex B bitstream and whether it is an IDR. Blocks until the
+    /// GPU is done.
+    pub fn encode(&mut self, ctx: &Context, wait: vk::Semaphore) -> Result<(Vec<u8>, bool)> {
         let d = &ctx.device;
         let vq = &ctx.video_queue;
         let idr = std::mem::take(&mut self.idr_requested) || self.frame_in_gop == 0 || self.frame_in_gop >= MAX_GOP;
@@ -674,7 +675,7 @@ impl Encoder {
             }
             out.extend_from_slice(std::slice::from_raw_parts(self.bitstream_ptr.add(offset as usize), size as usize));
             self.frame_in_gop += 1;
-            Ok(out)
+            Ok((out, idr))
         }
     }
 
