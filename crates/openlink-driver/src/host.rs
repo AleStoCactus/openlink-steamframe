@@ -2,7 +2,7 @@
 
 use crate::ovr::*;
 use std::ffi::{c_void, CStr, CString};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Host interfaces fetched once in `Init`. SteamVR documents them as callable from any thread.
 pub struct Host {
@@ -10,6 +10,11 @@ pub struct Host {
     props: *mut Iface<IVRProperties_Vtbl>,
     input: *mut Iface<IVRDriverInput_Vtbl>,
     log: *mut Iface<IVRDriverLog_Vtbl>,
+    ctx: *mut Iface<IVRDriverContext_Vtbl>,
+    /// Linux only. Fetched on first use: vrserver serves it through the compositor, which it
+    /// only starts after every driver's `Init`, so asking during `Init` fails with
+    /// `VRInitError_IPC_ServerInitFailed`.
+    ipc: Mutex<Option<*mut Iface<IVRIPCResourceManagerClient_Vtbl>>>,
 }
 
 // SAFETY: the pointers are owned by vrserver, outlive the driver, and are thread-safe.
@@ -29,33 +34,35 @@ macro_rules! call {
     }};
 }
 
+/// # Safety
+/// `ctx` must be the live `IVRDriverContext`.
+unsafe fn get<V>(ctx: *mut Iface<IVRDriverContext_Vtbl>, name: &[u8]) -> Result<*mut Iface<V>, EVRInitError> {
+    let mut err = VRInitError_None;
+    let p = call!(ctx, GetGenericInterface, name.as_ptr().cast(), &mut err);
+    if p.is_null() || err != VRInitError_None {
+        Err(if err == VRInitError_None {
+            VRInitError_Init_InterfaceNotFound
+        } else {
+            err
+        })
+    } else {
+        Ok(p.cast())
+    }
+}
+
 impl Host {
     /// # Safety
     /// `ctx` must be the `IVRDriverContext` SteamVR passed to `Init`.
     pub unsafe fn init(
         ctx: *mut Iface<IVRDriverContext_Vtbl>,
     ) -> Result<&'static Host, EVRInitError> {
-        unsafe fn get<V>(
-            ctx: *mut Iface<IVRDriverContext_Vtbl>,
-            name: &[u8],
-        ) -> Result<*mut Iface<V>, EVRInitError> {
-            let mut err = VRInitError_None;
-            let p = call!(ctx, GetGenericInterface, name.as_ptr().cast(), &mut err);
-            if p.is_null() || err != VRInitError_None {
-                Err(if err == VRInitError_None {
-                    VRInitError_Init_InterfaceNotFound
-                } else {
-                    err
-                })
-            } else {
-                Ok(p.cast())
-            }
-        }
         let host = Host {
             server: get(ctx, IVRServerDriverHost_Version)?,
             props: get(ctx, IVRProperties_Version)?,
             input: get(ctx, IVRDriverInput_Version)?,
             log: get(ctx, IVRDriverLog_Version)?,
+            ctx,
+            ipc: Mutex::new(None),
         };
         Ok(HOST.get_or_init(|| host))
     }
@@ -107,6 +114,46 @@ impl Host {
     pub fn set_render_target_size(&self, id: u32, w: u32, h: u32) {
         // SAFETY: valid interface.
         unsafe { call!(self.server, SetRecommendedRenderTargetSize, id, w, h) }
+    }
+
+    /// `IVRIPCResourceManagerClient`, fetched on first successful use (see the `ipc` field).
+    fn ipc(&self) -> Option<*mut Iface<IVRIPCResourceManagerClient_Vtbl>> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        let mut slot = self.ipc.lock().unwrap();
+        if slot.is_none() {
+            // SAFETY: the context outlives the driver.
+            match unsafe { get(self.ctx, IVRIPCResourceManagerClient_Version) } {
+                Ok(p) => {
+                    log::info!("IVRIPCResourceManagerClient acquired");
+                    *slot = Some(p);
+                }
+                Err(e) => log::error!("IVRIPCResourceManagerClient unavailable (error {e})"),
+            }
+        }
+        *slot
+    }
+
+    /// Ask SteamVR to allocate a Vulkan image it can share between the compositor, apps and us.
+    pub fn new_shared_vulkan_image(&self, vk_format: u32, width: u32, height: u32) -> Option<SharedTextureHandle_t> {
+        let ipc = self.ipc()?;
+        let mut h = 0;
+        // SAFETY: valid interface and out pointer.
+        let ok = unsafe { call!(ipc, NewSharedVulkanImage, vk_format, width, height, true, false, false, 1, 1, 0, 0, &mut h) };
+        (ok && h != 0).then_some(h)
+    }
+
+    pub fn unref_resource(&self, h: SharedTextureHandle_t) {
+        if let Some(ipc) = self.ipc() {
+            // SAFETY: valid interface.
+            unsafe { call!(ipc, UnrefResource, h) };
+        }
+    }
+
+    pub fn vsync_event(&self, offset_s: f64) {
+        // SAFETY: valid interface.
+        unsafe { call!(self.server, VsyncEvent, offset_s) }
     }
 
     pub fn container(&self, id: u32) -> PropertyContainerHandle_t {

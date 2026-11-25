@@ -4,8 +4,9 @@ PC VR streaming for standalone headsets that behaves like a native SteamVR heads
 controller prediction, hardware H.264/HEVC/AV1 encoding on every GPU vendor, Wi-Fi or USB, Windows and Linux.
 
 **Status: early skeleton.** Tracking flows from a mock headset through the server to the driver's
-loopback endpoint. The driver has not yet been loaded in a live SteamVR session. There is no video yet, and
-no Quest app yet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
+loopback endpoint, and the driver runs in live SteamVR (tested with 2.19 on Linux). On Linux the HMD uses
+direct mode, so SteamVR's compositor renders into driver-owned textures. Those frames are not encoded or
+streamed yet, and there is no Quest app yet. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and roadmap.
 
 ## Layout
 
@@ -28,6 +29,9 @@ cargo run --release -p openlink-server          # the desktop app
 cargo run --release -p openlink-client --bin mock-headset
 # now start SteamVR: an OpenLink HMD and two Touch controllers appear, swinging
 ```
+
+Start SteamVR from Steam (or `steam steam://run/250820`), not by running `vrstartup.sh` directly. Without
+Steam's runtime launcher service, `vrcompositor` cannot start.
 
 `scripts/install-driver.sh --remove` unregisters the driver.
 

@@ -62,6 +62,14 @@ unsafe extern "C" fn debug_request(_: *mut c_void, _: *const c_char, resp: *mut 
 pub struct Hmd {
     vtable: &'static ITrackedDeviceServerDriver_Vtbl,
     display: DisplayObj,
+    direct_mode: crate::direct_mode::DirectModeObj,
+}
+
+/// Whether the HMD exposes `IVRDriverDirectModeComponent` (compositor renders into our
+/// textures) instead of the "display on desktop" path. Linux allocates the textures through
+/// SteamVR's IPC resource manager; Windows support comes with the D3D11 texture path.
+pub const fn use_direct_mode() -> bool {
+    cfg!(target_os = "linux")
 }
 
 #[repr(C)]
@@ -76,6 +84,7 @@ impl Default for Hmd {
             display: DisplayObj {
                 vtable: &DISPLAY_VTBL,
             },
+            direct_mode: crate::direct_mode::DirectModeObj::default(),
         }
     }
 }
@@ -106,15 +115,21 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.set_f32(c, prop::SecondsFromVsyncToPhotons_Float, 0.0);
         h.set_u64(c, prop::CurrentUniverseId_Uint64, 0x4F4C_4E4B); // "OLNK"
         h.set_bool(c, prop::IsOnDesktop_Bool, false);
+        h.set_bool(c, prop::DriverDirectModeSendsVsyncEvents_Bool, use_direct_mode());
         h.set_bool(c, prop::DeviceIsWireless_Bool, true);
         h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, true);
         h.pose_updated(id, &DriverPose_t::disconnected());
-        log::info!("HMD activated as device {id}");
+        if use_direct_mode() {
+            let vsync = crate::direct_mode::VsyncThread::start(|| shared().display.lock().unwrap().refresh_rate);
+            *crate::VSYNC.lock().unwrap() = Some(vsync);
+        }
+        log::info!("HMD activated as device {id} (direct mode: {})", use_direct_mode());
         VRInitError_None
     })
 }
 
 unsafe extern "C" fn hmd_deactivate(_this: *mut c_void) {
+    crate::VSYNC.lock().unwrap().take();
     shared()
         .hmd_id
         .store(k_unTrackedDeviceIndexInvalid, Ordering::Release);
@@ -125,19 +140,23 @@ unsafe extern "C" fn hmd_get_component(this: *mut c_void, name: *const c_char) -
         let hmd = this.cast::<Hmd>();
         return std::ptr::addr_of_mut!((*hmd).display).cast();
     }
+    if component_is(name, IVRDriverDirectModeComponent_Version) && use_direct_mode() {
+        let hmd = this.cast::<Hmd>();
+        return std::ptr::addr_of_mut!((*hmd).direct_mode).cast();
+    }
     std::ptr::null_mut()
 }
 
-// Display component. This milestone uses SteamVR's "extended" path: it renders into a desktop
-// window we describe here, which is enough to validate tracking. Frame capture for streaming
-// (IVRDriverDirectModeComponent / IVRVirtualDisplay) replaces it in the video milestone.
+// Display component. With direct mode the compositor renders into our swap textures and only
+// uses this for projection/render size. Without it (Windows, for now) SteamVR falls back to
+// rendering into a desktop window described here.
 
 const WINDOW_W: u32 = 1920;
 const WINDOW_H: u32 = 1080;
 
 static DISPLAY_VTBL: IVRDisplayComponent_Vtbl = IVRDisplayComponent_Vtbl {
     GetWindowBounds: disp_window_bounds,
-    IsDisplayOnDesktop: disp_true,
+    IsDisplayOnDesktop: disp_on_desktop,
     IsDisplayRealDisplay: disp_false,
     GetRecommendedRenderTargetSize: disp_render_target,
     GetEyeOutputViewport: disp_eye_viewport,
@@ -146,8 +165,8 @@ static DISPLAY_VTBL: IVRDisplayComponent_Vtbl = IVRDisplayComponent_Vtbl {
     ComputeInverseDistortion: disp_inverse_distortion,
 };
 
-unsafe extern "C" fn disp_true(_: *mut c_void) -> bool {
-    true
+unsafe extern "C" fn disp_on_desktop(_: *mut c_void) -> bool {
+    !use_direct_mode()
 }
 unsafe extern "C" fn disp_false(_: *mut c_void) -> bool {
     false

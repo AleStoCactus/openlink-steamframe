@@ -110,9 +110,11 @@ preferred wired path.
   `IVRDisplayComponent` ("display on desktop") path fails with `CHmdWindowSDL: VR requires direct
   mode` / `VRInitError_Compositor_CannotDRMLeaseDisplay`. vrserver and tracking work, but the
   compositor does not start, so Linux needs a direct mode driver before anything renders.
-  SteamVR's direct mode driver path is designed around Windows/D3D.
-  The candidates are `IVRVirtualDisplay` and Vulkan external memory, or a Vulkan layer in
-  `vrcompositor`. This needs a spike before any encoder work on Linux.
+  Resolved: the HMD exposes `IVRDriverDirectModeComponent` on Linux and allocates swap textures
+  with `IVRIPCResourceManagerClient::NewSharedVulkanImage`, and the compositor then runs at the
+  headset refresh rate. That interface is only available once `vrcompositor` is up, after
+  driver `Init`, so it is fetched lazily. Next step: import the textures into the encoder via
+  `RefResource` + `ReceiveSharedFd`.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.

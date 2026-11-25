@@ -7,6 +7,7 @@
 //! restart there never takes SteamVR down.
 
 pub mod devices;
+pub mod direct_mode;
 pub mod host;
 pub mod link;
 pub mod ovr;
@@ -64,6 +65,7 @@ static PROVIDER: SyncProvider = SyncProvider(Provider {
 });
 
 static LINK: Mutex<Option<link::Link>> = Mutex::new(None);
+pub(crate) static VSYNC: Mutex<Option<direct_mode::VsyncThread>> = Mutex::new(None);
 
 unsafe extern "C" fn provider_init(
     _this: *mut c_void,
@@ -112,6 +114,7 @@ unsafe extern "C" fn provider_init(
 unsafe extern "C" fn provider_cleanup(_this: *mut c_void) {
     guard((), || {
         log::info!("OpenLink driver shutting down");
+        VSYNC.lock().unwrap().take();
         LINK.lock().unwrap().take();
     })
 }

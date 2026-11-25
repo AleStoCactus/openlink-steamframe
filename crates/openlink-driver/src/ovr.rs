@@ -74,6 +74,7 @@ pub mod prop {
     pub const UserIpdMeters_Float: i32 = 2003;
     pub const CurrentUniverseId_Uint64: i32 = 2004;
     pub const IsOnDesktop_Bool: i32 = 2007;
+    pub const DriverDirectModeSendsVsyncEvents_Bool: i32 = 2043;
     pub const ControllerRoleHint_Int32: i32 = 3007;
     pub const ControllerType_String: i32 = 7000;
 }
@@ -85,6 +86,10 @@ pub const IVRServerDriverHost_Version: &[u8] = b"IVRServerDriverHost_006\0";
 pub const IVRProperties_Version: &[u8] = b"IVRProperties_001\0";
 pub const IVRDriverInput_Version: &[u8] = b"IVRDriverInput_004\0";
 pub const IVRDriverLog_Version: &[u8] = b"IVRDriverLog_001\0";
+pub const IVRDriverDirectModeComponent_Version: &[u8] = b"IVRDriverDirectModeComponent_009\0";
+pub const IVRIPCResourceManagerClient_Version: &[u8] = b"IVRIPCResourceManagerClient_003\0";
+
+pub type SharedTextureHandle_t = u64;
 
 /// `k_InterfaceVersions`: what this driver was built against, returned from
 /// `GetInterfaceVersions`.
@@ -252,6 +257,60 @@ impl VREvent_t {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VRTextureBounds_t {
+    pub uMin: f32,
+    pub vMin: f32,
+    pub uMax: f32,
+    pub vMax: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SwapTextureSetDesc_t {
+    pub nWidth: u32,
+    pub nHeight: u32,
+    pub nFormat: u32,
+    pub nSampleCount: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SwapTextureSet_t {
+    pub rSharedTextureHandles: [SharedTextureHandle_t; 3],
+    pub unTextureFlags: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SubmitLayerPerEye_t {
+    pub hTexture: SharedTextureHandle_t,
+    pub hDepthTexture: SharedTextureHandle_t,
+    pub bounds: VRTextureBounds_t,
+    pub mProjection: [[f32; 4]; 4],
+    /// Row-major 3x4 `HmdMatrix34_t`: the HMD pose this layer was rendered with.
+    pub mHmdPose: [[f32; 4]; 3],
+    pub flHmdPosePredictionTimeInSecondsFromNow: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Throttling_t {
+    pub nFramesToThrottle: u32,
+    pub nAdditionalFramesToPredict: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DriverDirectMode_FrameTiming {
+    pub m_nSize: u32,
+    pub m_nNumFramePresents: u32,
+    pub m_nNumMisPresented: u32,
+    pub m_nNumDroppedFrames: u32,
+    pub m_nReprojectionFlags: u32,
+}
+
 // ------------------------------------------------------------------------------------------------
 // Interfaces implemented by SteamVR (we call these)
 // ------------------------------------------------------------------------------------------------
@@ -357,6 +416,35 @@ pub struct IVRDriverInput_Vtbl {
     ) -> EVRInputError,
 }
 
+/// Linux only. Its (protected, virtual) destructor is declared last, so it does not shift the
+/// slots below.
+#[repr(C)]
+pub struct IVRIPCResourceManagerClient_Vtbl {
+    pub NewSharedVulkanImage: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        format: u32,
+        width: u32,
+        height: u32,
+        renderable: bool,
+        mappable: bool,
+        compute_access: bool,
+        mip_levels: u32,
+        array_layers: u32,
+        extra_create_flags: u32,
+        extra_usage_flags: u32,
+        out: *mut SharedTextureHandle_t,
+    ) -> bool,
+    pub NewSharedVulkanBuffer: *const c_void,
+    pub NewSharedVulkanSemaphore: *const c_void,
+    pub RefResource:
+        unsafe extern "C" fn(this: *mut Iface<Self>, handle: SharedTextureHandle_t, new_ipc: *mut u64) -> bool,
+    pub UnrefResource: unsafe extern "C" fn(this: *mut Iface<Self>, handle: SharedTextureHandle_t) -> bool,
+    pub GetDmabufFormats: *const c_void,
+    pub GetDmabufModifiers: *const c_void,
+    pub ImportDmabuf: *const c_void,
+    pub ReceiveSharedFd: unsafe extern "C" fn(this: *mut Iface<Self>, ipc: u64, out_fd: *mut i32) -> bool,
+}
+
 #[repr(C)]
 pub struct IVRDriverLog_Vtbl {
     pub Log: unsafe extern "C" fn(this: *mut Iface<Self>, msg: *const c_char),
@@ -441,6 +529,26 @@ pub struct IVRDisplayComponent_Vtbl {
     ) -> bool,
 }
 
+#[repr(C)]
+pub struct IVRDriverDirectModeComponent_Vtbl {
+    pub CreateSwapTextureSet: unsafe extern "C" fn(
+        this: *mut c_void,
+        pid: u32,
+        desc: *const SwapTextureSetDesc_t,
+        out: *mut SwapTextureSet_t,
+    ),
+    pub DestroySwapTextureSet: unsafe extern "C" fn(this: *mut c_void, handle: SharedTextureHandle_t),
+    pub DestroyAllSwapTextureSets: unsafe extern "C" fn(this: *mut c_void, pid: u32),
+    /// `(SharedTextureHandle_t handles[2], uint32_t (*indices)[2])`
+    pub GetNextSwapTextureSetIndex:
+        unsafe extern "C" fn(this: *mut c_void, handles: *const SharedTextureHandle_t, indices: *mut [u32; 2]),
+    /// `(const SubmitLayerPerEye_t (&perEye)[2])`: a reference to an array is a pointer.
+    pub SubmitLayer: unsafe extern "C" fn(this: *mut c_void, per_eye: *const [SubmitLayerPerEye_t; 2]),
+    pub Present: unsafe extern "C" fn(this: *mut c_void, sync_texture: SharedTextureHandle_t),
+    pub PostPresent: unsafe extern "C" fn(this: *mut c_void, throttling: *const Throttling_t),
+    pub GetFrameTiming: unsafe extern "C" fn(this: *mut c_void, timing: *mut DriverDirectMode_FrameTiming),
+}
+
 #[cfg(test)]
 mod layout {
     use super::*;
@@ -454,6 +562,16 @@ mod layout {
         assert_eq!(size_of::<DistortionCoordinates_t>(), 24);
         assert_eq!(size_of::<PropertyWrite_t>(), 40);
         assert_eq!(size_of::<VREvent_HapticVibration_t>(), 32);
+        assert_eq!(size_of::<SwapTextureSetDesc_t>(), 16);
+        assert_eq!(size_of::<SwapTextureSet_t>(), 32);
+        assert_eq!(offset_of!(SwapTextureSet_t, unTextureFlags), 24);
+        assert_eq!(size_of::<SubmitLayerPerEye_t>(), 152);
+        assert_eq!(offset_of!(SubmitLayerPerEye_t, bounds), 16);
+        assert_eq!(offset_of!(SubmitLayerPerEye_t, mProjection), 32);
+        assert_eq!(offset_of!(SubmitLayerPerEye_t, mHmdPose), 96);
+        assert_eq!(offset_of!(SubmitLayerPerEye_t, flHmdPosePredictionTimeInSecondsFromNow), 144);
+        assert_eq!(size_of::<Throttling_t>(), 8);
+        assert_eq!(size_of::<DriverDirectMode_FrameTiming>(), 20);
         #[cfg(target_os = "linux")]
         assert_eq!(size_of::<VREvent_t>(), 64); // 60 bytes + our align(8) padding; we pass 60.
     }
