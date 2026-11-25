@@ -109,6 +109,8 @@ pub struct Shared {
     /// The headset display's measured frame period, once known (0 until then): the vsync we
     /// give SteamVR runs at exactly this rate, not the nominal refresh rate.
     pub vsync_period_ns: std::sync::atomic::AtomicI64,
+    /// Measured vsync-to-photon latency (microseconds) that controller poses are predicted over.
+    pub photon_latency_us: AtomicU32,
 }
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
@@ -126,6 +128,7 @@ pub fn shared() -> &'static Shared {
             controller_model: Mutex::new(ControllerModel::QuestPlus),
             prediction: PredictionConfig::default(),
             vsync_period_ns: std::sync::atomic::AtomicI64::new(0),
+            photon_latency_us: AtomicU32::new(0),
         }
     })
 }

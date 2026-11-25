@@ -49,6 +49,10 @@ impl Imported {
             .plane_layouts(&layouts);
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        // No modifier (an image SteamVR allocated for an application): the layout lives in the
+        // buffer's kernel metadata, which RADV applies to an optimal-tiling image bound to a
+        // dedicated import.
+        let implicit = set.modifier == vipc::DRM_FORMAT_MOD_INVALID;
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -56,12 +60,12 @@ impl Imported {
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .tiling(if implicit { vk::ImageTiling::OPTIMAL } else { vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT })
             .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push_next(&mut external)
-            .push_next(&mut modifier);
+            .push_next(&mut external);
+        let info = if implicit { info } else { info.push_next(&mut modifier) };
         let d = &ctx.device;
         // SAFETY: valid create info; every object is destroyed on error or in Drop.
         unsafe {

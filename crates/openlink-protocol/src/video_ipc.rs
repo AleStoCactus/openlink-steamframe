@@ -79,6 +79,10 @@ pub enum DriverVideoMsg {
     },
 }
 
+/// `modifier` of a texture set whose layout is not given by a modifier but carried by the
+/// buffer itself (its kernel metadata).
+pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerVideoMsg {
     /// The server no longer reads the textures of this frame.

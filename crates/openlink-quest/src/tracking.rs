@@ -200,7 +200,14 @@ impl TrackingSource for XrTracking {
         // Fails harmlessly (not focused) while the app is in the background.
         let _ = self.session.sync_actions(&[xr::ActiveActionSet::new(&self.actions.set)]);
         let horizon_ns = HEAD_HORIZON_US.load(Ordering::Relaxed) as i64 * 1000;
+        // Orientation is predicted the whole way; the display's reprojection absorbs what is
+        // left. Position only a little: extrapolated head translation turns every small
+        // movement into swimming parallax, which reprojection cannot undo.
         let mut hmd = relate(&self.view, &self.stage, self.xr_time(time_ns + horizon_ns));
+        let near = relate(&self.view, &self.stage, self.xr_time(time_ns + horizon_ns / 4));
+        if near.flags.is_valid() {
+            hmd.pose.position = near.pose.position;
+        }
         if hmd.flags.is_valid() {
             self.last_hmd = Some(hmd);
         } else if let Some(last) = self.last_hmd {

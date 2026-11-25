@@ -55,8 +55,11 @@ const SET_SIZE: usize = 3;
 
 struct Texture {
     handle: SharedTextureHandle_t,
-    /// `Some` when we allocated it (and so can stream it).
+    /// `Some` when we allocated it with GBM (the compositor's own textures).
     bo: Option<gbm::Bo>,
+    /// SteamVR's dmabuf for an image it allocated (applications' textures); its layout is in
+    /// the buffer's kernel metadata rather than a modifier.
+    shared: Option<std::os::fd::OwnedFd>,
     /// Newest frame the server is still reading this texture for.
     busy: Option<u64>,
 }
@@ -70,7 +73,7 @@ struct TextureSet {
 
 impl TextureSet {
     fn streamable(&self) -> bool {
-        self.textures.iter().all(|t| t.bo.is_some())
+        self.textures.iter().all(|t| t.bo.is_some() || t.shared.is_some())
     }
 
     /// The announcement for the server, and the fds that go with it.
@@ -82,17 +85,19 @@ impl TextureSet {
         let textures = self
             .textures
             .iter()
-            .map(|t| {
-                let bo = t.bo.as_ref().unwrap();
-                fds.extend(bo.planes.iter().map(|p| p.fd.as_raw_fd()));
-                DmabufTexture {
-                    handle: t.handle,
-                    planes: bo
-                        .planes
-                        .iter()
-                        .map(|p| DmabufPlane { offset: p.offset, stride: p.stride })
-                        .collect(),
+            .map(|t| match (&t.bo, &t.shared) {
+                (Some(bo), _) => {
+                    fds.extend(bo.planes.iter().map(|p| p.fd.as_raw_fd()));
+                    DmabufTexture {
+                        handle: t.handle,
+                        planes: bo.planes.iter().map(|p| DmabufPlane { offset: p.offset, stride: p.stride }).collect(),
+                    }
                 }
+                (None, Some(fd)) => {
+                    fds.push(fd.as_raw_fd());
+                    DmabufTexture { handle: t.handle, planes: vec![DmabufPlane { offset: 0, stride: 0 }] }
+                }
+                (None, None) => unreachable!("streamable() checked"),
             })
             .collect();
         let set = vipc::TextureSet {
@@ -100,7 +105,7 @@ impl TextureSet {
             width: self.desc.nWidth,
             height: self.desc.nHeight,
             drm_format: self.drm_format,
-            modifier: self.textures[0].bo.as_ref().unwrap().modifier,
+            modifier: self.textures[0].bo.as_ref().map_or(vipc::DRM_FORMAT_MOD_INVALID, |bo| bo.modifier),
             vk_format: self.desc.nFormat,
             textures,
         };
@@ -127,6 +132,7 @@ enum Gbm {
 }
 
 struct Compositor {
+    last_layer_shape: Option<Vec<bool>>,
     sets: Vec<TextureSet>,
     pending: Vec<[SubmitLayerPerEye_t; 2]>,
     presents: VecDeque<Instant>,
@@ -141,6 +147,7 @@ struct Compositor {
 impl Default for Compositor {
     fn default() -> Self {
         Self {
+            last_layer_shape: None,
             sets: Vec::new(),
             pending: Vec::new(),
             presents: VecDeque::new(),
@@ -245,7 +252,13 @@ fn render_node() -> CString {
 
 /// Allocates `desc` as dmabufs and imports them into SteamVR. `None` (with a log line) when
 /// this path is unavailable; the caller then falls back to SteamVR's own allocation.
-fn create_dmabuf_textures(c: &mut Compositor, desc: &SwapTextureSetDesc_t) -> Option<(u32, Vec<Texture>)> {
+/// `allow_compression`: AMD DCC-compressed modifiers are fine for the compositor, but
+/// applications (games under Proton) reject textures that use them.
+fn create_dmabuf_textures(
+    c: &mut Compositor,
+    desc: &SwapTextureSetDesc_t,
+    allow_compression: bool,
+) -> Option<(u32, Vec<Texture>)> {
     let h = host();
     if matches!(c.gbm, Gbm::Untried) {
         let node = render_node();
@@ -269,7 +282,10 @@ fn create_dmabuf_textures(c: &mut Compositor, desc: &SwapTextureSetDesc_t) -> Op
         log::warn!("no DRM format for VkFormat {}; this set cannot be streamed", desc.nFormat);
         return None;
     };
-    let modifiers = h.dmabuf_modifiers(drm_format);
+    let mut modifiers = h.dmabuf_modifiers(drm_format);
+    if !allow_compression {
+        modifiers.retain(|&m| !amd_dcc(m));
+    }
     if modifiers.is_empty() {
         log::warn!("compositor reports no dmabuf modifiers for format {drm_format:#x}");
         return None;
@@ -308,7 +324,7 @@ fn create_dmabuf_textures(c: &mut Compositor, desc: &SwapTextureSetDesc_t) -> Op
             release_handles(&textures);
             return None;
         };
-        textures.push(Texture { handle, bo: Some(bo), busy: None });
+        textures.push(Texture { handle, bo: Some(bo), shared: None, busy: None });
     }
     Some((drm_format, textures))
 }
@@ -324,7 +340,14 @@ fn create_steamvr_textures(desc: &SwapTextureSetDesc_t) -> Option<Vec<Texture>> 
     let mut textures = Vec::with_capacity(SET_SIZE);
     for _ in 0..SET_SIZE {
         match h.new_shared_vulkan_image(desc.nFormat, desc.nWidth, desc.nHeight) {
-            Some(handle) => textures.push(Texture { handle, bo: None, busy: None }),
+            Some(handle) => {
+                // Its dmabuf, so the server can read it (an application's layer).
+                let shared = h.shared_fd(handle);
+                if shared.is_none() {
+                    log::warn!("no fd for SteamVR image {handle:#x}; this set cannot be streamed");
+                }
+                textures.push(Texture { handle, bo: None, shared, busy: None })
+            }
             None => {
                 release_handles(&textures);
                 return None;
@@ -332,6 +355,17 @@ fn create_steamvr_textures(desc: &SwapTextureSetDesc_t) -> Option<Vec<Texture>> 
         }
     }
     Some(textures)
+}
+
+/// Whether an AMD format modifier uses DCC compression (`AMD_FMT_MOD_DCC`, bit 13 of an
+/// `AMD_FMT_MOD` modifier, vendor 0x02 in the top byte).
+fn amd_dcc(modifier: u64) -> bool {
+    modifier >> 56 == 0x02 && modifier & (1 << 13) != 0
+}
+
+/// Whether `pid` is SteamVR's compositor (`vrcompositor`).
+fn is_compositor(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "vrcompositor")
 }
 
 unsafe extern "C" fn create_swap_texture_set(
@@ -344,10 +378,13 @@ unsafe extern "C" fn create_swap_texture_set(
         let desc = *desc;
         *out = SwapTextureSet_t::default();
         with(|c| {
-            let (drm_format, textures) = match create_dmabuf_textures(c, &desc) {
+            // Only the compositor can use our GBM dmabufs: applications (e.g. games under
+            // Proton) reject them, compressed or not, and ask again in an endless loop.
+            let dmabuf = if is_compositor(pid) { create_dmabuf_textures(c, &desc, true) } else { None };
+            let (drm_format, textures) = match dmabuf {
                 Some(t) => t,
                 None => match create_steamvr_textures(&desc) {
-                    Some(t) => (0, t),
+                    Some(t) => (drm_format_for(desc.nFormat).unwrap_or(0), t),
                     None => {
                         log::error!(
                             "cannot allocate swap textures {}x{} format {} (pid {pid})",
@@ -368,6 +405,7 @@ unsafe extern "C" fn create_swap_texture_set(
                 set.textures.iter().map(|t| t.handle).collect::<Vec<_>>(),
                 match set.textures[0].bo.as_ref() {
                     Some(bo) => format!("dmabuf, modifier {:#x}, {} plane(s)", bo.modifier, bo.planes.len()),
+                    None if set.streamable() => "SteamVR-allocated, shared as dmabuf".into(),
                     None => "SteamVR-allocated, not streamable".into(),
                 }
             );
@@ -483,7 +521,20 @@ unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHan
         let now_ns = monotonic_ns();
         let should_log = with(|c| {
             let layers = std::mem::take(&mut c.pending);
-            if let Some(base) = layers.first() {
+            // Stream the first layer we can read (an application's own layer uses textures
+            // SteamVR allocated, which we cannot).
+            let streamable = |h: SharedTextureHandle_t| {
+                c.sets.iter().any(|s| s.streamable() && s.textures.iter().any(|t| t.handle == h))
+            };
+            // Diagnostics: log the layer layout whenever it changes.
+            let layout: Vec<(u64, u64, bool)> =
+                layers.iter().map(|l| (l[0].hTexture >> 32, l[1].hTexture >> 32, streamable(l[0].hTexture))).collect();
+            let shape: Vec<bool> = layout.iter().map(|l| l.2).collect();
+            if c.last_layer_shape.as_ref() != Some(&shape) {
+                log::info!("layers this frame (left/right texture index, streamable): {layout:x?}");
+                c.last_layer_shape = Some(shape);
+            }
+            if let Some(base) = layers.iter().find(|l| l.iter().all(|e| streamable(e.hTexture))) {
                 send_frame(c, base, now_ns);
             }
             c.layer_counts.push_back(layers.len());
@@ -527,6 +578,9 @@ unsafe extern "C" fn get_frame_timing(_this: *mut c_void, timing: *mut DriverDir
 /// were presented for.
 static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
 static VSYNC_PERIOD_NS: AtomicI64 = AtomicI64::new(0);
+/// Pending one-shot shift of the next vsync (nanoseconds, + = later), from the headset's phase
+/// measurement.
+pub static VSYNC_SHIFT_NS: AtomicI64 = AtomicI64::new(0);
 
 /// The vsync a frame presented at `now_ns` is for: SteamVR's compositor starts at a vsync and
 /// presents for the next one, which is also where SteamVR's `SecondsFromVsyncToPhotons` counts
@@ -557,6 +611,13 @@ impl VsyncThread {
                     while !stop.load(Ordering::Acquire) {
                         let period = Duration::from_secs_f64(1.0 / refresh_hz().clamp(30.0, 240.0) as f64);
                         next += period;
+                        // Phase correction from the headset (one-shot, signed).
+                        let shift = VSYNC_SHIFT_NS.swap(0, Ordering::AcqRel);
+                        if shift > 0 {
+                            next += Duration::from_nanos(shift as u64);
+                        } else if shift < 0 {
+                            next = next.checked_sub(Duration::from_nanos((-shift) as u64)).unwrap_or(next);
+                        }
                         let now = Instant::now();
                         if next > now {
                             std::thread::sleep(next - now);

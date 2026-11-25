@@ -23,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -251,6 +251,12 @@ pub enum HeadsetMessage {
     DisplayPeriod {
         period_ns: i64,
     },
+    /// Shift SteamVR's vsync by this much (+ = later) so frames reach the display with a few
+    /// milliseconds to spare: not so early that they wait a whole frame, not so late that
+    /// jitter makes them miss it.
+    VsyncShift {
+        shift_ns: i64,
+    },
     Disconnect,
 }
 
@@ -290,6 +296,10 @@ pub enum ToDriver {
     /// Pace SteamVR's vsync to this period (the headset display's measured one).
     DisplayPeriod {
         period_ns: i64,
+    },
+    /// Shift SteamVR's vsync once by this much (+ = later).
+    VsyncShift {
+        shift_ns: i64,
     },
 }
 

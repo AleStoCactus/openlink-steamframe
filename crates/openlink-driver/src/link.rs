@@ -99,6 +99,9 @@ fn run(socket: UdpSocket, server: SocketAddr, stop: Arc<AtomicBool>) {
     }
 }
 
+/// Share of the measured photon latency controllers are predicted over.
+const CONTROLLER_PREDICTION: f64 = 0.6;
+
 fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
     let s = shared();
     match msg {
@@ -158,7 +161,14 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                             now,
                             &s.prediction,
                         );
-                        h.pose_updated(id, &to_ovr_pose(&st));
+                        // SteamVR predicts to vsync only (SecondsFromVsyncToPhotons is 0): call the
+                        // sample older so it predicts towards the photons. Only part of the way:
+                        // swings decelerate, and linear extrapolation over the full latency
+                        // overshoots (swings looked wider than they were).
+                        let mut predicted = st;
+                        predicted.time_offset_s -=
+                            CONTROLLER_PREDICTION * s.photon_latency_us.load(Ordering::Acquire) as f64 * 1e-6;
+                        h.pose_updated(id, &to_ovr_pose(&predicted));
                         if let Some(handles) = *slot.handles.lock().unwrap() {
                             devices::update_inputs(&handles, c, st.time_offset_s);
                         }
@@ -168,6 +178,12 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
             }
         }
         ToDriver::PhotonLatency { seconds } => devices::set_photon_latency(seconds),
+        ToDriver::VsyncShift { shift_ns } => {
+            #[cfg(target_os = "linux")]
+            crate::direct_mode::VSYNC_SHIFT_NS.fetch_add(shift_ns.clamp(-5_000_000, 5_000_000), Ordering::AcqRel);
+            #[cfg(not(target_os = "linux"))]
+            let _ = shift_ns;
+        }
         ToDriver::DisplayPeriod { period_ns } => {
             if (5_000_000..40_000_000).contains(&period_ns) {
                 let old = s.vsync_period_ns.swap(period_ns, Ordering::AcqRel);

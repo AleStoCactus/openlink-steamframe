@@ -152,6 +152,20 @@ impl Host {
         (ok && h != 0).then_some(h)
     }
 
+    /// A file descriptor for a shared resource (`RefResource` + `ReceiveSharedFd`).
+    pub fn shared_fd(&self, h: SharedTextureHandle_t) -> Option<std::os::fd::OwnedFd> {
+        let ipc = self.ipc()?;
+        let mut token = 0u64;
+        let mut fd = -1;
+        // SAFETY: valid interface and out pointers.
+        unsafe {
+            if !call!(ipc, RefResource, h, &mut token) || !call!(ipc, ReceiveSharedFd, token, &mut fd) || fd < 0 {
+                return None;
+            }
+            Some(std::os::fd::FromRawFd::from_raw_fd(fd))
+        }
+    }
+
     pub fn unref_resource(&self, h: SharedTextureHandle_t) {
         if let Some(ipc) = self.ipc() {
             // SAFETY: valid interface.

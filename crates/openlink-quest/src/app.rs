@@ -277,7 +277,12 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             }
             (out.trimmed, out.unmatched, out.released, out.collected) = (0, 0, 0, 0);
         }
-        stats.report(client.get().map(|c| &c.state));
+        stats.period_ms = state.predicted_display_period.as_nanos() as f32 * 1e-6;
+        if let Some(shift_ns) = stats.report(client.get().map(|c| &c.state)) {
+            if let Some(c) = client.get() {
+                c.reporter.vsync_shift(shift_ns);
+            }
+        }
         let Some(picture) = shown.filter(|_| state.should_render && !eyes.is_empty()) else {
             stream.end(state.predicted_display_time, xr::EnvironmentBlendMode::OPAQUE, &[]).map_err(e("xrEndFrame"))?;
             continue;
@@ -466,11 +471,13 @@ struct Stats {
     lead_ms: Vec<f32>,
     /// Per shown picture: ms between decode finishing and the render loop picking it up.
     slack_ms: Vec<f32>,
+    /// Display frame period (ms), for the phase of the slack.
+    period_ms: f32,
 }
 
 impl Default for Stats {
     fn default() -> Self {
-        Self { since: std::time::Instant::now(), displayed: 0, new_pictures: 0, errors: Vec::new(), lead_ms: Vec::new(), slack_ms: Vec::new() }
+        Self { since: std::time::Instant::now(), displayed: 0, new_pictures: 0, errors: Vec::new(), lead_ms: Vec::new(), slack_ms: Vec::new(), period_ms: 11.1 }
     }
 }
 
@@ -492,10 +499,34 @@ impl Stats {
         self.errors.push((degrees, mm));
     }
 
-    fn report(&mut self, client: Option<&Arc<Mutex<ClientState>>>) {
+    /// Every few seconds: logs, and returns a vsync shift (ns) that moves pictures' arrival
+    /// to `TARGET_SLACK_MS` before they are needed.
+    fn report(&mut self, client: Option<&Arc<Mutex<ClientState>>>) -> Option<i64> {
+        const TARGET_SLACK_MS: f32 = 4.0;
         let elapsed = self.since.elapsed().as_secs_f32();
         if elapsed < 5.0 {
-            return;
+            return None;
+        }
+        // Slack is circular in the frame period: 0.5 ms and 10.6 ms (at 11.1) are the same
+        // phase, right at the boundary. Its circular mean is where pictures arrive.
+        let mut shift = None;
+        let p = self.period_ms.max(1.0);
+        if self.slack_ms.len() >= 20 {
+            let (mut sx, mut sy) = (0.0f32, 0.0f32);
+            for s in &self.slack_ms {
+                let a = s / p * std::f32::consts::TAU;
+                sx += a.cos();
+                sy += a.sin();
+            }
+            let mean = (sy.atan2(sx) / std::f32::consts::TAU * p).rem_euclid(p);
+            let mut error = mean - TARGET_SLACK_MS;
+            if error > p / 2.0 {
+                error -= p;
+            } else if error < -p / 2.0 {
+                error += p;
+            }
+            log::info!("picture phase: arrive {mean:.1} ms before pickup (target {TARGET_SLACK_MS}); shifting vsync by {:.1} ms", error * 0.5);
+            shift = Some((error * 0.5 * 1e6) as i64);
         }
         if !self.errors.is_empty() {
             let pct = |v: &mut Vec<f32>, q: f32| {
@@ -530,9 +561,11 @@ impl Stats {
             let mut v = std::mem::take(&mut self.lead_ms);
             v.sort_by(f32::total_cmp);
             let median = v[v.len() / 2];
-            // Close the loop: move the head prediction horizon by half the measured lead.
+            // Close the loop on a slight under-prediction: falling short is corrected by the
+            // display's reprojection, overshooting magnifies every small head movement.
+            const TARGET_LEAD_MS: f32 = -8.0;
             let old = crate::tracking::HEAD_HORIZON_US.load(std::sync::atomic::Ordering::Relaxed);
-            let new = (old as f32 - median * 1000.0 * 0.5).clamp(0.0, 100_000.0) as i32;
+            let new = (old as f32 - (median - TARGET_LEAD_MS) * 1000.0 * 0.5).clamp(0.0, 100_000.0) as i32;
             crate::tracking::HEAD_HORIZON_US.store(new, std::sync::atomic::Ordering::Relaxed);
             log::info!(
                 "head prediction lead over {} turning frames: {:.1} ms median (p10 {:.1}, p90 {:.1}); + = predicts too far; horizon {:.1} -> {:.1} ms",
@@ -556,6 +589,8 @@ impl Stats {
                 c.video_overflow
             );
         }
-        *self = Self::default();
+        let period_ms = self.period_ms;
+        *self = Self { period_ms, ..Self::default() };
+        shift
     }
 }

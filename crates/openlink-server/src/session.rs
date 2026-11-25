@@ -388,6 +388,9 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
             HeadsetMessage::DisplayPeriod { period_ns } => {
                 to_driver(&driver_sock, &ToDriver::DisplayPeriod { period_ns });
             }
+            HeadsetMessage::VsyncShift { shift_ns } => {
+                to_driver(&driver_sock, &ToDriver::VsyncShift { shift_ns });
+            }
             HeadsetMessage::VideoLoss { frame } => {
                 log::debug!("headset lost video at frame {frame}");
                 shared.idr_requested.store(true, Ordering::Release);

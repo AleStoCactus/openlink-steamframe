@@ -268,13 +268,12 @@ unsafe extern "C" fn disp_inverse_distortion(
 }
 
 /// How far past vsync SteamVR predicts poses: the measured present-to-photon latency.
+///
+/// Applied to the controllers only, by reporting their samples that much older (see `link`):
+/// `SecondsFromVsyncToPhotons` stays 0, because SteamVR's head pose bookkeeping (which
+/// `render_pose` corrects for) shifts with it. The head needs no prediction from SteamVR.
 pub fn set_photon_latency(seconds: f32) {
-    let id = shared().hmd_id.load(Ordering::Acquire);
-    if id == k_unTrackedDeviceIndexInvalid {
-        return;
-    }
-    let h = host();
-    h.set_f32(h.container(id), prop::SecondsFromVsyncToPhotons_Float, seconds.clamp(0.0, 0.2));
+    shared().photon_latency_us.store((seconds.clamp(0.0, 0.2) * 1e6) as u32, Ordering::Release);
 }
 
 /// Push new display parameters (from the headset's Hello) to SteamVR at runtime.

@@ -264,6 +264,11 @@ pub struct FrameReporter {
 }
 
 impl FrameReporter {
+    /// Asks for SteamVR's vsync to move by `shift_ns` (+ = later).
+    pub fn vsync_shift(&self, shift_ns: i64) {
+        let _ = self.sock.send(&proto::encode(&HeadsetMessage::VsyncShift { shift_ns }));
+    }
+
     /// The display's measured frame period, headset clock.
     pub fn display_period(&self, period_ns: i64) {
         let _ = self.sock.send(&proto::encode(&HeadsetMessage::DisplayPeriod { period_ns }));
