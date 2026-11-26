@@ -91,9 +91,11 @@ Quest app (openlink-quest + openlink-client)  ──UDP 9757──  server `open
   a shared `ID3D11Fence` per frame after acquiring SteamVR's sync texture. `video_ipc` runs over
   loopback TCP 9760. The server opens the textures with D3D11 and copies each frame into
   NT-handle textures imported into Vulkan (`video/d3d.rs`). AMD's Windows driver needs the
-  session reset in the first frame's coding scope, ignores Vulkan rate control (so on Windows
-  `encode.rs` sets QP per frame, `SoftRateControl`) and always writes SAO slice syntax (so the
-  SPS enables SAO). Check any encoder change's output with FFmpeg
+  session reset in the first frame's coding scope, ignores Vulkan's bitrate (so on Windows
+  `encode.rs` sets QP per frame through CBR's min/max QP, `SoftRateControl`; its constant-QP
+  mode is 3x slower) and always writes SAO slice syntax (so the SPS enables SAO). Windows
+  pipelines encodes (`encode::PIPELINED`: two source images, a finisher thread). Never time
+  `--encode-selftest` while a stream is running: both share the video engine. Check any encoder change's output with FFmpeg
   (`ffmpeg -err_detect +bitstream -i out.h265 -f null -`): the Quest decoder only says
   "Unsupported input buffer".
 - **Audio**: 48 kHz s16 PCM in 5 ms datagrams both ways, with an adaptive `JitterBuffer`

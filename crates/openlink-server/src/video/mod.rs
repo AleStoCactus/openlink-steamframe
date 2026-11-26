@@ -228,6 +228,100 @@ struct Pipeline {
     fence_sems: [avk::Semaphore; 4],
     /// Compositor write fences seen: already signalled, still pending, unavailable.
     fence_stats: (u32, u32, u32),
+    /// With [`encode::PIPELINED`]: `converted` and this alternate, as an encode may still
+    /// wait on the previous convert's.
+    converted_spare: avk::Semaphore,
+    /// With [`encode::PIPELINED`]: finishes encodes and sends them (created on first use).
+    finisher: Option<Finisher>,
+}
+
+/// When and with what pose a frame was rendered, and when its convert ran.
+struct FrameMeta {
+    present_ns: i64,
+    hmd_pose: [[f32; 4]; 3],
+    t0: Instant,
+    t1: Instant,
+}
+
+struct FinishJob {
+    pending: encode::Pending,
+    /// `None` when no headset is connected (nothing to send).
+    info: Option<video::FrameInfo>,
+    /// Return the bitstream (for `--dump-video`).
+    keep: bool,
+}
+
+struct FinishDone {
+    /// Bytes, and the bitstream if it was to be kept.
+    result: std::result::Result<(usize, Option<Vec<u8>>), encode::FinishError>,
+    idr: bool,
+    encode: Duration,
+    send_error: bool,
+}
+
+/// [`encode::PIPELINED`]: a thread that waits for each encode and sends it to the headset the
+/// moment it is done, while the video thread converts the next frame.
+struct Finisher {
+    jobs: Option<std::sync::mpsc::SyncSender<FinishJob>>,
+    done: std::sync::mpsc::Receiver<FinishDone>,
+    /// The frame being encoded.
+    in_flight: Option<FrameMeta>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Finisher {
+    fn new(sender: std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)>) -> Self {
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<FinishJob>(1);
+        let (done_tx, done) = std::sync::mpsc::sync_channel::<FinishDone>(1);
+        let thread = std::thread::Builder::new()
+            .name("video-finish".into())
+            .spawn(move || {
+                for job in rx {
+                    let (idr, submitted) = (job.pending.idr, job.pending.submitted);
+                    let result = job.pending.finish();
+                    let encode = submitted.elapsed();
+                    let mut send_error = false;
+                    let result = result.map(|bitstream| {
+                        let bytes = bitstream.len();
+                        let kept = job.keep.then(|| bitstream.clone());
+                        if let Some(mut info) = job.info {
+                            info.idr = idr;
+                            // A failure: the sender is still busy with the previous frame.
+                            send_error = sender.try_send((info, bitstream)).is_err();
+                        }
+                        (bytes, kept)
+                    });
+                    if done_tx.send(FinishDone { result, idr, encode, send_error }).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn video finisher");
+        Self { jobs: Some(jobs), done, in_flight: None, thread: Some(thread) }
+    }
+
+    fn start(&mut self, job: FinishJob, meta: FrameMeta) {
+        if let Some(jobs) = &self.jobs {
+            if jobs.send(job).is_ok() {
+                self.in_flight = Some(meta);
+            }
+        }
+    }
+
+    /// Waits for the frame in flight, if there is one.
+    fn wait(&mut self) -> Option<(FrameMeta, FinishDone)> {
+        let meta = self.in_flight.take()?;
+        self.done.recv().ok().map(|d| (meta, d))
+    }
+
+    /// Finishes what is in flight and ends the thread.
+    fn join(mut self) {
+        let _ = self.wait();
+        self.jobs.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Pipeline {
@@ -275,15 +369,22 @@ impl Pipeline {
             converted: ctx.semaphore()?,
             fence_sems: [ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?],
             fence_stats: (0, 0, 0),
+            converted_spare: ctx.semaphore()?,
+            finisher: None,
         })
     }
 
-    fn destroy(self, ctx: &Context) {
+    fn destroy(mut self, ctx: &Context) {
+        // The finisher may still read the encoder's bitstream buffer.
+        if let Some(f) = self.finisher.take() {
+            f.join();
+        }
         // SAFETY: the device is idle (caller).
         unsafe {
             let d = &ctx.device;
             d.destroy_fence(self.fence, None);
             d.destroy_semaphore(self.converted, None);
+            d.destroy_semaphore(self.converted_spare, None);
             self.fence_sems.iter().for_each(|&s| d.destroy_semaphore(s, None));
             d.destroy_command_pool(self.pool, None);
         }
@@ -677,44 +778,92 @@ impl<'a> Connection<'a> {
         if sink.is_some_and(HeadsetLink::take_idr_request) {
             p.encoder.request_idr();
         }
+        let meta = FrameMeta { present_ns: frame.present_ns, hmd_pose: frame.hmd_pose, t0, t1 };
+        let info = |idr: bool| {
+            sink.is_some_and(|s| s.headset().is_some()).then(|| video::FrameInfo {
+                idr,
+                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
+                present_ns: frame.present_ns,
+                foveation: p.requested.foveation,
+            })
+        };
+
+        if encode::PIPELINED {
+            // This frame was converted while the previous one encoded; that encode must be
+            // finished before this one is submitted (they share the bitstream buffer).
+            let finisher = p.finisher.get_or_insert_with(|| Finisher::new(self.sender.clone()));
+            let previous = finisher.wait();
+            if let Some((_, done)) = &previous {
+                match &done.result {
+                    Ok((bytes, _)) => p.encoder.finished(*bytes, done.idr),
+                    Err(e) => {
+                        if e.lost {
+                            ctx.mark_lost();
+                        }
+                        return Err(e.message.clone());
+                    }
+                }
+            }
+            let pending = p.encoder.submit(ctx, p.converted)?;
+            // The next convert signals the other semaphore: this encode may not have consumed
+            // this one yet.
+            std::mem::swap(&mut p.converted, &mut p.converted_spare);
+            let job = FinishJob { info: info(pending.idr), pending, keep: self.dump.is_some() };
+            p.finisher.as_mut().expect("created above").start(job, meta);
+            if let Some((meta, done)) = previous {
+                let Ok((bytes, kept)) = done.result else { unreachable!("returned above") };
+                if let Some(bitstream) = &kept {
+                    self.dump_frame(&meta, bitstream, done.idr);
+                }
+                self.count_frame(&meta, bytes, done.encode, done.send_error);
+            }
+            return Ok(());
+        }
+
         let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;
         let t2 = Instant::now();
+        let info = info(idr);
+        self.dump_frame(&meta, &bitstream, idr);
+        let bytes = bitstream.len();
+        let mut send_error = false;
+        if let Some(info) = info {
+            // A failure: the sender is still busy with the previous frame.
+            send_error = self.sender.try_send((info, bitstream)).is_err();
+        }
+        self.count_frame(&meta, bytes, t2 - t1, send_error);
+        Ok(())
+    }
 
+    /// Appends a frame to `--dump-video`'s file, with its render pose beside it.
+    fn dump_frame(&mut self, meta: &FrameMeta, bitstream: &[u8], idr: bool) {
         if let Some(f) = &mut self.dump {
-            if let Err(e) = f.write_all(&bitstream) {
+            if let Err(e) = f.write_all(bitstream) {
                 log::error!("video: dump write failed: {e}");
                 self.dump = None;
             }
             // Beside the stream: each frame's render pose, for checking labels against content.
             if let Some(poses) = &mut self.dump_poses {
-                let p = proto::Pose::from_matrix34(&frame.hmd_pose);
+                let p = proto::Pose::from_matrix34(&meta.hmd_pose);
                 let _ = writeln!(
                     poses,
                     "{} {} {} {:?} {:?}",
-                    self.stats_frames_total, frame.present_ns, idr as u8, p.orientation, p.position
+                    self.stats_frames_total, meta.present_ns, idr as u8, p.orientation, p.position
                 );
             }
             self.stats_frames_total += 1;
         }
-        let bytes = bitstream.len();
-        if sink.is_some_and(|s| s.headset().is_some()) {
-            let info = video::FrameInfo {
-                idr,
-                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
-                present_ns: frame.present_ns,
-                foveation: p.requested.foveation,
-            };
-            if self.sender.try_send((info, bitstream)).is_err() {
-                self.stats.send_errors += 1; // the sender is still busy with the previous frame
-            }
-        }
+    }
+
+    /// Statistics, logged every 5 s.
+    fn count_frame(&mut self, meta: &FrameMeta, bytes: usize, encode: Duration, send_error: bool) {
         let s = &mut self.stats;
-        let since = *s.since.get_or_insert(t0);
+        let since = *s.since.get_or_insert(meta.t0);
         s.frames += 1;
         s.bytes += bytes as u64;
-        s.convert += t1 - t0;
-        s.encode += t2 - t1;
-        let elapsed = t2 - since;
+        s.convert += meta.t1 - meta.t0;
+        s.encode += encode;
+        s.send_errors += send_error as u32;
+        let elapsed = since.elapsed();
         if elapsed >= Duration::from_secs(5) {
             let n = s.frames.max(1);
             if let Some(p) = &mut self.pipeline {
@@ -733,7 +882,6 @@ impl<'a> Connection<'a> {
             );
             *s = Stats::default();
         }
-        Ok(())
     }
 
     /// Drops the GPU state without touching a lost device: its objects are leaked, as
@@ -823,8 +971,9 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let staging_ptr = check(unsafe { d.map_memory(staging_mem, 0, avk::WHOLE_SIZE, avk::MemoryMapFlags::empty()) }, "vkMapMemory")?
         as *mut u8;
     let mut pattern = vec![0u8; nv12_len];
-    let barrier = avk::ImageMemoryBarrier2::default()
-        .image(enc.src)
+    // For the image the frame is written into, set per frame (`enc.src` alternates when
+    // encodes are pipelined).
+    let barrier_template = avk::ImageMemoryBarrier2::default()
         .subresource_range(color_range())
         .old_layout(avk::ImageLayout::UNDEFINED)
         .new_layout(avk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -832,6 +981,8 @@ pub fn selftest(args: &[String]) -> Result<()> {
         .dst_access_mask(avk::AccessFlags2::TRANSFER_WRITE);
     let t0 = Instant::now();
     let mut bytes = 0usize;
+    // GPU encode time alone (the pattern is drawn on the CPU, which dominates the total).
+    let mut encode_time = Duration::ZERO;
     let result = (|| -> Result<()> {
         for i in 0..frames {
             fill_pattern(&mut pattern, cw, ch, width as usize / 2, i);
@@ -843,6 +994,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
             unsafe {
                 std::ptr::copy_nonoverlapping(pattern.as_ptr(), staging_ptr, nv12_len);
                 check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+                let barrier = barrier_template.image(enc.src);
                 d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)));
                 let plane = |aspect, offset: usize, w: usize, h: usize| avk::BufferImageCopy {
                     buffer_offset: offset as u64,
@@ -865,7 +1017,9 @@ pub fn selftest(args: &[String]) -> Result<()> {
                 check(d.queue_submit(ctx.compute_queue, &[submit], fence), "vkQueueSubmit (selftest)")?;
             }
             ctx.wait_fence(fence, "selftest prep")?;
+            let te = Instant::now();
             let (bs, _) = enc.encode(&ctx, sem).map_err(|e| format!("frame {i}: {e}"))?;
+            encode_time += te.elapsed();
             bytes += bs.len();
             if let Some(f) = &mut out {
                 f.write_all(&bs).map_err(|e| e.to_string())?;
@@ -877,7 +1031,12 @@ pub fn selftest(args: &[String]) -> Result<()> {
         Ok(())
     })();
     let secs = t0.elapsed().as_secs_f64();
-    log::info!("selftest: {frames} frames in {secs:.2} s ({:.1} fps), {:.1} MB", frames as f64 / secs, bytes as f64 / 1e6);
+    log::info!(
+        "selftest: {frames} frames in {secs:.2} s ({:.1} fps), {:.1} MB, encode {:.2} ms/frame",
+        frames as f64 / secs,
+        bytes as f64 / 1e6,
+        encode_time.as_secs_f64() * 1e3 / frames.max(1) as f64
+    );
     if ctx.is_lost() {
         std::mem::forget(enc);
         return result;

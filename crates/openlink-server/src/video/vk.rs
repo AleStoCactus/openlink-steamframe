@@ -46,7 +46,7 @@ pub struct Context {
 }
 
 /// Longest a single convert or encode may take before the GPU is presumed hung.
-const GPU_TIMEOUT_NS: u64 = 1_000_000_000;
+pub const GPU_TIMEOUT_NS: u64 = 1_000_000_000;
 
 #[cfg(target_os = "linux")]
 const DEVICE_EXTENSIONS: &[&CStr] = &[
@@ -375,6 +375,11 @@ impl Context {
                 Err(format!("{what}: {e:?}"))
             }
         }
+    }
+
+    /// A wait elsewhere (an encode finished on another thread) timed out or lost the device.
+    pub fn mark_lost(&self) {
+        self.lost.set(true);
     }
 
     pub fn is_lost(&self) -> bool {
