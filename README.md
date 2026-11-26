@@ -32,7 +32,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video and connection settings. Only some settings take effect (H.265 is the only encoder) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+) |
 | Windows version | 📋 Planned | Tracking and driver parts are written with Windows in mind, but there is no Windows video path yet |
-| Steam Frame build | 📋 Planned | A client for Valve's Steam Frame |
+| Steam Frame build | 🟡 Written, untested on hardware | Native arm64 Linux app (`openlink-frame`): OpenXR on the headset's SteamVR runtime, GL over EGL, hardware decode through V4L2 (Qualcomm Iris), zero-copy via dmabuf where the driver allows it. Checked against Monado and the real server, not yet on a Frame. See [Play on a Steam Frame](#play-on-a-steam-frame-untested) |
 | Wi-Fi streaming | ✅ Working | See [Wi-Fi and USB cable](#wi-fi-and-usb-cable) |
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
 | Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issue: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth |
@@ -63,10 +63,13 @@ crates/openlink-tracking   pose math + prediction policy
 crates/openlink-driver     SteamVR driver (pure Rust)
 crates/openlink-server     desktop app `openlink` (GUI + session)
 crates/openlink-client     headset client core + `mock-headset`
+crates/openlink-xr         OpenXR tracking, input and stream statistics shared by the headset apps
 crates/openlink-quest      Quest app (OpenXR, NativeActivity)
+crates/openlink-frame      Steam Frame app (native Linux arm64: OpenXR, EGL, V4L2)
 driver/openlink            SteamVR driver manifest/resources
 scripts/install-driver.sh  build + register the driver (Linux)
 scripts/build-quest.sh     build (and --install) the Quest APK
+scripts/build-frame.sh     build (and --install over SSH) the Steam Frame app
 ```
 
 ## Try it without a headset (Linux)
@@ -106,6 +109,35 @@ The app finds the server by LAN broadcast. To point it at a specific PC instead:
 
 `openlink --dump-video out.h265` also writes the stream to a file; `openlink --encode-selftest
 4128x2208 600 out.h265` exercises the encoder without SteamVR.
+
+## Play on a Steam Frame (untested)
+
+The Frame runs SteamOS on arm64, so its client is a native Linux program, not an APK. It renders
+through SteamVR's OpenXR runtime on the headset (desktop GL over EGL, `XR_MNDX_egl_enable`) and
+decodes with the Frame's hardware decoder (`/dev/video-dec0`, V4L2). The PC side is unchanged:
+the same driver and `openlink` server as for a Quest. The Frame's controllers reach the PC as
+Touch controllers (SteamVR on the headset maps them), so games' Touch bindings apply.
+
+This build has not run on a Frame yet. It has been checked against Monado and the real server,
+and its tests also pass on arm64, but the headset's decoder and SteamVR runtime are untested.
+Please report the log (`~/.local/state/openlink/frame.log`) of a first try.
+
+```sh
+# on the PC: cross-build for arm64 (or run the same script on the headset itself)
+sudo pacman -S --needed aarch64-linux-gnu-gcc    # Debian/Ubuntu: gcc-aarch64-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+scripts/build-frame.sh --install 192.168.1.20    # the headset's address; needs sshd on it
+```
+
+On the headset (Developer Mode; `sudo systemctl enable --now sshd`, and set a password with
+`passwd`), add `~/Applications/openlink/openlink-frame.sh` to Steam as a non-Steam game and start
+it, or start it over SSH while SteamVR runs there. It finds the PC by LAN broadcast;
+`--server 192.168.1.10` (or `OPENLINK_SERVER`) names it instead.
+
+Useful switches: `OPENLINK_V4L2_DECODER=/dev/videoN` (another decoder node),
+`OPENLINK_OPENXR_LOADER=/path/libopenxr_loader.so`, `OPENLINK_EGL_SURFACELESS=1`, `--swap-eyes`.
+Without a decoder the app still runs, with tracking and input only, which is enough to test the
+controllers.
 
 ## License
 

@@ -6,7 +6,6 @@ mod app;
 mod decoder;
 mod egl;
 mod render;
-mod tracking;
 
 use android_activity::AndroidApp;
 

@@ -198,7 +198,9 @@ impl ControllerModel {
         let m = model.to_ascii_lowercase();
         if m.contains("pro") {
             Self::QuestPro
-        } else if m.contains("quest 3") || m.contains("quest3") {
+        } else if m.contains("quest 3") || m.contains("quest3") || m.contains("steam frame") {
+            // The Steam Frame's controllers reach the PC as Touch (SteamVR on the headset maps
+            // them); the current Touch Plus model is the closest match.
             Self::QuestPlus
         } else {
             Self::Quest2
@@ -242,6 +244,14 @@ mod tests {
             angular_velocity: w,
             flags: MotionFlags::ALL,
         }
+    }
+
+    #[test]
+    fn controller_models_follow_the_headset() {
+        assert_eq!(ControllerModel::from_headset_model("Meta Quest Pro"), ControllerModel::QuestPro);
+        assert_eq!(ControllerModel::from_headset_model("Meta Quest 3S"), ControllerModel::QuestPlus);
+        assert_eq!(ControllerModel::from_headset_model("Steam Frame"), ControllerModel::QuestPlus);
+        assert_eq!(ControllerModel::from_headset_model("Oculus Quest2"), ControllerModel::Quest2);
     }
 
     #[test]

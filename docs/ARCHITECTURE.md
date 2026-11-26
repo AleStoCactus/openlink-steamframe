@@ -1,6 +1,7 @@
 # OpenLink architecture
 
-OpenLink streams SteamVR to standalone headsets (Quest 2/3/3S/Pro first) over Wi-Fi or USB.
+OpenLink streams SteamVR to standalone headsets (Quest 2/3/3S/Pro first, then Valve's Steam
+Frame) over Wi-Fi or USB.
 The aim is a headset that behaves like a native SteamVR HMD:
 
 - **Tracking** that feels like Link / Steam Link / Lighthouse: no overshooting "standalone-style"
@@ -30,6 +31,9 @@ The aim is a headset that behaves like a native SteamVR HMD:
 | `openlink-driver` | SteamVR driver in pure Rust (OpenVR C++ vtables written by hand, layout-tested) |
 | `openlink-server` | Desktop app `openlink`: session, relay, settings, GUI; later the encoder |
 | `openlink-client` | Headset client core + `mock-headset` for testing the PC side without a headset |
+| `openlink-xr` | OpenXR tracking (sampled at now), input, haptics and stream statistics, shared by the headset apps |
+| `openlink-quest` | Quest app: Android NativeActivity, GLES, `AMediaCodec` |
+| `openlink-frame` | Steam Frame app: native Linux arm64, desktop GL over EGL, V4L2 decode |
 
 The driver is deliberately thin. It runs inside `vrserver`, so a bug there takes SteamVR down,
 and it has no network access to the headset. Everything with real failure modes (sockets to the
@@ -91,6 +95,32 @@ without a round trip through system memory.
 
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
+
+## Steam Frame client
+
+The Frame runs SteamOS (Linux) on a Snapdragon 8 Gen 3, so its client is an ordinary arm64 Linux
+program. It has the same structure as the Quest app (frame loop, tracking thread, decoder thread)
+and shares its tracking code through `openlink-xr`. What differs is the platform:
+
+| | Quest | Steam Frame |
+|---|---|---|
+| OpenXR runtime | Meta's, via the Khronos loader in the APK | SteamVR's arm64 runtime; its loader at `/opt/steamvr/bin/linuxarm64/libopenxr_loader.so` is tried first |
+| Graphics | GLES 3.2, `XrGraphicsBindingOpenGLESAndroidKHR` | desktop GL (Mesa: Zink on Turnip) over EGL, `XR_KHR_opengl_enable` + `XR_MNDX_egl_enable`. The `openxr` crate has no EGL binding for desktop GL, so `xr_egl.rs` implements its `Graphics` trait |
+| Decode | `AMediaCodec` into an `AImageReader` | V4L2 stateful mem2mem decoder (Qualcomm Iris, `/dev/video-dec0`), NV12 out. Turnip has no Vulkan Video |
+| Picture to GL | `AHardwareBuffer` as an external texture | capture buffers exported (`VIDIOC_EXPBUF`) and imported as two dmabuf `EGLImage`s (R8 luma, GR88 chroma), YUV to RGB in the shader. Uploaded from the mapped buffer if export or import fails |
+| Controllers | Touch profile | the same Touch bindings; SteamVR maps them onto the Frame controllers, so the PC keeps seeing Touch |
+
+Not yet verified on hardware:
+
+- Whether Iris exports its NV12 buffers. One report says it cannot. Then each picture (about 13 MB)
+  is copied from what may be uncached memory, which is likely to be a bottleneck.
+- The chroma plane offset. Qualcomm aligns luma rows to 32 without saying so in the format, and
+  `decoder::layout` assumes it.
+- The decoder's low-latency controls.
+
+Next steps once it runs: the Frame controller profile (`XR_VALVE_frame_controller_interaction`)
+with a matching SteamVR device on the PC, eye tracking for foveated encoding, and SteamOS
+packaging.
 
 ## Wired connection
 

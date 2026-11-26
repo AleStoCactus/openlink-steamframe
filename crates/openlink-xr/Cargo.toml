@@ -1,0 +1,14 @@
+[package]
+name = "openlink-xr"
+description = "OpenXR pieces shared by the headset apps: tracking sampled at now, input, haptics and stream statistics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
+openlink-protocol.workspace = true
+openlink-client = { path = "../openlink-client" }
+log.workspace = true
+glam.workspace = true
+openxr = { version = "0.22", default-features = false }
+libc = "0.2"
