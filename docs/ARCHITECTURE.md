@@ -92,6 +92,18 @@ linear velocity (`v + ω × r`).
 Encode must be zero-copy: the texture SteamVR hands the driver is encoded on the same GPU,
 without a round trip through system memory.
 
+**Downscaling.** SteamVR renders larger than the stream (its 100% is enlarged for the lens,
+and games supersample further), so the converter shrinks each eye. It filters with Lanczos-2
+stretched over each output pixel's footprint, so detail a supersampled render adds reaches the
+stream instead of being averaged away. The first converter averaged four bilinear taps over
+the footprint; against FFmpeg's Lanczos on a zone plate it was 26 dB off at both 1.5x and
+2.8x (high frequencies faded to grey; even a 1:1 copy was blurred), and the stream looked
+clearly softer than other streamers at the same settings. Now: 33 dB at 1.5x, 36 dB at 2.8x,
+exact at 1:1 (`openlink --convert-selftest`). Cost on an RX 6800, both eyes: 0.8 ms at 1:1,
+1.4 ms from SteamVR's 100% (3174x3430), 3.9 ms from a 1.8x supersampled eye (5710x6172), against
+0.4-0.9 ms before; above 2 texels per output pixel each bilinear read covers a pair of texels
+on both axes, which is what makes that affordable.
+
 **Windows capture.** The driver creates every swap texture (the compositor's and each
 application's) as a D3D11 texture with `D3D11_RESOURCE_MISC_SHARED`, on the adapter it names in
 `Prop_GraphicsAdapterLuid_Uint64` so SteamVR renders on the same GPU. On Windows a

@@ -1054,6 +1054,183 @@ pub fn selftest(args: &[String]) -> Result<()> {
     result
 }
 
+/// `openlink --convert-selftest SOURCE.rgba SRC_WxH EYE_WxH OUT.gray`: runs one eye-sized
+/// picture through the converter (the downscale from SteamVR's render size to the encoded size)
+/// and writes the left eye's luma (`EYE_W` x `EYE_H`, 8-bit limited range), to compare with an
+/// ideal downscale (`ffmpeg ... -vf scale=...:flags=lanczos`) for sharpness.
+pub fn convert_selftest(args: &[String]) -> Result<()> {
+    let usage = "usage: --convert-selftest SOURCE.rgba SRC_WxH EYE_WxH OUT.gray";
+    let size = |s: Option<&String>| -> Result<(u32, u32)> {
+        let (w, h) = s.ok_or(usage)?.split_once('x').ok_or(usage)?;
+        Ok((w.parse().map_err(|_| usage)?, h.parse().map_err(|_| usage)?))
+    };
+    let source = std::fs::read(args.first().ok_or(usage)?).map_err(|e| e.to_string())?;
+    let (sw, sh) = size(args.get(1))?;
+    let (ew, eh) = size(args.get(2))?;
+    let out_path = args.get(3).ok_or(usage)?;
+    if source.len() != (sw * sh * 4) as usize {
+        return Err(format!("{} bytes is not {sw}x{sh} RGBA", source.len()));
+    }
+    #[cfg(target_os = "linux")]
+    let gpu = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev()
+    };
+    #[cfg(windows)]
+    let gpu = 0;
+    let ctx = Context::new(gpu)?;
+    let d = &ctx.device;
+    let (cw, ch) = (2 * ew, eh + eh % 2);
+    let mut converter = convert::Converter::new(&ctx, cw, ch, ew, eh, None)?;
+    let host = avk::MemoryPropertyFlags::HOST_VISIBLE | avk::MemoryPropertyFlags::HOST_COHERENT;
+    // SAFETY: plain object creation, recording and submission on objects made here; the
+    // device is idle before anything is destroyed.
+    unsafe {
+        let buffer = |size: usize, usage| -> Result<(avk::Buffer, avk::DeviceMemory, *mut u8)> {
+            let b = check(
+                d.create_buffer(&avk::BufferCreateInfo::default().size(size as u64).usage(usage), None),
+                "vkCreateBuffer",
+            )?;
+            let m = ctx.bind_buffer_memory(b, host)?;
+            let p = check(d.map_memory(m, 0, avk::WHOLE_SIZE, avk::MemoryMapFlags::empty()), "vkMapMemory")? as *mut u8;
+            Ok((b, m, p))
+        };
+        let (up, up_mem, up_ptr) = buffer(source.len(), avk::BufferUsageFlags::TRANSFER_SRC)?;
+        std::ptr::copy_nonoverlapping(source.as_ptr(), up_ptr, source.len());
+        let (down, down_mem, down_ptr) = buffer((cw * ch) as usize, avk::BufferUsageFlags::TRANSFER_DST)?;
+        let image_info = |format, usage| {
+            avk::ImageCreateInfo::default()
+                .image_type(avk::ImageType::TYPE_2D)
+                .format(format)
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(avk::SampleCountFlags::TYPE_1)
+                .tiling(avk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .initial_layout(avk::ImageLayout::UNDEFINED)
+        };
+        let src = check(
+            d.create_image(
+                &image_info(avk::Format::R8G8B8A8_UNORM, avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST)
+                    .extent(avk::Extent3D { width: sw, height: sh, depth: 1 }),
+                None,
+            ),
+            "vkCreateImage (source)",
+        )?;
+        let src_mem = ctx.bind_image_memory(src, avk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let src_view = check(
+            d.create_image_view(
+                &avk::ImageViewCreateInfo::default()
+                    .image(src)
+                    .view_type(avk::ImageViewType::TYPE_2D)
+                    .format(avk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(color_range()),
+                None,
+            ),
+            "vkCreateImageView (source)",
+        )?;
+        let nv12 = check(
+            d.create_image(
+                &image_info(avk::Format::G8_B8R8_2PLANE_420_UNORM, avk::ImageUsageFlags::TRANSFER_DST)
+                    .extent(avk::Extent3D { width: cw, height: ch, depth: 1 }),
+                None,
+            ),
+            "vkCreateImage (nv12)",
+        )?;
+        let nv12_mem = ctx.bind_image_memory(nv12, avk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        converter.bind_eyes(&ctx, src_view, src_view, None);
+
+        let pool = ctx.command_pool(ctx.compute_family)?;
+        let cmd = ctx.command_buffer(pool)?;
+        let fence = ctx.fence()?;
+        check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+        let barrier = |image, old, new, src_stage, src_access, dst_stage, dst_access| {
+            avk::ImageMemoryBarrier2::default()
+                .image(image)
+                .subresource_range(color_range())
+                .old_layout(old)
+                .new_layout(new)
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+        };
+        let to_dst = [
+            barrier(src, avk::ImageLayout::UNDEFINED, avk::ImageLayout::TRANSFER_DST_OPTIMAL, avk::PipelineStageFlags2::NONE, avk::AccessFlags2::NONE, avk::PipelineStageFlags2::COPY, avk::AccessFlags2::TRANSFER_WRITE),
+            barrier(nv12, avk::ImageLayout::UNDEFINED, avk::ImageLayout::TRANSFER_DST_OPTIMAL, avk::PipelineStageFlags2::NONE, avk::AccessFlags2::NONE, avk::PipelineStageFlags2::COPY, avk::AccessFlags2::TRANSFER_WRITE),
+        ];
+        d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(&to_dst));
+        d.cmd_copy_buffer_to_image(
+            cmd,
+            up,
+            src,
+            avk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[avk::BufferImageCopy {
+                image_subresource: avk::ImageSubresourceLayers {
+                    aspect_mask: avk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_extent: avk::Extent3D { width: sw, height: sh, depth: 1 },
+                ..Default::default()
+            }],
+        );
+        let to_read = [barrier(
+            src,
+            avk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            avk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            avk::PipelineStageFlags2::COPY,
+            avk::AccessFlags2::TRANSFER_WRITE,
+            avk::PipelineStageFlags2::COMPUTE_SHADER,
+            avk::AccessFlags2::SHADER_SAMPLED_READ,
+        )];
+        d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(&to_read));
+        converter.record(&ctx, cmd, [[0.0, 0.0, 1.0, 1.0]; 2], None, nv12);
+        converter.record_luma_readback(&ctx, cmd, down);
+        check(d.end_command_buffer(cmd), "vkEndCommandBuffer")?;
+        let cmds = [cmd];
+        check(d.queue_submit(ctx.compute_queue, &[avk::SubmitInfo::default().command_buffers(&cmds)], fence), "vkQueueSubmit")?;
+        ctx.wait_fence(fence, "convert selftest")?;
+
+        // The left eye, without the right one beside it.
+        let luma = std::slice::from_raw_parts(down_ptr, (cw * ch) as usize);
+        let mut out = Vec::with_capacity((ew * eh) as usize);
+        for row in luma.chunks(cw as usize).take(eh as usize) {
+            out.extend_from_slice(&row[..ew as usize]);
+        }
+        std::fs::write(out_path, &out).map_err(|e| e.to_string())?;
+        log::info!("convert selftest: {sw}x{sh} -> {ew}x{eh} luma written to {out_path}");
+
+        // GPU time of the conversion alone (both eyes), as the video thread runs it.
+        const RUNS: u32 = 50;
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            check(d.reset_command_buffer(cmd, avk::CommandBufferResetFlags::empty()), "vkResetCommandBuffer")?;
+            check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+            converter.record(&ctx, cmd, [[0.0, 0.0, 1.0, 1.0]; 2], None, nv12);
+            check(d.end_command_buffer(cmd), "vkEndCommandBuffer")?;
+            check(d.queue_submit(ctx.compute_queue, &[avk::SubmitInfo::default().command_buffers(&cmds)], fence), "vkQueueSubmit")?;
+            ctx.wait_fence(fence, "convert selftest")?;
+        }
+        log::info!("convert selftest: {:.2} ms per frame (both eyes)", t0.elapsed().as_secs_f64() * 1e3 / RUNS as f64);
+
+        d.destroy_fence(fence, None);
+        d.destroy_command_pool(pool, None);
+        d.destroy_image_view(src_view, None);
+        d.destroy_image(src, None);
+        d.free_memory(src_mem, None);
+        d.destroy_image(nv12, None);
+        d.free_memory(nv12_mem, None);
+        for (b, m) in [(up, up_mem), (down, down_mem)] {
+            d.destroy_buffer(b, None);
+            d.free_memory(m, None);
+        }
+    }
+    converter.destroy(&ctx);
+    Ok(())
+}
+
 /// A detailed, moving NV12 test pattern whose left and right halves (each `half` pixels wide)
 /// are identical: fine noise, edges and gradients scrolling diagonally.
 fn fill_pattern(buf: &mut [u8], w: usize, h: usize, half: usize, frame: u32) {

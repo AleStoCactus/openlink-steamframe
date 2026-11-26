@@ -32,6 +32,8 @@ adb logcat -s OpenLink
   bump**: the installed driver silently ignores messages of another version.
 - `scripts/build-quest.sh` only builds the Android lib; `target/release/openlink` can be stale.
 - Server debug: `openlink --dump-video out.h265`, `openlink --encode-selftest 4128x2208 600 out.h265`.
+  `openlink --convert-selftest SRC.rgba 5710x6172 2064x2208 out.gray` runs the downscale alone
+  (compare with `ffmpeg ... scale=...:flags=lanczos` for sharpness).
 - Quest debug properties (`adb shell setprop …`): `debug.openlink.server <ip>` (skip LAN discovery),
   `debug.openlink.freeze 1`, `debug.openlink.swap_eyes 1`.
 - Server build needs PipeWire headers and clang (pipewire crate, bindgen); the video path needs
