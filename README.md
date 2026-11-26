@@ -84,7 +84,7 @@ What the rows mean:
   headset accepts.
 - **Statistics screen:** latency, bitrate, frame loss and encode/decode times in the desktop app.
 
-Known issue: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters
+Known issue (Linux Only): SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters
 with head motion, while games are smooth.
 
 Already working on both systems: tracking (head and controllers, predicted by SteamVR),
@@ -95,7 +95,7 @@ resolution setting scales from there. On Windows, check SteamVR's render resolut
 picture looks softer than on Linux.
 
 After 1.0.0: H.264 and AV1 encoding, and automatic detection of the refresh rates and
-resolutions the headset supports. A Steam Frame client is not planned.
+resolutions the headset supports. A Steam Frame or Pico client is not planned.
 
 ## Wi-Fi and USB cable
 
@@ -182,7 +182,7 @@ The app finds the server by LAN broadcast. To point it at a specific PC instead:
 ## Windows
 
 Needs a GPU whose Windows driver has Vulkan Video H.265 encode (tested: AMD RX 6800, driver
-32.0.21045), Rust with the MSVC toolchain, and the Vulkan SDK (for `glslc`;
+26.11.2), Rust with the MSVC toolchain, and the Vulkan SDK (for `glslc`;
 `winget install KhronosGroup.VulkanSDK`). In PowerShell:
 
 ```powershell
