@@ -1,7 +1,6 @@
 //! The desktop window.
 
 use crate::config::{CodecPreference, ConnectionMode, Settings};
-use crate::encoder::{Backend, BackendPreference};
 use crate::session::Status;
 use eframe::egui;
 use openlink_protocol::Codec;
@@ -163,29 +162,15 @@ impl App {
                             CodecPreference::Fixed(Codec::H265),
                             CodecPreference::Fixed(Codec::H264),
                         ] {
-                            ui.selectable_value(&mut d.codec, c, codec_label(c));
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Encoder");
-                let enc_label = |p: BackendPreference| match p {
-                    BackendPreference::Auto => "Auto".to_string(),
-                    BackendPreference::Fixed(b) => b.name().to_string(),
-                };
-                egui::ComboBox::from_id_salt("encoder")
-                    .selected_text(enc_label(d.encoder))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut d.encoder, BackendPreference::Auto, "Auto");
-                        for b in Backend::ALL
-                            .into_iter()
-                            .filter(|b| b.supported_on_this_os())
-                        {
-                            ui.selectable_value(
-                                &mut d.encoder,
-                                BackendPreference::Fixed(b),
-                                b.name(),
-                            );
+                            let encodable = match c {
+                                CodecPreference::Auto => true,
+                                CodecPreference::Fixed(c) => crate::encoder::CODECS.contains(&c),
+                            };
+                            ui.add_enabled_ui(encodable, |ui| {
+                                ui.selectable_value(&mut d.codec, c, codec_label(c))
+                            })
+                            .response
+                            .on_disabled_hover_text("Not supported yet: OpenLink only encodes HEVC.");
                         }
                     });
                 ui.end_row();
