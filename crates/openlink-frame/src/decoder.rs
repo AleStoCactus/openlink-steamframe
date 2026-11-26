@@ -175,7 +175,13 @@ pub fn spawn(frames: Receiver<Frame>, client: Arc<Mutex<ClientState>>, output: A
                     let want = (2 * eye_w, eye_h, cfg.codec);
                     if decoder.as_ref().is_none_or(|(_, have)| *have != want) {
                         if !frame.info.idr {
-                            continue; // a new decoder must start at an IDR
+                            // A new decoder must start at an IDR, and after a restart (or a
+                            // failed open) none may be on its way: have the receive thread
+                            // drop frames until one comes and ask the server for it. On a new
+                            // stream configuration the server sends one anyway; asking as well
+                            // costs a frame or two.
+                            client.lock().unwrap().idr_wanted = true;
+                            continue;
                         }
                         decoder = None;
                         output.lock().unwrap().pending.clear();

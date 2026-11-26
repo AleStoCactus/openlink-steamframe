@@ -93,9 +93,15 @@ pub enum Event {
     Loss,
 }
 
-/// While waiting for an IDR, ask again every this many dropped frames, in case the IDR the
-/// server sent was lost too (or the server never heard the first request).
-const IDR_REQUEST_INTERVAL: u64 = 30;
+/// While waiting for an IDR, ask again this often, in case the IDR the server sent was lost
+/// too (or the server never heard the first request). Losses come in bursts, so this decides
+/// how long a burst freezes the picture: in a Steam Frame session over its adapter, most bursts
+/// outlasted the IDR asked for when they began, and with a retry every 30 dropped frames
+/// (0.42 s at 72 Hz) each froze the picture for about that long. An IDR arrives a round trip
+/// and a frame or two after it is asked for (some 30 ms), so asking much sooner than this only
+/// adds IDRs that are already on their way. Counted in time rather than frames, since frames
+/// lost while waiting do not count as dropped, and a burst loses many.
+const IDR_RETRY_NS: i64 = 100_000_000;
 /// Frames further behind the last one than this are a restarted count, not reordering.
 const RESTART_DISTANCE: i32 = 300;
 
@@ -109,6 +115,8 @@ pub struct Reassembler {
     last: Option<u32>,
     /// After a loss, P frames reference something the decoder never saw.
     need_idr: bool,
+    /// When the last [`Event::Loss`] was returned (`time::monotonic_ns`).
+    last_request_ns: Option<i64>,
     pub stats: ReassemblyStats,
 }
 
@@ -128,14 +136,19 @@ struct Partial {
 
 impl Default for Reassembler {
     fn default() -> Self {
-        Self { current: None, last: None, need_idr: true, stats: ReassemblyStats::default() }
+        Self { current: None, last: None, need_idr: true, last_request_ns: None, stats: ReassemblyStats::default() }
     }
 }
 
 impl Reassembler {
-    /// Drops frames until the next IDR (e.g. the decoder could not keep up).
+    /// Drops frames until the next IDR (e.g. the decoder could not keep up, or restarted) and
+    /// asks for one with the next datagram, then every `IDR_RETRY_NS` like after a loss. While
+    /// already waiting for an IDR it changes nothing.
     pub fn require_idr(&mut self) {
-        self.need_idr = true;
+        if !self.need_idr {
+            self.need_idr = true;
+            self.last_request_ns = None;
+        }
     }
 
     /// Forgets the stream so far (a new session): the next IDR starts it again. Keeps stats.
@@ -146,6 +159,11 @@ impl Reassembler {
 
     /// Feeds one datagram. Returns a complete, decodable frame, or what happened instead.
     pub fn push(&mut self, datagram: &[u8]) -> Result<Frame, Event> {
+        self.push_at(datagram, crate::time::monotonic_ns())
+    }
+
+    /// [`push`](Self::push) with the arrival time given (`time::monotonic_ns`).
+    fn push_at(&mut self, datagram: &[u8], now_ns: i64) -> Result<Frame, Event> {
         if !is_video(datagram) || u16::from_le_bytes([datagram[4], datagram[5]]) != PROTOCOL_VERSION {
             return Err(Event::Pending);
         }
@@ -184,14 +202,17 @@ impl Reassembler {
             self.stats.lost_frames += missed;
             self.need_idr = true;
         }
-        let r = self.add(chunk, chunks, datagram);
-        if report && r.is_err() {
+        let r = self.add(chunk, chunks, datagram, now_ns);
+        // Ask at once on a new loss, then again every IDR_RETRY_NS until an IDR gets through.
+        let retry = self.last_request_ns.is_none_or(|t| now_ns - t >= IDR_RETRY_NS);
+        if r.is_err() && self.need_idr && (report || retry) {
+            self.last_request_ns = Some(now_ns);
             return Err(Event::Loss);
         }
         r
     }
 
-    fn add(&mut self, chunk: usize, chunks: usize, datagram: &[u8]) -> Result<Frame, Event> {
+    fn add(&mut self, chunk: usize, chunks: usize, datagram: &[u8], now_ns: i64) -> Result<Frame, Event> {
         let p = self.current.as_mut().unwrap();
         if p.chunks.len() != chunks || p.chunks[chunk].is_some() {
             return Err(Event::Pending);
@@ -213,11 +234,11 @@ impl Reassembler {
         let Some((info, start)) = parsed else { return Err(Event::Pending) };
         if self.need_idr && !info.idr {
             self.stats.dropped_frames += 1;
-            return Err(if self.stats.dropped_frames % IDR_REQUEST_INTERVAL == 1 { Event::Loss } else { Event::Pending });
+            return Err(Event::Pending);
         }
         self.need_idr = false;
         self.stats.frames += 1;
-        Ok(Frame { number: p.number, info, bitstream: data[start..].to_vec(), received_ns: crate::time::monotonic_ns() })
+        Ok(Frame { number: p.number, info, bitstream: data[start..].to_vec(), received_ns: now_ns })
     }
 }
 
@@ -292,16 +313,61 @@ mod tests {
         let mut p = Packetizer::default();
         let mut r = Reassembler::default();
         let _lost_idr = packets(&mut p, true, 10);
+        // One second of P frames at 72 Hz, two datagrams each.
+        let period = 1_000_000_000 / 72;
+        let mut requests = Vec::new();
+        for i in 0..72 {
+            for d in packets(&mut p, false, 2000) {
+                let now = i * period;
+                if r.push_at(&d, now) == Err(Event::Loss) {
+                    requests.push(now);
+                }
+            }
+        }
+        assert_eq!(requests[0], 0, "the first request goes out at once");
+        assert!(requests.windows(2).all(|w| w[1] - w[0] >= IDR_RETRY_NS), "{requests:?}");
+        assert!(requests.len() >= 9, "{} IDR requests in one second", requests.len());
+        assert!(packets(&mut p, true, 10).iter().map(|d| r.push_at(d, 72 * period)).any(|x| x.is_ok()));
+    }
+
+    #[test]
+    fn require_idr_asks_at_once_and_drops_until_one() {
+        // The decoder restarted mid-stream: no frame was lost, so only require_idr asks.
+        let mut p = Packetizer::default();
+        let mut r = Reassembler::default();
+        assert!(packets(&mut p, true, 10).iter().map(|d| r.push_at(d, 0)).any(|x| x.is_ok()));
+        r.require_idr();
+        let f = packets(&mut p, false, 2000);
+        assert_eq!(r.push_at(&f[0], 1), Err(Event::Loss));
+        assert_eq!(r.push_at(&f[1], 2), Err(Event::Pending), "a P frame is dropped");
+        // Asking again while waiting does not bring the next request forward.
+        r.require_idr();
+        assert_eq!(packets(&mut p, false, 10).iter().map(|d| r.push_at(d, 3)).collect::<Vec<_>>(), [Err(Event::Pending)]);
+        assert_eq!(r.stats.dropped_frames, 2);
+        assert_eq!(r.stats.lost_frames, 0);
+        assert!(packets(&mut p, true, 10).iter().map(|d| r.push_at(d, 4)).any(|x| x.is_ok()));
+    }
+
+    #[test]
+    fn asks_again_while_a_burst_loses_every_frame() {
+        // Every frame loses a datagram, so none is dropped whole: retries must still go out.
+        let mut p = Packetizer::default();
+        let mut r = Reassembler::default();
+        let period = 1_000_000_000 / 72;
         let mut requests = 0;
-        for _ in 0..100 {
-            for d in packets(&mut p, false, 10) {
-                if r.push(&d) == Err(Event::Loss) {
+        for i in 0..36 {
+            let mut f = packets(&mut p, i == 0, 3000);
+            if i > 0 {
+                f.remove(0);
+            }
+            for d in &f {
+                if r.push_at(d, i * period) == Err(Event::Loss) {
                     requests += 1;
                 }
             }
         }
-        assert!(requests >= 3, "{requests} IDR requests in 100 dropped frames");
-        assert!(packets(&mut p, true, 10).iter().map(|d| r.push(d)).any(|x| x.is_ok()));
+        // Half a second of loss: the first report and about one retry per 100 ms.
+        assert!((4..=6).contains(&requests), "{requests} IDR requests in 0.5 s of loss");
     }
 
     #[test]

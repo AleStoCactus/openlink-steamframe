@@ -40,6 +40,11 @@ pub struct ClientState {
     pub video: video::ReassemblyStats,
     /// Complete frames dropped because the consumer of [`Client::video_frames`] fell behind.
     pub video_overflow: u64,
+    /// Set by the consumer of [`Client::video_frames`] when its decoder cannot go on without
+    /// an IDR (it restarted, say): the receive thread then drops frames until one arrives and
+    /// asks the server for it, as after a loss. Without it nothing would ask, and on a clean
+    /// link the picture would stay frozen until the next loss.
+    pub idr_wanted: bool,
 }
 
 /// Frames waiting for the decoder. More than this and the oldest are of no use anyway.
@@ -221,11 +226,11 @@ fn on_video(
     match result {
         Ok(frame) => match frames.try_send(frame) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-            Err(TrySendError::Full(f)) => {
-                // The next frame would reference this one: recover with an IDR.
+            Err(TrySendError::Full(_)) => {
+                // The next frame would reference this one: recover with an IDR (the
+                // reassembler asks for it with the next datagram).
                 state.lock().unwrap().video_overflow += 1;
                 reassembler.require_idr();
-                let _ = sock.send(&proto::encode(&HeadsetMessage::VideoLoss { frame: f.number }));
             }
         },
         Err(video::Event::Loss) => {
@@ -235,7 +240,11 @@ fn on_video(
         Err(video::Event::Pending) => {}
     }
     // Published on every datagram: drops while waiting for an IDR must be visible too.
-    state.lock().unwrap().video = reassembler.stats;
+    let mut st = state.lock().unwrap();
+    st.video = reassembler.stats;
+    if std::mem::take(&mut st.idr_wanted) {
+        reassembler.require_idr();
+    }
 }
 
 /// A frame arrives as a burst of a few hundred datagrams; the default buffer drops some.
