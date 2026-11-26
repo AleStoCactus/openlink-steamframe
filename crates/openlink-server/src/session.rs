@@ -13,7 +13,7 @@ use openlink_protocol::{
     audio::{self, JitterBuffer},
     clock::{ClockSample, ClockSync},
     time::monotonic_ns,
-    Codec, FromDriver, HeadsetInfo, HeadsetMessage, ServerMessage, StreamConfig, ToDriver,
+    Batteries, Codec, FromDriver, HeadsetInfo, HeadsetMessage, ServerMessage, StreamConfig, ToDriver,
 };
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -103,6 +103,8 @@ pub struct HeadsetStatus {
     pub sample_age_ms: f32,
     /// Present-to-photon latency of the video, as measured by the headset.
     pub photon_latency_ms: Option<f32>,
+    /// The headset's last battery report.
+    pub battery: Option<Batteries>,
 }
 
 struct Shared {
@@ -363,6 +365,7 @@ fn welcome(
                 tracking_hz: 0.0,
                 sample_age_ms: 0.0,
                 photon_latency_ms: None,
+                battery: None,
             })
         }
     }
@@ -534,22 +537,13 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                     rate_window = (Instant::now(), 0);
                 }
             }
-            HeadsetMessage::Battery {
-                hmd,
-                left,
-                right,
-                charging,
-            } => {
-                to_driver(
-                    &driver_sock,
-                    &ToDriver::Battery {
-                        hmd,
-                        left,
-                        right,
-                        charging,
-                    },
-                );
+            HeadsetMessage::Battery(b) => {
+                if let Some(h) = shared.status.lock().unwrap().headset.as_mut() {
+                    h.battery = Some(b);
+                }
+                to_driver(&driver_sock, &ToDriver::Battery(b));
             }
+            HeadsetMessage::Controllers(c) => to_driver(&driver_sock, &ToDriver::Controllers(c)),
             HeadsetMessage::FrameDisplayed { present_ns, received_ns, queued_ns, decoded_ns, display_ns } => {
                 let Some(received_pc) = clock.headset_to_pc(received_ns) else {
                     continue;

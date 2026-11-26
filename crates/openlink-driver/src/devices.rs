@@ -3,7 +3,7 @@
 use crate::host::host;
 use crate::ovr::*;
 use crate::state::{shared, ControllerHandles, DisplayConfig};
-use openlink_protocol::{buttons, ControllerState, Hand};
+use openlink_protocol::{buttons, hmd_model_number, ControllerInput, Hand};
 use openlink_tracking::{ControllerModel, DriverPoseState};
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::Ordering;
@@ -107,11 +107,14 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         let h = host();
         let c = h.container(id);
         let d = s.display.lock().unwrap().clone();
-        h.set_string(c, prop::TrackingSystemName_String, "openlink");
-        h.set_string(c, prop::ModelNumber_String, &d.model);
-        h.set_string(c, prop::ManufacturerName_String, "Meta");
+        // Named as Meta's own driver (Link) names a Quest, so games that check for an Oculus
+        // headset find one. SteamVR has no Quest headset render model; Link uses none either.
+        h.set_string(c, prop::TrackingSystemName_String, "oculus");
+        h.set_string(c, prop::ModelNumber_String, hmd_model_number(&d.model));
+        h.set_string(c, prop::ManufacturerName_String, "Oculus");
         h.set_string(c, prop::SerialNumber_String, HMD_SERIAL);
         h.set_string(c, prop::RenderModelName_String, "generic_hmd");
+        set_icons(c, &HMD_ICONS);
         h.set_f32(c, prop::DisplayFrequency_Float, d.refresh_rate);
         h.set_f32(c, prop::UserIpdMeters_Float, d.ipd_m);
         h.set_f32(c, prop::SecondsFromVsyncToPhotons_Float, 0.0);
@@ -291,7 +294,7 @@ pub fn apply_display(d: &DisplayConfig) {
     }
     let h = host();
     let c = h.container(id);
-    h.set_string(c, prop::ModelNumber_String, &d.model);
+    h.set_string(c, prop::ModelNumber_String, hmd_model_number(&d.model));
     h.set_f32(c, prop::DisplayFrequency_Float, d.refresh_rate);
     h.set_f32(c, prop::UserIpdMeters_Float, d.ipd_m);
     h.set_render_target_size(id, d.eye_width, d.eye_height);
@@ -332,26 +335,17 @@ unsafe extern "C" fn ctrl_activate(this: *mut c_void, id: u32) -> EVRInitError {
         let s = shared();
         let h = host();
         let c = h.container(id);
-        let model = *s.controller_model.lock().unwrap();
-        let (side, role, model_number) = match hand {
-            Hand::Left => (
-                "left",
-                TrackedControllerRole_LeftHand,
-                "Oculus Quest (Left Controller)",
-            ),
-            Hand::Right => (
-                "right",
-                TrackedControllerRole_RightHand,
-                "Oculus Quest (Right Controller)",
-            ),
+        let model = s.controller_model.lock().unwrap()[hand as usize];
+        let (side, role, icons) = match hand {
+            Hand::Left => ("left", TrackedControllerRole_LeftHand, &LEFT_ICONS),
+            Hand::Right => ("right", TrackedControllerRole_RightHand, &RIGHT_ICONS),
         };
         // Present as genuine Touch controllers so games' shipped Touch bindings, pose offsets
         // and render models all apply unchanged.
         h.set_string(c, prop::TrackingSystemName_String, "oculus");
-        h.set_string(c, prop::ManufacturerName_String, "Oculus");
-        h.set_string(c, prop::ModelNumber_String, model_number);
         h.set_string(c, prop::SerialNumber_String, controller_serial(hand));
-        h.set_string(c, prop::RenderModelName_String, model.render_model(hand));
+        set_controller_model(c, hand, model);
+        set_icons(c, icons);
         h.set_string(c, prop::ControllerType_String, "oculus_touch");
         h.set_string(
             c,
@@ -361,6 +355,8 @@ unsafe extern "C" fn ctrl_activate(this: *mut c_void, id: u32) -> EVRInitError {
         h.set_i32(c, prop::ControllerRoleHint_Int32, role);
         h.set_bool(c, prop::DeviceIsWireless_Bool, true);
         h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, true);
+        // Lets SteamVR put a resting controller in standby (see `presence`).
+        h.set_bool(c, prop::ContainsProximitySensor_Bool, true);
 
         let b = |p: &CStr| h.create_bool(c, p);
         let f = |p: &CStr, two: bool| h.create_scalar(c, p, two);
@@ -395,6 +391,7 @@ unsafe extern "C" fn ctrl_activate(this: *mut c_void, id: u32) -> EVRInitError {
             grip_touch: b(c"/input/grip/touch"),
             thumbrest_touch: b(c"/input/thumbrest/touch"),
             haptic: h.create_haptic(c, c"/output/haptic"),
+            proximity: b(c"/proximity"),
         };
         *s.controllers[hand as usize].handles.lock().unwrap() = Some(handles);
         s.controllers[hand as usize].id.store(id, Ordering::Release);
@@ -417,9 +414,8 @@ unsafe extern "C" fn ctrl_get_component(_: *mut c_void, _: *const c_char) -> *mu
 }
 
 /// Forward one controller's buttons/axes. `time_offset` is the (negative) sample age.
-pub fn update_inputs(handles: &ControllerHandles, st: &ControllerState, time_offset: f64) {
+pub fn update_inputs(handles: &ControllerHandles, i: &ControllerInput, time_offset: f64) {
     let h = host();
-    let i = &st.input;
     let bit = |m: u32| i.buttons & m != 0;
     h.update_bool(handles.ax_click, bit(buttons::A_X_CLICK), time_offset);
     h.update_bool(handles.ax_touch, bit(buttons::A_X_TOUCH), time_offset);
@@ -455,19 +451,57 @@ pub fn update_inputs(handles: &ControllerHandles, st: &ControllerState, time_off
     );
 }
 
-/// Called when a headset with possibly different controllers connects.
-pub fn apply_controller_model(model: ControllerModel) {
+/// Shows `hand`'s controller as `model` (when a headset connects, and when it says which
+/// controllers it has). Does nothing if that is already what it shows.
+pub fn apply_controller_model(hand: Hand, model: ControllerModel) {
     let s = shared();
-    *s.controller_model.lock().unwrap() = model;
-    for hand in [Hand::Left, Hand::Right] {
-        let id = s.controllers[hand as usize].id.load(Ordering::Acquire);
-        if id != k_unTrackedDeviceIndexInvalid {
-            let h = host();
-            h.set_string(
-                h.container(id),
-                prop::RenderModelName_String,
-                model.render_model(hand),
-            );
-        }
+    let was = std::mem::replace(&mut s.controller_model.lock().unwrap()[hand as usize], model);
+    let id = s.controllers[hand as usize].id.load(Ordering::Acquire);
+    if was != model && id != k_unTrackedDeviceIndexInvalid {
+        log::info!("{hand:?} controller: {}", model.model_number(hand));
+        set_controller_model(host().container(id), hand, model);
+    }
+}
+
+fn set_controller_model(c: PropertyContainerHandle_t, hand: Hand, model: ControllerModel) {
+    let h = host();
+    h.set_string(c, prop::ModelNumber_String, model.model_number(hand));
+    h.set_string(c, prop::ManufacturerName_String, model.manufacturer());
+    h.set_string(c, prop::RenderModelName_String, model.render_model(hand));
+}
+
+macro_rules! controller_icons {
+    ($side:literal) => {
+        [
+            (prop::NamedIconPathDeviceOff_String, concat!("{oculus}/icons/rifts_", $side, "_controller_off.png")),
+            (prop::NamedIconPathDeviceSearching_String, concat!("{oculus}/icons/rifts_", $side, "_controller_searching.gif")),
+            (prop::NamedIconPathDeviceSearchingAlert_String, concat!("{oculus}/icons/rifts_", $side, "_controller_searching_alert.gif")),
+            (prop::NamedIconPathDeviceReady_String, concat!("{oculus}/icons/rifts_", $side, "_controller_ready.png")),
+            (prop::NamedIconPathDeviceReadyAlert_String, concat!("{oculus}/icons/rifts_", $side, "_controller_ready_alert.png")),
+            (prop::NamedIconPathDeviceNotReady_String, concat!("{oculus}/icons/rifts_", $side, "_controller_error.png")),
+            (prop::NamedIconPathDeviceAlertLow_String, concat!("{oculus}/icons/rifts_", $side, "_controller_ready_low.png")),
+        ]
+    };
+}
+
+/// Status window icons, from the Oculus driver that ships with SteamVR (as Link uses them): the
+/// Quest headset, and the Rift S Touch controllers, the only Touch icons it has. Pairs of
+/// property and path; the controllers have no standby icon there.
+const HMD_ICONS: [(i32, &str); 7] = [
+    (prop::NamedIconPathDeviceOff_String, "{oculus}/icons/quest_headset_off.png"),
+    (prop::NamedIconPathDeviceSearching_String, "{oculus}/icons/quest_headset_searching.gif"),
+    (prop::NamedIconPathDeviceSearchingAlert_String, "{oculus}/icons/quest_headset_alert_searching.gif"),
+    (prop::NamedIconPathDeviceReady_String, "{oculus}/icons/quest_headset_ready.png"),
+    (prop::NamedIconPathDeviceReadyAlert_String, "{oculus}/icons/quest_headset_ready_alert.png"),
+    (prop::NamedIconPathDeviceNotReady_String, "{oculus}/icons/quest_headset_error.png"),
+    (prop::NamedIconPathDeviceStandby_String, "{oculus}/icons/quest_headset_standby.png"),
+];
+const LEFT_ICONS: [(i32, &str); 7] = controller_icons!("left");
+const RIGHT_ICONS: [(i32, &str); 7] = controller_icons!("right");
+
+fn set_icons(c: PropertyContainerHandle_t, icons: &[(i32, &str)]) {
+    let h = host();
+    for &(p, path) in icons {
+        h.set_string(c, p, path);
     }
 }

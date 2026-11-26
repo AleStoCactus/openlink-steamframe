@@ -27,7 +27,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// [`HeadsetInfo::high_refresh_rates`] by model name, for the headset to probe before it has a
 /// `HeadsetInfo`.
@@ -126,6 +126,87 @@ impl MotionFlags {
     }
     pub fn is_valid(self) -> bool {
         self.has(Self::POSITION_VALID) && self.has(Self::ORIENTATION_VALID)
+    }
+}
+
+/// Which Meta controllers a hand holds, and how SteamVR and games are told about them. The
+/// names follow what Meta's own SteamVR driver (Link) reports, because games look for them to
+/// pick controller models and bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ControllerModel {
+    /// Quest 2 Touch.
+    Quest2,
+    /// Quest 3 / 3S Touch Plus.
+    QuestPlus,
+    /// Touch Pro.
+    QuestPro,
+}
+
+impl ControllerModel {
+    /// The controllers a headset ships with, for when the headset cannot say which it has.
+    pub fn from_headset_model(model: &str) -> Self {
+        let m = model.to_ascii_lowercase();
+        if m.contains("pro") {
+            Self::QuestPro
+        } else if m.contains("quest 3") || m.contains("quest3") {
+            Self::QuestPlus
+        } else {
+            Self::Quest2
+        }
+    }
+
+    /// From the OpenXR interaction profile the runtime bound the hand to.
+    pub fn from_interaction_profile(profile: &str, headset_model: &str) -> Option<Self> {
+        match profile {
+            "/interaction_profiles/meta/touch_controller_plus" => Some(Self::QuestPlus),
+            "/interaction_profiles/facebook/touch_controller_pro" => Some(Self::QuestPro),
+            // Every Touch generation can bind to the plain profile; it only says "a Touch".
+            "/interaction_profiles/oculus/touch_controller" => Some(Self::from_headset_model(headset_model)),
+            _ => None,
+        }
+    }
+
+    /// SteamVR's `RenderModelName`, shown in the SteamVR void and used by many games.
+    pub fn render_model(self, hand: Hand) -> &'static str {
+        match (self, hand) {
+            (Self::Quest2, Hand::Left) => "oculus_quest2_controller_left",
+            (Self::Quest2, Hand::Right) => "oculus_quest2_controller_right",
+            (Self::QuestPlus, Hand::Left) => "oculus_quest_plus_controller_left",
+            (Self::QuestPlus, Hand::Right) => "oculus_quest_plus_controller_right",
+            (Self::QuestPro, Hand::Left) => "oculus_quest_pro_controller_left",
+            (Self::QuestPro, Hand::Right) => "oculus_quest_pro_controller_right",
+        }
+    }
+
+    /// SteamVR's `ModelNumber`. Link calls the Quest 2 by its code name, Miramar.
+    pub fn model_number(self, hand: Hand) -> &'static str {
+        match (self, hand) {
+            (Self::Quest2, Hand::Left) => "Miramar (Left Controller)",
+            (Self::Quest2, Hand::Right) => "Miramar (Right Controller)",
+            (Self::QuestPlus, Hand::Left) => "Meta Quest 3 (Left Controller)",
+            (Self::QuestPlus, Hand::Right) => "Meta Quest 3 (Right Controller)",
+            (Self::QuestPro, Hand::Left) => "Meta Quest Pro (Left Controller)",
+            (Self::QuestPro, Hand::Right) => "Meta Quest Pro (Right Controller)",
+        }
+    }
+
+    pub fn manufacturer(self) -> &'static str {
+        match self {
+            Self::Quest2 => "Oculus",
+            Self::QuestPlus | Self::QuestPro => "Meta",
+        }
+    }
+}
+
+/// SteamVR's `ModelNumber` for a headset, from its OpenXR system name ("Oculus Quest2",
+/// "Meta Quest 3", ...), named as Link names it: the Quest 2 by its code name, the others as
+/// the runtime does.
+pub fn hmd_model_number(system_name: &str) -> &str {
+    let m: String = system_name.to_ascii_lowercase().split_whitespace().collect();
+    if m.contains("quest2") {
+        "Miramar"
+    } else {
+        system_name
     }
 }
 
@@ -304,6 +385,24 @@ pub enum Codec {
     Av1,
 }
 
+/// One device's battery.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryState {
+    /// Charge, 0.0 to 1.0.
+    pub level: f32,
+    pub charging: bool,
+}
+
+/// The headset's and controllers' batteries. `None` where the headset cannot tell: the
+/// controllers' charge only reaches apps through an OpenXR extension not every runtime has,
+/// and a controller that is off has no reading at all.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Batteries {
+    pub hmd: Option<BatteryState>,
+    /// Left, right.
+    pub controllers: [Option<BatteryState>; 2],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HapticPulse {
     pub hand: Hand,
@@ -355,12 +454,11 @@ pub enum HeadsetMessage {
         t1: i64,
         t2: i64,
     },
-    Battery {
-        hmd: f32,
-        left: f32,
-        right: f32,
-        charging: bool,
-    },
+    /// Sent every few seconds, so a lost datagram only delays the next reading.
+    Battery(Batteries),
+    /// The controllers actually in use (left, right), `None` while a hand has none. Sent every
+    /// few seconds like [`HeadsetMessage::Battery`].
+    Controllers([Option<ControllerModel>; 2]),
     /// Video frames were lost; the server should send an IDR. `frame` is the first number the
     /// headset knows it missed.
     VideoLoss {
@@ -415,12 +513,8 @@ pub enum ToDriver {
     /// `sample.sample_time_ns` has already been converted to the PC monotonic clock
     /// ([`time::monotonic_ns`]).
     Tracking(TrackingSample),
-    Battery {
-        hmd: f32,
-        left: f32,
-        right: f32,
-        charging: bool,
-    },
+    Battery(Batteries),
+    Controllers([Option<ControllerModel>; 2]),
     /// Measured time from `Present` to photons on the headset. SteamVR predicts poses this far
     /// past vsync, so what the user sees matches where things are when they see it.
     PhotonLatency {
@@ -506,6 +600,20 @@ mod tests {
         assert_eq!(info("Meta Quest 3S").encoded_size(100), (1832, 1920));
         assert_eq!(info("Oculus Quest2").encoded_size(100), (1832, 1920));
         assert_eq!(info("Unknown HMD").encoded_size(100), (1680, 1760));
+    }
+
+    #[test]
+    fn steamvr_model_names() {
+        assert_eq!(hmd_model_number("Oculus Quest2"), "Miramar");
+        assert_eq!(hmd_model_number("Meta Quest 3"), "Meta Quest 3");
+        assert_eq!(hmd_model_number("Meta Quest 3S"), "Meta Quest 3S");
+        assert_eq!(hmd_model_number("Meta Quest Pro"), "Meta Quest Pro");
+        let profile = |p: &str, hmd: &str| ControllerModel::from_interaction_profile(p, hmd);
+        assert_eq!(profile("/interaction_profiles/meta/touch_controller_plus", "Oculus Quest2"), Some(ControllerModel::QuestPlus));
+        assert_eq!(profile("/interaction_profiles/facebook/touch_controller_pro", "Meta Quest 3"), Some(ControllerModel::QuestPro));
+        assert_eq!(profile("/interaction_profiles/oculus/touch_controller", "Meta Quest 3S"), Some(ControllerModel::QuestPlus));
+        assert_eq!(profile("/interaction_profiles/oculus/touch_controller", "Oculus Quest2"), Some(ControllerModel::Quest2));
+        assert_eq!(profile("/interaction_profiles/ext/hand_interaction_ext", "Meta Quest 3"), None);
     }
 
     #[test]

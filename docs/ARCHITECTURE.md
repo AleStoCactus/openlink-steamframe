@@ -76,6 +76,22 @@ identical for Quest 2, Touch Plus and Touch Pro). The driver converts with
 `world_from_raw = world_from_grip · inverse(raw_from_grip)`. The lever arm is included in the
 linear velocity (`v + ω × r`).
 
+Names follow Meta's own driver (Link), which games look for: the HMD is tracking system
+`oculus`, manufacturer `Oculus`, model `Miramar` for a Quest 2 (Link uses the code name) and the
+runtime's system name otherwise ("Meta Quest 3"); controllers are "Meta Quest 3 (Left
+Controller)" and so on, with the matching render model. Which controllers a hand holds comes
+from the OpenXR interaction profile: the app suggests its bindings for Touch, Touch Plus
+(`XR_META_touch_controller_plus`) and Touch Pro (`XR_FB_touch_controller_pro`), so the runtime
+binds the real one, and the plain Touch profile falls back to the headset's own controllers.
+
+A controller that is put down stops being reported by the Quest within about a second (its
+OpenXR action goes inactive). Passing that on as disconnected made SteamVR show "controller not
+detected" whenever a controller rested on a desk, so the driver keeps reporting it at its last
+pose (`presence.rs`) and only disconnects the controllers with the headset. Standby is
+SteamVR's own: it shows a device as standby when its orientation stays nearly constant and its
+`/proximity` input is false. The controllers declare `Prop_ContainsProximitySensor_Bool` and
+report `/proximity` false once they have neither moved (1 cm, 2°) nor been touched for 15 s.
+
 ## Video pipeline
 
 | Stage | Windows | Linux |

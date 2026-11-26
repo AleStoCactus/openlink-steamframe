@@ -14,6 +14,7 @@ mod gbm;
 pub mod host;
 pub mod link;
 pub mod ovr;
+pub mod presence;
 pub mod render_pose;
 pub mod state;
 #[cfg(any(target_os = "linux", windows))]
