@@ -38,6 +38,7 @@ headset-side rows only differ where the PC side does.
 | Audio and video streaming | 🟡 Video works; audio needs a virtual cable for the mic and mirrors the default output | ✅ Done |
 | Wi-Fi streaming | ✅ Done | ✅ Done |
 | Wired streaming (USB) | 📋 Planned | 📋 Planned |
+| SteamVR dashboard | ✅ Works correctly | 🟡 Functional, but jitters and glitches a lot |
 | SteamVR throttling behavior support | 📋 Planned | 📋 Planned |
 | High performance | 🟡 Full-resolution 90 fps on an RX 6800; no error correction or adaptive bitrate | 🟡 Full-resolution 90 fps on RX 6000+; no error correction or adaptive bitrate |
 | Guided GUI setup | 📋 Planned | 📋 Planned |
