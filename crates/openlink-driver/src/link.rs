@@ -212,9 +212,9 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
         }
         ToDriver::PhotonLatency { seconds } => devices::set_photon_latency(seconds),
         ToDriver::VsyncShift { shift_ns } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             crate::direct_mode::VSYNC_SHIFT_NS.fetch_add(shift_ns.clamp(-5_000_000, 5_000_000), Ordering::AcqRel);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", windows)))]
             let _ = shift_ns;
         }
         ToDriver::DisplayPeriod { period_ns } => {

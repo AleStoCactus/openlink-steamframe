@@ -249,7 +249,19 @@ fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
             log::warn!("cannot enlarge the UDP send buffer: {}", std::io::Error::last_os_error());
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_SNDBUF};
+        // SAFETY: valid socket and option value.
+        let r = unsafe {
+            setsockopt(SOCKET(sock.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, Some(&bytes.to_ne_bytes()))
+        };
+        if r != 0 {
+            log::warn!("cannot enlarge the UDP send buffer: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = (sock, bytes);
 }
 

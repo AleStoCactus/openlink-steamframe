@@ -16,6 +16,11 @@ use ash::vk::native::*;
 
 const NO_REFERENCE_PICTURE: u8 = 0xFF;
 const BITSTREAM_SIZE: u64 = 16 << 20;
+/// Reset the session in the first frame's command buffer instead of a submission of its own.
+/// AMD's Windows driver needs this: after a reset submitted alone, every encode completes
+/// without encoding (its feedback query never becomes available). RADV is happy either way, and
+/// keeps the separate reset it was developed with.
+const RESET_WITH_FIRST_FRAME: bool = cfg!(windows);
 /// `log2_max_pic_order_cnt_lsb_minus4` at its maximum: POC LSBs wrap every 65536 frames.
 /// (At 4, POC passed its 8-bit LSB range after 256 frames and the encode hung the GPU.)
 const LOG2_MAX_POC_LSB_MINUS4: u8 = 12;
@@ -565,8 +570,16 @@ impl Encoder {
             .max_bitrate(bitrate)
             .frame_rate_numerator(fps_milli)
             .frame_rate_denominator(1000);
+        // A flat reference pattern (every P frame refers to the previous one) is a hint that the
+        // spec allows only together with REGULAR_GOP, which on-demand IDRs break. RADV ignores
+        // the invalid combination; AMD's Windows driver is not given it.
+        let rc_flags = if cfg!(windows) {
+            vk::VideoEncodeH265RateControlFlagsKHR::empty()
+        } else {
+            vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+        };
         let rc_h265 = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .flags(vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT)
+            .flags(rc_flags)
             .gop_frame_count(0)
             .idr_period(0)
             .consecutive_b_frame_count(0)
@@ -610,7 +623,9 @@ impl Encoder {
             idr_requested: true,
             dpb_initialised: false,
         };
-        enc.reset(ctx)?;
+        if !RESET_WITH_FIRST_FRAME {
+            enc.reset(ctx)?;
+        }
         Ok(enc)
     }
 
@@ -784,7 +799,15 @@ impl Encoder {
             .video_session(self.session)
             .video_session_parameters(self.params)
             .reference_slots(begin_slots);
-        begin.p_next = (&raw const rc).cast();
+        // Reset in this command buffer (see `RESET_WITH_FIRST_FRAME`): the session has no rate
+        // control state yet, so begin without one and set it with the reset.
+        let reset_here = RESET_WITH_FIRST_FRAME && !self.dpb_initialised;
+        if !reset_here {
+            begin.p_next = (&raw const rc).cast();
+        }
+        let mut control = vk::VideoCodingControlInfoKHR::default()
+            .flags(vk::VideoCodingControlFlagsKHR::RESET | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL);
+        control.p_next = (&raw const rc).cast();
 
         let src_barrier = vk::ImageMemoryBarrier2::default()
             .image(self.src)
@@ -835,6 +858,9 @@ impl Encoder {
                 &vk::DependencyInfo::default().image_memory_barriers(if first { barriers_first } else { &barriers }),
             );
             (vq.cmd_begin_video_coding_khr)(self.cmd, &begin);
+            if reset_here {
+                (vq.cmd_control_video_coding_khr)(self.cmd, &control);
+            }
             d.cmd_begin_query(self.cmd, self.query_pool, 0, vk::QueryControlFlags::empty());
             (ctx.video_encode.cmd_encode_video_khr)(self.cmd, &encode_info);
             d.cmd_end_query(self.cmd, self.query_pool, 0);

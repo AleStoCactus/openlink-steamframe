@@ -1,14 +1,13 @@
-//! Video link to the server (Linux): dmabuf fds and per-frame metadata out, releases back.
-//! See [`openlink_protocol::video_ipc`].
+//! Video link to the server: textures (Linux: dmabuf fds) and per-frame metadata out, releases
+//! back. See [`openlink_protocol::video_ipc`].
 //!
 //! The server listens; this thread connects whenever it is running, announces every current
 //! swap texture set, then relays the server's releases to [`crate::direct_mode`].
 
 use crate::direct_mode;
-use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, ServerVideoMsg};
+use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, RawAttachment, ServerVideoMsg};
 use openlink_protocol::{self as proto};
 use std::io;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -29,10 +28,26 @@ fn drop_channel(why: &io::Error) {
     }
 }
 
+/// Whether the server is connected.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn connected() -> bool {
+    CHANNEL.lock().unwrap().is_some()
+}
+
 /// Announces a new swap texture set, if the server is connected.
-pub fn send_set(set: &vipc::TextureSet, fds: &[RawFd]) {
+pub fn send_set(set: &vipc::TextureSet, attachments: &[RawAttachment]) {
     if let Some(ch) = channel() {
-        if let Err(e) = ch.send(&proto::encode(&DriverVideoMsg::TextureSet(set.clone())), fds) {
+        if let Err(e) = ch.send(&proto::encode(&DriverVideoMsg::TextureSet(set.clone())), attachments) {
+            drop_channel(&e);
+        }
+    }
+}
+
+/// Sends a message with nothing attached, if the server is connected.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn send_msg(msg: &DriverVideoMsg) {
+    if let Some(ch) = channel() {
+        if let Err(e) = ch.send(&proto::encode(msg), &[]) {
             drop_channel(&e);
         }
     }
@@ -90,15 +105,15 @@ impl Drop for VideoLink {
 
 fn connect() -> io::Result<Arc<Channel>> {
     let ch = Arc::new(Channel::connect()?);
-    let hello = DriverVideoMsg::Hello { driver_version: env!("CARGO_PKG_VERSION").into() };
+    let hello = DriverVideoMsg::Hello { driver_version: env!("CARGO_PKG_VERSION").into(), pid: std::process::id() };
     ch.send(&proto::encode(&hello), &[])?;
     let result = std::cell::RefCell::new(Ok(()));
     let publish = ch.clone();
     direct_mode::announce_all(
-        &mut |set, fds| {
+        &mut |msg, attachments| {
             let mut r = result.borrow_mut();
             if r.is_ok() {
-                *r = ch.send(&proto::encode(&DriverVideoMsg::TextureSet(set.clone())), fds);
+                *r = ch.send(&proto::encode(msg), attachments);
             }
         },
         || {

@@ -2,7 +2,9 @@
 
 use crate::ovr::*;
 use std::ffi::{c_void, CStr, CString};
-use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// Host interfaces fetched once in `Init`. SteamVR documents them as callable from any thread.
 pub struct Host {
@@ -10,10 +12,12 @@ pub struct Host {
     props: *mut Iface<IVRProperties_Vtbl>,
     input: *mut Iface<IVRDriverInput_Vtbl>,
     log: *mut Iface<IVRDriverLog_Vtbl>,
+    #[cfg(target_os = "linux")]
     ctx: *mut Iface<IVRDriverContext_Vtbl>,
     /// Linux only. Fetched on first use: vrserver serves it through the compositor, which it
     /// only starts after every driver's `Init`, so asking during `Init` fails with
     /// `VRInitError_IPC_ServerInitFailed`.
+    #[cfg(target_os = "linux")]
     ipc: Mutex<Option<*mut Iface<IVRIPCResourceManagerClient_Vtbl>>>,
 }
 
@@ -61,7 +65,9 @@ impl Host {
             props: get(ctx, IVRProperties_Version)?,
             input: get(ctx, IVRDriverInput_Version)?,
             log: get(ctx, IVRDriverLog_Version)?,
+            #[cfg(target_os = "linux")]
             ctx,
+            #[cfg(target_os = "linux")]
             ipc: Mutex::new(None),
         };
         Ok(HOST.get_or_init(|| host))
@@ -141,11 +147,9 @@ impl Host {
         unsafe { call!(self.server, SetRecommendedRenderTargetSize, id, w, h) }
     }
 
+    #[cfg(target_os = "linux")]
     /// `IVRIPCResourceManagerClient`, fetched on first successful use (see the `ipc` field).
     fn ipc(&self) -> Option<*mut Iface<IVRIPCResourceManagerClient_Vtbl>> {
-        if !cfg!(target_os = "linux") {
-            return None;
-        }
         let mut slot = self.ipc.lock().unwrap();
         if slot.is_none() {
             // SAFETY: the context outlives the driver.
@@ -160,6 +164,7 @@ impl Host {
         *slot
     }
 
+    #[cfg(target_os = "linux")]
     /// Ask SteamVR to allocate a Vulkan image it can share between the compositor, apps and us.
     pub fn new_shared_vulkan_image(&self, vk_format: u32, width: u32, height: u32) -> Option<SharedTextureHandle_t> {
         let ipc = self.ipc()?;
@@ -169,6 +174,7 @@ impl Host {
         (ok && h != 0).then_some(h)
     }
 
+    #[cfg(target_os = "linux")]
     /// A file descriptor for a shared resource (`RefResource` + `ReceiveSharedFd`).
     pub fn shared_fd(&self, h: SharedTextureHandle_t) -> Option<std::os::fd::OwnedFd> {
         let ipc = self.ipc()?;
@@ -183,6 +189,7 @@ impl Host {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn unref_resource(&self, h: SharedTextureHandle_t) {
         if let Some(ipc) = self.ipc() {
             // SAFETY: valid interface.
@@ -190,6 +197,7 @@ impl Host {
         }
     }
 
+    #[cfg(target_os = "linux")]
     /// DRM modifiers the compositor can render into for `drm_format` (`DRM_FORMAT_MOD_INVALID`
     /// filtered out). Empty if unsupported.
     pub fn dmabuf_modifiers(&self, drm_format: u32) -> Vec<u64> {
@@ -211,6 +219,7 @@ impl Host {
         }
     }
 
+    #[cfg(target_os = "linux")]
     /// Hands a dmabuf to SteamVR. The fds in `attrs` are dup'ed, not consumed.
     pub fn import_dmabuf(&self, attrs: &mut DmabufAttributes_t) -> Option<SharedTextureHandle_t> {
         let ipc = self.ipc()?;

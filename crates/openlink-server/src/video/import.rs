@@ -1,8 +1,10 @@
-//! Compositor dmabufs as Vulkan images.
+//! Compositor textures as Vulkan images: dmabufs on Linux, our D3D11 copies of the driver's
+//! shared textures on Windows (see [`super::d3d`]).
 
 use super::vk::{check, Context, Result};
 use ash::vk;
 use openlink_protocol::video_ipc as vipc;
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 
 /// One imported compositor texture.
@@ -12,7 +14,11 @@ pub struct Imported {
     pub view: vk::ImageView,
     memory: vk::DeviceMemory,
     /// Kept to export the compositor's implicit write fence each frame.
+    #[cfg(target_os = "linux")]
     fd: OwnedFd,
+    /// The driver's texture and our copy, which `image` is.
+    #[cfg(windows)]
+    pub d3d: super::d3d::Texture,
     pub width: u32,
     pub height: u32,
 }
@@ -31,6 +37,7 @@ pub fn vk_format_for(drm_format: u32) -> Option<vk::Format> {
 
 impl Imported {
     /// `fds` holds one fd per plane of `tex`; plane 0's fd names the buffer.
+    #[cfg(target_os = "linux")]
     pub fn new(ctx: &Context, set: &vipc::TextureSet, tex: &vipc::DmabufTexture, fds: Vec<OwnedFd>) -> Result<Self> {
         let format = vk_format_for(set.drm_format)
             .ok_or_else(|| format!("unsupported DRM format {:#x}", set.drm_format))?;
@@ -102,28 +109,71 @@ impl Imported {
             let memory = check(d.allocate_memory(&alloc, None), "vkAllocateMemory (dmabuf)").map_err(fail)?;
             // Success: the driver owns the duplicate now.
             let _ = dup.into_raw_fd();
-            if let Err(e) = check(d.bind_image_memory(image, memory, 0), "vkBindImageMemory (dmabuf)") {
-                d.free_memory(memory, None);
-                return Err(fail(e));
-            }
-            let view_info = vk::ImageViewCreateInfo::default()
-                .image(image)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
-                .subresource_range(color_range());
-            let view = match check(d.create_image_view(&view_info, None), "vkCreateImageView (dmabuf)") {
-                Ok(v) => v,
-                Err(e) => {
-                    d.free_memory(memory, None);
-                    return Err(fail(e));
-                }
-            };
+            let view = bind_and_view(ctx, image, memory, format).map_err(fail)?;
             Ok(Self { handle: tex.handle, image, view, memory, fd, width: set.width, height: set.height })
+        }
+    }
+
+    /// Opens the driver's texture (`tex.handle`, a legacy shared handle) through D3D11 and
+    /// imports our copy of it.
+    #[cfg(windows)]
+    pub fn new(
+        ctx: &Context,
+        set: &vipc::TextureSet,
+        tex: &vipc::DmabufTexture,
+        _attachments: Vec<vipc::Attachment>,
+    ) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        let format = vk_format_for(set.drm_format)
+            .ok_or_else(|| format!("unsupported DRM format {:#x}", set.drm_format))?;
+        let d3d = ctx.d3d.open(tex.handle, set.drm_format)?;
+        let handle_type = vk::ExternalMemoryHandleTypeFlags::D3D11_TEXTURE;
+        let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: set.width, height: set.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external);
+        let d = &ctx.device;
+        // SAFETY: valid create info; every object is destroyed on error or in Drop.
+        unsafe {
+            let image = check(d.create_image(&info, None), "vkCreateImage (D3D11 texture)")?;
+            let fail = |e: String| {
+                d.destroy_image(image, None);
+                e
+            };
+            let req = d.get_image_memory_requirements(image);
+            let ty = ctx
+                .memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| ctx.memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+                .ok_or_else(|| fail("no memory type can import this texture".into()))?;
+            // D3D11 textures must be imported as dedicated allocations. Vulkan does not take
+            // ownership of an NT handle; ours is closed with `d3d`.
+            let mut import = vk::ImportMemoryWin32HandleInfoKHR::default()
+                .handle_type(handle_type)
+                .handle(d3d.copy_handle.as_raw_handle() as _);
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(ty)
+                .push_next(&mut import)
+                .push_next(&mut dedicated);
+            let memory = check(d.allocate_memory(&alloc, None), "vkAllocateMemory (D3D11 texture)").map_err(fail)?;
+            let view = bind_and_view(ctx, image, memory, format).map_err(fail)?;
+            Ok(Self { handle: tex.handle, image, view, memory, d3d, width: set.width, height: set.height })
         }
     }
 
     /// A sync file that signals when the compositor's pending writes to this texture are done
     /// (the dmabuf's implicit fences). `None` if the kernel cannot export one.
+    #[cfg(target_os = "linux")]
     pub fn write_fence(&self) -> Option<OwnedFd> {
         #[repr(C)]
         struct ExportSyncFile {
@@ -151,6 +201,25 @@ impl Imported {
             ctx.device.free_memory(self.memory, None);
         }
     }
+}
+
+/// Binds `memory` to `image` and creates its view; frees `memory` on failure (the caller
+/// destroys the image).
+///
+/// # Safety
+/// Valid, unbound image and memory allocated for it.
+unsafe fn bind_and_view(ctx: &Context, image: vk::Image, memory: vk::DeviceMemory, format: vk::Format) -> Result<vk::ImageView> {
+    let d = &ctx.device;
+    if let Err(e) = check(d.bind_image_memory(image, memory, 0), "vkBindImageMemory (import)") {
+        d.free_memory(memory, None);
+        return Err(e);
+    }
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(color_range());
+    check(d.create_image_view(&view_info, None), "vkCreateImageView (import)").inspect_err(|_| d.free_memory(memory, None))
 }
 
 pub fn color_range() -> vk::ImageSubresourceRange {

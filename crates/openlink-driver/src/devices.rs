@@ -62,15 +62,15 @@ unsafe extern "C" fn debug_request(_: *mut c_void, _: *const c_char, resp: *mut 
 pub struct Hmd {
     vtable: &'static ITrackedDeviceServerDriver_Vtbl,
     display: DisplayObj,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     direct_mode: crate::direct_mode::DirectModeObj,
 }
 
 /// Whether the HMD exposes `IVRDriverDirectModeComponent` (compositor renders into our
-/// textures) instead of the "display on desktop" path. Linux allocates the textures through
-/// SteamVR's IPC resource manager; Windows support comes with the D3D11 texture path.
+/// textures) instead of the "display on desktop" path. Linux allocates the textures as dmabufs
+/// (and through SteamVR's IPC resource manager), Windows as D3D11 shared textures.
 pub const fn use_direct_mode() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", windows))
 }
 
 #[repr(C)]
@@ -85,7 +85,7 @@ impl Default for Hmd {
             display: DisplayObj {
                 vtable: &DISPLAY_VTBL,
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             direct_mode: crate::direct_mode::DirectModeObj::default(),
         }
     }
@@ -120,8 +120,15 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.set_bool(c, prop::DriverDirectModeSendsVsyncEvents_Bool, use_direct_mode());
         h.set_bool(c, prop::DeviceIsWireless_Bool, true);
         h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, true);
+        // Windows: SteamVR renders on the adapter the HMD names. Ours is the one the swap
+        // textures are created on, so the compositor can open them.
+        #[cfg(windows)]
+        match crate::direct_mode::adapter_luid() {
+            Some(luid) => h.set_u64(c, prop::GraphicsAdapterLuid_Uint64, luid),
+            None => log::error!("no D3D11 adapter; SteamVR picks its own and frames cannot be streamed"),
+        }
         h.pose_updated(id, &DriverPose_t::disconnected());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if use_direct_mode() {
             let vsync = crate::direct_mode::VsyncThread::start(|| {
                 let measured = shared().vsync_period_ns.load(Ordering::Acquire);
@@ -139,7 +146,7 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
 }
 
 unsafe extern "C" fn hmd_deactivate(_this: *mut c_void) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     crate::VSYNC.lock().unwrap().take();
     shared()
         .hmd_id
@@ -151,7 +158,7 @@ unsafe extern "C" fn hmd_get_component(this: *mut c_void, name: *const c_char) -
         let hmd = this.cast::<Hmd>();
         return std::ptr::addr_of_mut!((*hmd).display).cast();
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if component_is(name, IVRDriverDirectModeComponent_Version) && use_direct_mode() {
         let hmd = this.cast::<Hmd>();
         return std::ptr::addr_of_mut!((*hmd).direct_mode).cast();
@@ -160,8 +167,8 @@ unsafe extern "C" fn hmd_get_component(this: *mut c_void, name: *const c_char) -
 }
 
 // Display component. With direct mode the compositor renders into our swap textures and only
-// uses this for projection/render size. Without it (Windows, for now) SteamVR falls back to
-// rendering into a desktop window described here.
+// uses this for projection/render size. Without it (platforms other than Linux and Windows)
+// SteamVR falls back to rendering into a desktop window described here.
 
 const WINDOW_W: u32 = 1920;
 const WINDOW_H: u32 = 1080;
