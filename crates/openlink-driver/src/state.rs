@@ -56,6 +56,32 @@ impl DisplayConfig {
         }
     }
 
+    /// Whether SteamVR, started with `self`, renders correctly for a headset that wants `other`.
+    ///
+    /// SteamVR reads the render target size and projection once, when its compositor starts:
+    /// `SetRecommendedRenderTargetSize` and `SetDisplayProjectionRaw` at runtime are accepted
+    /// but the compositor keeps its swap textures and frustum (seen on Linux: textures stayed
+    /// at the placeholder's 2876x3080 after a Quest 3 reported 1680x1760). Games then render
+    /// another FOV and aspect than the headset shows them with: severe, nauseating distortion.
+    /// A small FOV tolerance absorbs float noise between sessions of the same headset.
+    pub fn renders_like(&self, other: &Self) -> bool {
+        const FOV_TOLERANCE_RAD: f32 = 0.005;
+        let close = |a: &Fov, b: &Fov| {
+            [
+                a.angle_left - b.angle_left,
+                a.angle_right - b.angle_right,
+                a.angle_up - b.angle_up,
+                a.angle_down - b.angle_down,
+            ]
+            .iter()
+            .all(|d| d.abs() <= FOV_TOLERANCE_RAD)
+        };
+        self.eye_width == other.eye_width
+            && self.eye_height == other.eye_height
+            && close(&self.fov[0], &other.fov[0])
+            && close(&self.fov[1], &other.fov[1])
+    }
+
     /// OpenVR raw projection: tangents of the four half-angles.
     ///
     /// OpenVR's "top" is the tangent of the **downward** extent (negative) and "bottom" that of
@@ -73,6 +99,33 @@ impl DisplayConfig {
                 v: [f.angle_right.tan(), f.angle_up.tan()],
             },
         }
+    }
+}
+
+/// The last connected headset's info, kept on disk so the next SteamVR start describes that
+/// headset's display from the outset (see [`DisplayConfig::renders_like`]).
+pub mod display_cache {
+    use openlink_protocol::{self as proto, HeadsetInfo};
+    use std::path::PathBuf;
+
+    fn path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("openlink").join("last-headset.bin"))
+    }
+
+    /// `None` when there is no cache or it is from another protocol version.
+    pub fn load() -> Option<HeadsetInfo> {
+        proto::decode(&std::fs::read(path()?).ok()?).ok()
+    }
+
+    pub fn save(info: &HeadsetInfo) -> std::io::Result<()> {
+        let path = path().ok_or_else(|| std::io::Error::other("no config directory"))?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // Write then rename, so a crash mid-write never leaves a truncated cache.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, proto::encode(info))?;
+        std::fs::rename(tmp, path)
     }
 }
 
@@ -104,6 +157,10 @@ pub struct Shared {
     pub hmd_id: AtomicU32,
     pub controllers: [ControllerSlot; 2],
     pub display: Mutex<DisplayConfig>,
+    /// The display SteamVR was started with, which its compositor keeps for the whole session.
+    pub startup_display: DisplayConfig,
+    /// A SteamVR restart was requested for a headset whose display differs from the startup one.
+    pub restart_requested: std::sync::atomic::AtomicBool,
     pub controller_model: Mutex<ControllerModel>,
     pub prediction: PredictionConfig,
     /// The headset display's measured frame period, once known (0 until then): the vsync we
@@ -123,10 +180,16 @@ pub fn shared() -> &'static Shared {
             id: AtomicU32::new(k_unTrackedDeviceIndexInvalid),
             handles: Mutex::new(None),
         };
+        let display = match display_cache::load() {
+            Some(info) => DisplayConfig::from_headset(&info),
+            None => DisplayConfig::default(),
+        };
         Shared {
+            startup_display: display.clone(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
             hmd_id: AtomicU32::new(k_unTrackedDeviceIndexInvalid),
             controllers: [slot(), slot()],
-            display: Mutex::new(DisplayConfig::default()),
+            display: Mutex::new(display),
             controller_model: Mutex::new(ControllerModel::QuestPlus),
             prediction: PredictionConfig::default(),
             vsync_period_ns: std::sync::atomic::AtomicI64::new(0),
@@ -159,5 +222,20 @@ mod tests {
         assert!((ndc_y(&r, 0.768f32.tan()) - 1.0).abs() < 1e-5);
         assert!((ndc_y(&r, (-0.960f32).tan()) + 1.0).abs() < 1e-5);
         assert!(r.vTopLeft.v[0] < 0.0 && r.vBottomRight.v[0] > 0.0);
+    }
+
+    #[test]
+    fn render_setup_comparison() {
+        let a = DisplayConfig::default();
+        let mut b = a.clone();
+        b.refresh_rate = 120.0;
+        b.ipd_m = 0.07;
+        b.fov[0].angle_up += 0.001;
+        assert!(a.renders_like(&b), "refresh rate, IPD and float noise need no restart");
+        b.eye_width = 1680;
+        assert!(!a.renders_like(&b));
+        let mut c = a.clone();
+        c.fov[1].angle_down -= 0.05;
+        assert!(!a.renders_like(&c));
     }
 }

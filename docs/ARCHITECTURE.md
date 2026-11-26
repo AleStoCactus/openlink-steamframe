@@ -140,6 +140,14 @@ preferred wired path.
   headset refresh rate. That interface is only available once `vrcompositor` is up, after
   driver `Init`, so it is fetched lazily. Next step: import the textures into the encoder via
   `RefResource` + `ReceiveSharedFd`.
+- **Display changes at runtime.** Resolved: they do not take. SteamVR reads the HMD's render
+  target size and projection once, when the compositor starts; `SetRecommendedRenderTargetSize`
+  and `SetDisplayProjectionRaw` later are accepted but the compositor keeps its swap textures
+  and frustum (it stayed at the placeholder's 2876x3080 after a Quest 3 reported 1680x1760), so
+  games render another FOV and aspect than the headset shows: severe distortion. The driver
+  therefore saves the last headset's info (`last-headset.bin` in the platform config dir),
+  describes that display from SteamVR's start, and asks SteamVR to restart
+  (`IVRServerDriverHost::RequestRestart`) when a headset with a different size or FOV connects.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.

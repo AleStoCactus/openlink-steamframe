@@ -6,7 +6,7 @@
 use crate::devices::{self, to_ovr_pose};
 use crate::host::host;
 use crate::ovr::{k_unTrackedDeviceIndexInvalid, DriverPose_t};
-use crate::state::{shared, DisplayConfig};
+use crate::state::{display_cache, shared, DisplayConfig};
 use openlink_protocol::{self as proto, time::monotonic_ns, FromDriver, Hand, ToDriver};
 use openlink_tracking::{controller_raw_from_grip, to_driver_pose, ControllerModel};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -118,6 +118,31 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                 info.current_refresh_rate
             );
             let d = DisplayConfig::from_headset(&info);
+            if display_cache::load().as_ref() != Some(&info) {
+                if let Err(e) = display_cache::save(&info) {
+                    log::error!("cannot save the headset's display for the next SteamVR start: {e}");
+                }
+            }
+            // SteamVR keeps the display it started with (see `DisplayConfig::renders_like`), so
+            // a different headset needs a restart, which picks the saved display up. Only ask
+            // once the cache holds it, or the restarted SteamVR would ask again, forever.
+            if !s.startup_display.renders_like(&d)
+                && display_cache::load().as_ref() == Some(&info)
+                && !s.restart_requested.swap(true, Ordering::AcqRel)
+            {
+                let was = &s.startup_display;
+                log::warn!(
+                    "SteamVR started for a {}x{} display, the headset wants {}x{} \
+                     (FOV {:?}, was {:?}): restarting SteamVR to apply it",
+                    was.eye_width,
+                    was.eye_height,
+                    d.eye_width,
+                    d.eye_height,
+                    d.fov,
+                    was.fov
+                );
+                host().request_restart("OpenLink: restarting SteamVR for the headset's display");
+            }
             devices::apply_display(&d);
             *s.display.lock().unwrap() = d;
             devices::apply_controller_model(ControllerModel::from_headset_model(&info.model));
