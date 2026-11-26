@@ -72,6 +72,8 @@ pub enum DriverVideoMsg {
     Frame {
         frame_id: u64,
         eyes: [EyeLayer; 2],
+        /// SteamVR's own layer (dashboard, laser, overlays), to draw over an application's.
+        overlay: Option<[EyeLayer; 2]>,
         /// Row-major 3x4 HMD pose the frame was rendered with.
         hmd_pose: [[f32; 4]; 3],
         /// The vsync this frame was presented for (`time::monotonic_ns`).
@@ -296,6 +298,7 @@ mod tests {
         let msg = DriverVideoMsg::Frame {
             frame_id: 7,
             eyes: [EyeLayer { texture: 1, bounds: [0.0, 0.0, 1.0, 1.0] }; 2],
+            overlay: None,
             hmd_pose: [[0.0; 4]; 3],
             present_ns: 99,
         };

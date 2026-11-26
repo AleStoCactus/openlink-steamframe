@@ -8,13 +8,18 @@ layout(set = 0, binding = 0) uniform sampler2D left_eye;
 layout(set = 0, binding = 1) uniform sampler2D right_eye;
 layout(set = 0, binding = 2, r8) uniform writeonly image2D y_plane;
 layout(set = 0, binding = 3, rg8) uniform writeonly image2D cbcr_plane;
+// SteamVR's own layer (dashboard, laser, overlays) drawn over an application's layer.
+layout(set = 0, binding = 4) uniform sampler2D overlay_left;
+layout(set = 0, binding = 5) uniform sampler2D overlay_right;
 
 layout(push_constant) uniform Push {
     // uMin, vMin, uMax, vMax of each eye's image within its texture.
     vec4 bounds[2];
+    vec4 overlay_bounds[2];
     // Output pixels per eye; the frame is two of these side by side, then black padding up to
     // the coded size.
     ivec2 eye_size;
+    int has_overlay;
 } pc;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
@@ -43,7 +48,14 @@ vec3 sample_frame(ivec2 p) {
         c += textureLod(right_eye, uv + vec2(-q.x, q.y), 0.0).rgb;
         c += textureLod(right_eye, uv + vec2(q.x, q.y), 0.0).rgb;
     }
-    return c * 0.25;
+    c *= 0.25;
+    if (pc.has_overlay != 0) {
+        vec4 ob = pc.overlay_bounds[eye];
+        vec2 ouv = mix(ob.xy, ob.zw, local);
+        vec4 o = eye == 0 ? textureLod(overlay_left, ouv, 0.0) : textureLod(overlay_right, ouv, 0.0);
+        c = mix(c, o.rgb, o.a);
+    }
+    return c;
 }
 
 void main() {

@@ -14,7 +14,10 @@ static SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rgba_to_nv12.com
 #[derive(Clone, Copy)]
 struct Push {
     bounds: [[f32; 4]; 2],
+    overlay_bounds: [[f32; 4]; 2],
     eye_size: [i32; 2],
+    has_overlay: i32,
+    _pad: i32,
 }
 
 struct Plane {
@@ -99,6 +102,16 @@ impl Converter {
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
         // SAFETY: valid create infos throughout.
         unsafe {
@@ -136,7 +149,7 @@ impl Converter {
             d.destroy_shader_module(module, None);
 
             let sizes = [
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 2 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 4 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 2 },
             ];
             let pool = check(
@@ -200,7 +213,9 @@ impl Converter {
 
     /// Points the shader at this frame's eye textures. Only call while no submitted work uses
     /// the descriptor set.
-    pub fn bind_eyes(&self, ctx: &Context, left: vk::ImageView, right: vk::ImageView) {
+    /// `overlay`: the left and right views of a layer to draw over the eyes, if any (the eyes
+    /// are bound in its place otherwise, so every binding stays valid).
+    pub fn bind_eyes(&self, ctx: &Context, left: vk::ImageView, right: vk::ImageView, overlay: Option<(vk::ImageView, vk::ImageView)>) {
         let info = |view| {
             [vk::DescriptorImageInfo::default()
                 .sampler(self.sampler)
@@ -208,6 +223,7 @@ impl Converter {
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
         };
         let (l, r) = (info(left), info(right));
+        let (ol, or) = overlay.map_or((info(left), info(right)), |(a, b)| (info(a), info(b)));
         // SAFETY: valid set; not in use (caller's contract).
         unsafe {
             ctx.device.update_descriptor_sets(
@@ -222,6 +238,16 @@ impl Converter {
                         .dst_binding(1)
                         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                         .image_info(&r),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.set)
+                        .dst_binding(4)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&ol),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.set)
+                        .dst_binding(5)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&or),
                 ],
                 &[],
             )
@@ -231,7 +257,14 @@ impl Converter {
     /// Records the conversion, then the copy of Y and CbCr into `nv12`'s planes. The eye
     /// textures must already be in `SHADER_READ_ONLY_OPTIMAL`, and `nv12` in
     /// `TRANSFER_DST_OPTIMAL`.
-    pub fn record(&mut self, ctx: &Context, cmd: vk::CommandBuffer, bounds: [[f32; 4]; 2], nv12: vk::Image) {
+    pub fn record(
+        &mut self,
+        ctx: &Context,
+        cmd: vk::CommandBuffer,
+        bounds: [[f32; 4]; 2],
+        overlay_bounds: Option<[[f32; 4]; 2]>,
+        nv12: vk::Image,
+    ) {
         let d = &ctx.device;
         let to = |p: &Plane, old, new, src_stage, src_access, dst_stage, dst_access| {
             vk::ImageMemoryBarrier2::default()
@@ -271,7 +304,10 @@ impl Converter {
         });
         let push = Push {
             bounds,
+            overlay_bounds: overlay_bounds.unwrap_or(bounds),
             eye_size: [self.eye_width as i32, self.eye_height as i32],
+            has_overlay: overlay_bounds.is_some() as i32,
+            _pad: 0,
         };
         // SAFETY: recording into a command buffer in the recording state; all handles valid.
         unsafe {

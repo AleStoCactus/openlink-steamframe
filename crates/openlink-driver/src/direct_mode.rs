@@ -495,8 +495,14 @@ unsafe extern "C" fn submit_layer(_this: *mut c_void, per_eye: *const [SubmitLay
     with(|c| c.pending.push(layer));
 }
 
-/// Hands the base layer of the frame to the server, marking its textures busy.
-fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) {
+/// Hands the base layer of the frame to the server, with SteamVR's own layer to draw over it
+/// (dashboard, laser, overlays) when the base is an application's, marking their textures busy.
+fn send_frame(
+    c: &mut Compositor,
+    base: &[SubmitLayerPerEye_t; 2],
+    overlay: Option<&[SubmitLayerPerEye_t; 2]>,
+    now_ns: i64,
+) {
     let streamable = |h: SharedTextureHandle_t| {
         c.sets.iter().any(|s| s.streamable() && s.textures.iter().any(|t| t.handle == h))
     };
@@ -513,6 +519,7 @@ fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) 
     let msg = vipc::DriverVideoMsg::Frame {
         frame_id,
         eyes: [eye(&base[0]), eye(&base[1])],
+        overlay: overlay.map(|o| [eye(&o[0]), eye(&o[1])]),
         // The compositor's own layer reports the pose one frame stale; an application's layer
         // reports the pose it really rendered with (both measured against the mock headset).
         hmd_pose: if from_compositor {
@@ -528,7 +535,7 @@ fn send_frame(c: &mut Compositor, base: &[SubmitLayerPerEye_t; 2], now_ns: i64) 
     c.next_frame_id += 1;
     c.frames_sent += 1;
     for t in c.sets.iter_mut().flat_map(|s| &mut s.textures) {
-        if base.iter().any(|e| e.hTexture == t.handle) {
+        if base.iter().chain(overlay.into_iter().flatten()).any(|e| e.hTexture == t.handle) {
             t.busy = Some(frame_id);
         }
     }
@@ -577,7 +584,20 @@ unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHan
                     c.new_content += 1;
                     c.last_texture = base[0].hTexture;
                 }
-                send_frame(c, base, now_ns);
+                // SteamVR's own layer, over an application's scene. Without an application it
+                // is the scene itself, and is not drawn twice.
+                let is_compositor = |l: &[SubmitLayerPerEye_t; 2]| {
+                    c.sets.iter().any(|s| s.compositor && s.textures.iter().any(|t| t.handle == l[0].hTexture))
+                };
+                let overlay = if is_compositor(base) {
+                    None
+                } else {
+                    layers
+                        .iter()
+                        .filter(|l| is_compositor(l) && l.iter().all(|e| streamable(e.hTexture)))
+                        .max_by_key(|l| rank(l[0].hTexture).1)
+                };
+                send_frame(c, base, overlay, now_ns);
             }
             c.layer_counts.push_back(layers.len());
             c.presents.push_back(now);

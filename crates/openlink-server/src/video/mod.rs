@@ -130,6 +130,7 @@ fn spawn_sender(sink: Option<Arc<VideoSink>>) -> std::sync::mpsc::SyncSender<(vi
 struct Frame {
     id: u64,
     eyes: [vipc::EyeLayer; 2],
+    overlay: Option<[vipc::EyeLayer; 2]>,
     hmd_pose: [[f32; 4]; 3],
     present_ns: i64,
 }
@@ -195,8 +196,8 @@ struct Pipeline {
     cmd: avk::CommandBuffer,
     fence: avk::Fence,
     converted: avk::Semaphore,
-    /// Receive the compositor's write fences, one per eye.
-    fence_sems: [avk::Semaphore; 2],
+    /// Receive the compositor's write fences, one per texture read (two eyes, two overlay).
+    fence_sems: [avk::Semaphore; 4],
     /// Compositor write fences seen: already signalled, still pending, unavailable.
     fence_stats: (u32, u32, u32),
 }
@@ -229,7 +230,7 @@ impl Pipeline {
             pool,
             fence: ctx.fence()?,
             converted: ctx.semaphore()?,
-            fence_sems: [ctx.semaphore()?, ctx.semaphore()?],
+            fence_sems: [ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?],
             fence_stats: (0, 0, 0),
         })
     }
@@ -249,11 +250,25 @@ impl Pipeline {
 
     /// Converts the frame on the compute queue and waits for it, so the textures can be
     /// released before encoding.
-    fn convert(&mut self, ctx: &Context, eyes: [&Imported; 2], bounds: [[f32; 4]; 2]) -> Result<()> {
+    /// `overlay`: SteamVR's own layer to draw over an application's, with its bounds.
+    fn convert(
+        &mut self,
+        ctx: &Context,
+        eyes: [&Imported; 2],
+        bounds: [[f32; 4]; 2],
+        overlay: Option<([&Imported; 2], [[f32; 4]; 2])>,
+    ) -> Result<()> {
         let d = &ctx.device;
+        // Every distinct texture this frame reads.
+        let mut unique: Vec<&Imported> = Vec::new();
+        for img in eyes.iter().chain(overlay.iter().flat_map(|(o, _)| o.iter())) {
+            if !unique.iter().any(|u| u.handle == img.handle) {
+                unique.push(img);
+            }
+        }
         // Wait for the compositor's rendering into the textures (implicit dmabuf fences).
         let mut waits = Vec::new();
-        for (eye, sem) in eyes.iter().zip(self.fence_sems) {
+        for (eye, sem) in unique.iter().zip(self.fence_sems) {
             let Some(sync) = eye.write_fence() else {
                 self.fence_stats.2 += 1;
                 continue;
@@ -276,12 +291,8 @@ impl Pipeline {
                 }
                 Err(e) => log::warn!("video: cannot import compositor fence: {e:?}"),
             }
-            if eyes[0].handle == eyes[1].handle {
-                break;
-            }
         }
 
-        let unique: Vec<&Imported> = if eyes[0].handle == eyes[1].handle { vec![eyes[0]] } else { eyes.to_vec() };
         let ownership = |img: &Imported, acquire: bool| {
             let (src_q, dst_q) = if acquire {
                 (avk::QUEUE_FAMILY_FOREIGN_EXT, ctx.compute_family)
@@ -317,7 +328,7 @@ impl Pipeline {
         );
         let release: Vec<_> = unique.iter().map(|i| ownership(i, false)).collect();
 
-        self.converter.bind_eyes(ctx, eyes[0].view, eyes[1].view);
+        self.converter.bind_eyes(ctx, eyes[0].view, eyes[1].view, overlay.map(|(o, _)| (o[0].view, o[1].view)));
         // SAFETY: our command buffer is idle (we wait for its fence every frame).
         unsafe {
             check(
@@ -325,7 +336,7 @@ impl Pipeline {
                 "vkBeginCommandBuffer",
             )?;
             d.cmd_pipeline_barrier2(self.cmd, &avk::DependencyInfo::default().image_memory_barriers(&acquire));
-            self.converter.record(ctx, self.cmd, bounds, self.encoder.src);
+            self.converter.record(ctx, self.cmd, bounds, overlay.map(|(_, b)| b), self.encoder.src);
             d.cmd_pipeline_barrier2(self.cmd, &avk::DependencyInfo::default().image_memory_barriers(&release));
             check(d.end_command_buffer(self.cmd), "vkEndCommandBuffer")?;
             let stages = vec![avk::PipelineStageFlags::COMPUTE_SHADER; waits.len()];
@@ -431,8 +442,8 @@ impl<'a> Connection<'a> {
                     Ok(DriverVideoMsg::Hello { driver_version }) => log::info!("video: driver {driver_version}"),
                     Ok(DriverVideoMsg::TextureSet(set)) => self.import_set(&set, fds),
                     Ok(DriverVideoMsg::TexturesDestroyed { handles }) => self.forget(&handles),
-                    Ok(DriverVideoMsg::Frame { frame_id, eyes, hmd_pose, present_ns }) => {
-                        if let Some(old) = newest.replace(Frame { id: frame_id, eyes, hmd_pose, present_ns }) {
+                    Ok(DriverVideoMsg::Frame { frame_id, eyes, overlay, hmd_pose, present_ns }) => {
+                        if let Some(old) = newest.replace(Frame { id: frame_id, eyes, overlay, hmd_pose, present_ns }) {
                             self.stats.skipped += 1;
                             release(old.id);
                         }
@@ -545,7 +556,12 @@ impl<'a> Connection<'a> {
         let p = self.pipeline.as_mut().unwrap();
 
         let t0 = Instant::now();
-        let converted = p.convert(ctx, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds]);
+        // The overlay is drawn only if both its textures are known.
+        let overlay = frame.overlay.and_then(|o| {
+            let (l, r) = (self.imports.get(&o[0].texture)?, self.imports.get(&o[1].texture)?);
+            Some(([l, r], [o[0].bounds, o[1].bounds]))
+        });
+        let converted = p.convert(ctx, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds], overlay);
         release(frame.id);
         converted?;
         let t1 = Instant::now();

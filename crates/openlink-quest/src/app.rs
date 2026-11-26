@@ -46,6 +46,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     exts.khr_opengl_es_enable = true;
     exts.khr_convert_timespec_time = available.khr_convert_timespec_time;
     exts.fb_display_refresh_rate = available.fb_display_refresh_rate;
+    exts.ext_performance_settings = available.ext_performance_settings;
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -142,6 +143,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         xr::SessionState::READY => {
                             session.begin(xr::ViewConfigurationType::PRIMARY_STEREO).map_err(e("xrBeginSession"))?;
                             session_running = true;
+                            request_sustained_performance(&instance, &session);
                         }
                         xr::SessionState::STOPPING => {
                             session.end().map_err(e("xrEndSession"))?;
@@ -366,6 +368,26 @@ fn monotonic_ns(instance: &xr::Instance, t: xr::Time) -> i64 {
         return t.as_nanos();
     }
     ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+/// Asks for sustained high CPU and GPU clocks. The app's own load is light, so by default the
+/// runtime lowered them (CPU often at 1.4 GHz), and the decoder and the threads feeding it slowed
+/// and grew jittery: decode time rose from 6 to 10 ms and pictures started missing frames.
+fn request_sustained_performance(instance: &xr::Instance, session: &xr::Session<xr::OpenGlEs>) {
+    let Some(ext) = instance.exts().ext_performance_settings else {
+        log::warn!("XR_EXT_performance_settings unavailable; clocks stay dynamic");
+        return;
+    };
+    for domain in [xr::PerfSettingsDomainEXT::CPU, xr::PerfSettingsDomainEXT::GPU] {
+        // SAFETY: valid session and enum values.
+        let r = unsafe {
+            (ext.perf_settings_set_performance_level)(session.as_raw(), domain, xr::PerfSettingsLevelEXT::SUSTAINED_HIGH)
+        };
+        if r.into_raw() < 0 {
+            log::warn!("cannot raise {domain:?} performance level: {r:?}");
+        }
+    }
+    log::info!("requested sustained high CPU and GPU performance");
 }
 
 fn current_rate(session: &xr::Session<xr::OpenGlEs>, ext: bool) -> f32 {

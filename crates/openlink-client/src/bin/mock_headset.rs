@@ -17,6 +17,8 @@
 //! * `--still-controllers`: controllers hold still, as world-fixed reference points.
 //! * `--video-out PATH`: write the received video stream (Annex B) to PATH. Either way, video
 //!   statistics and the frames' render poses are logged every few seconds.
+//! * `--poses-out PATH`: write each received frame's render pose to PATH, one line per frame
+//!   (present time ns, position xyz, orientation xyzw), to line up with the frames of `--video-out`.
 
 use glam::{DQuat, DVec3};
 use openlink_client::{Client, TrackingSource};
@@ -160,6 +162,7 @@ fn main() {
     let mut delay_ms = 0.0;
     let mut spin_tilted = false;
     let mut video_out: Option<String> = None;
+    let mut poses_out: Option<String> = None;
     let (mut yaw_deg, mut yaw_hz) = (8.6, 0.2);
     let mut yaw_steps = false;
     let mut still_controllers = false;
@@ -174,6 +177,7 @@ fn main() {
             }
             "--spin-tilted" => spin_tilted = true,
             "--video-out" => video_out = Some(args.next().expect("--video-out PATH")),
+            "--poses-out" => poses_out = Some(args.next().expect("--poses-out PATH")),
             "--yaw-deg" => yaw_deg = args.next().and_then(|v| v.parse().ok()).expect("--yaw-deg DEG"),
             "--yaw-steps" => yaw_steps = true,
             "--still-controllers" => still_controllers = true,
@@ -207,7 +211,7 @@ fn main() {
     );
     let frames = client.video_frames().expect("video receiver");
     let state = client.state();
-    std::thread::spawn(move || video_sink(frames, state, video_out));
+    std::thread::spawn(move || video_sink(frames, state, video_out, poses_out));
     let stop = AtomicBool::new(false);
     client.run(&mut mock, rate, &stop);
 }
@@ -217,13 +221,21 @@ fn video_sink(
     frames: std::sync::mpsc::Receiver<openlink_protocol::video::Frame>,
     state: std::sync::Arc<std::sync::Mutex<openlink_client::ClientState>>,
     out: Option<String>,
+    poses_out: Option<String>,
 ) {
     use std::io::Write;
     let mut file = out.map(|p| std::fs::File::create(&p).unwrap_or_else(|e| panic!("{p}: {e}")));
+    let mut poses = poses_out.map(|p| std::fs::File::create(&p).unwrap_or_else(|e| panic!("{p}: {e}")));
     let (mut since, mut count, mut bytes, mut idrs) = (std::time::Instant::now(), 0u32, 0usize, 0u32);
     for f in frames {
         if let Some(file) = &mut file {
             file.write_all(&f.bitstream).expect("write video");
+        }
+        if let Some(poses) = &mut poses {
+            let p = f.info.render_pose;
+            let (t, q) = (p.position, p.orientation);
+            writeln!(poses, "{} {} {} {} {} {} {} {}", f.info.present_ns, t[0], t[1], t[2], q[0], q[1], q[2], q[3])
+                .expect("write poses");
         }
         count += 1;
         bytes += f.bitstream.len();

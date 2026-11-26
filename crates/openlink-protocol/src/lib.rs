@@ -23,7 +23,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
