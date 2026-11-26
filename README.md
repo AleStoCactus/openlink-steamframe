@@ -36,6 +36,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Steam Frame build | ❌ Not Planned | A client for Valve's Steam Frame |
 | Wi-Fi streaming | ✅ Working | See [Wi-Fi and USB cable](#wi-fi-and-usb-cable) |
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
+| Quest 3 Extended Refresh Rates | 🟡 Partial | Server side works, Quest app doesn't request the refresh rate correctly |
 | Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issue: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth |
 
 ### Planned
