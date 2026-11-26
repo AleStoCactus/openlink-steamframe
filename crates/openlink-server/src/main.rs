@@ -30,6 +30,14 @@ fn main() {
         }
         return;
     }
+    #[cfg(any(target_os = "linux", windows))]
+    if let Some(i) = args.iter().position(|a| a == "--convert-selftest") {
+        if let Err(e) = video::convert_selftest(&args[i + 1..]) {
+            log::error!("convert selftest: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let settings = Arc::new(Mutex::new(Settings::load()));
     let status = Arc::new(Mutex::new(Status::default()));
 
