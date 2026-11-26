@@ -108,12 +108,15 @@ semaphore. Windows has no `SOCK_SEQPACKET`, so the link is loopback TCP with len
 messages and a writer thread whose bounded queue gives `try_send` the same never-block
 behaviour.
 
-**AMD's Windows Vulkan Video driver** (RX 6800, driver 32.0.21045) differs from RADV in two ways
-the encoder works around, both `cfg(windows)`: a session reset submitted on its own leaves every
+**AMD's Windows Vulkan Video driver** (RX 6800, driver 32.0.21045) differs from RADV in three ways
+the encoder works around, all `cfg(windows)`: a session reset submitted on its own leaves every
 later encode completing without output (the feedback query never becomes available), so the
-reset goes into the first frame's coding scope; and CBR and VBR are accepted but ignored (byte-
+reset goes into the first frame's coding scope; CBR and VBR are accepted but ignored (byte-
 identical streams at 20 and 200 Mbit/s), so the encoder runs at a constant QP that the server
-sets per frame from each frame's size and a VBV-like budget (`SoftRateControl`).
+sets per frame from each frame's size and a VBV-like budget (`SoftRateControl`); and it writes
+SAO syntax into every slice header even when the SPS has SAO off, so decoders misparsed every
+slice after it (FFmpeg: `alignment_bit_equal_to_one=0`; the Quest 3 rejected the IDR and showed
+nothing), and the SPS now enables SAO.
 
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
