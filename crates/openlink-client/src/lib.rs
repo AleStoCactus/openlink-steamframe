@@ -18,7 +18,7 @@ use openlink_protocol::{
     self as proto,
     audio::{self, JitterBuffer, Packetizer},
     time::monotonic_ns,
-    video, Batteries, HapticPulse, HeadsetInfo, HeadsetMessage,
+    video, Batteries, ControllerModel, HapticPulse, HeadsetInfo, HeadsetMessage,
     ServerMessage, StreamConfig, TrackingSample,
 };
 use std::net::{SocketAddr, UdpSocket};
@@ -32,16 +32,21 @@ pub trait TrackingSource {
     /// Sample every device **at** `time_ns` (headset clock). No forward prediction.
     fn sample(&mut self, time_ns: i64) -> TrackingSample;
     fn haptics(&mut self, _pulse: HapticPulse) {}
-    /// Read every [`BATTERY_PERIOD`] on the tracking thread, so it must be quick; `None` if
+    /// Read every [`STATUS_PERIOD`] on the tracking thread, so it must be quick; `None` if
     /// this source has no batteries to report.
     fn battery(&mut self) -> Option<Batteries> {
         None
     }
+    /// The controllers in use (left, right), read every [`STATUS_PERIOD`]; `None` if this
+    /// source cannot tell.
+    fn controllers(&mut self) -> Option<[Option<ControllerModel>; 2]> {
+        None
+    }
 }
 
-/// How often the battery is reported. Charge changes slowly, and resending regularly also
-/// makes up for a lost datagram.
-pub const BATTERY_PERIOD: Duration = Duration::from_secs(5);
+/// How often the battery and controllers are reported. They change slowly, and resending
+/// regularly also makes up for a lost datagram.
+pub const STATUS_PERIOD: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct ClientState {
@@ -187,7 +192,7 @@ impl Client {
         let mut next = Instant::now();
         let mut last_hello: Option<Instant> = None;
         let mut seq = 0u32;
-        let mut last_battery: Option<Instant> = None;
+        let mut last_status: Option<Instant> = None;
 
         while !stop.load(Ordering::Acquire) {
             let welcomed = self.state.lock().unwrap().welcome.is_some();
@@ -203,14 +208,17 @@ impl Client {
                     .sock
                     .send(&proto::encode(&HeadsetMessage::Tracking { seq, sample }));
                 seq = seq.wrapping_add(1);
-                if last_battery.is_none_or(|t| t.elapsed() >= BATTERY_PERIOD) {
-                    last_battery = Some(Instant::now());
+                if last_status.is_none_or(|t| t.elapsed() >= STATUS_PERIOD) {
+                    last_status = Some(Instant::now());
                     if let Some(b) = source.battery() {
                         let _ = self.sock.send(&proto::encode(&HeadsetMessage::Battery(b)));
                     }
+                    if let Some(c) = source.controllers() {
+                        let _ = self.sock.send(&proto::encode(&HeadsetMessage::Controllers(c)));
+                    }
                 }
             } else {
-                last_battery = None; // report straight away once welcomed (again)
+                last_status = None; // report straight away once welcomed (again)
             }
             while let Ok(p) = self.haptics.try_recv() {
                 source.haptics(p);

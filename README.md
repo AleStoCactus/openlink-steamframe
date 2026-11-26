@@ -47,7 +47,7 @@ headset-side rows only differ where the PC side does.
 | AMD GPU support | ✅ Done (RX 6800) | ✅ Done (RADV, RX 6000+) |
 | NVIDIA GPU support | ❔ Untested | ❔ Untested |
 | Battery status in SteamVR | 🟡 Headset works; Quest controllers' charge is not available to apps | 🟡 Headset works; Quest controllers' charge is not available to apps |
-| Correct headset model in SteamVR and games | 📋 Planned | 📋 Planned |
+| Correct headset model in SteamVR and games | ✅ Done | ✅ Done |
 | Quest app requests the correct refresh rate | 🟡 Server side works; the Quest app does not request the rate correctly | 🟡 Server side works; the Quest app does not request the rate correctly |
 | Statistics screen | 📋 Planned | 📋 Planned |
 
@@ -76,8 +76,10 @@ What the rows mean:
   before the stream starts: no status, pairing or settings screen.
 - **GPU support:** any GPU whose driver has Vulkan Video H.265 encode should work. AMD is
   verified on both systems; NVIDIA and Intel are not tested yet.
-- **Headset model:** SteamVR shows a generic OpenLink HMD instead of the real headset (e.g.
-  Quest 3), which some games use to pick controller models and bindings.
+- **Headset model:** the headset and controllers are named as Meta's own driver (Link) names
+  them, with the Quest status icons, so SteamVR and games see e.g. a Meta Quest 3 with Touch
+  Plus controllers. The controllers are the ones actually in use (Touch, Touch Plus or Touch
+  Pro, from the OpenXR interaction profile), not guessed from the headset.
 - **Battery status:** the headset's and both controllers' charge in the SteamVR dashboard (and
   the desktop app), sent every 5 s. The headset's comes from Android's `BatteryManager`; the
   controllers' only from runtimes with `XR_EXT_interaction_profile_battery_state_display`, and

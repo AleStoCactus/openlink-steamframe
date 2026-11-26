@@ -5,6 +5,7 @@
 
 use crate::devices::{self, to_ovr_pose};
 use crate::host::host;
+use crate::presence::Presence;
 use crate::ovr::{k_unTrackedDeviceIndexInvalid, prop, DriverPose_t};
 use crate::state::{display_cache, shared, DisplayConfig};
 use openlink_protocol::{self as proto, time::monotonic_ns, FromDriver, Hand, ToDriver};
@@ -64,6 +65,7 @@ impl Drop for Link {
 fn run(socket: UdpSocket, server: SocketAddr, stop: Arc<AtomicBool>) {
     let mut buf = [0u8; 2048];
     let mut last_tracking: Option<Instant> = None;
+    let mut presence: [Presence; 2] = Default::default();
     let mut last_heartbeat = Instant::now() - HEARTBEAT_EVERY;
 
     while !stop.load(Ordering::Acquire) {
@@ -75,7 +77,7 @@ fn run(socket: UdpSocket, server: SocketAddr, stop: Arc<AtomicBool>) {
         match socket.recv_from(&mut buf) {
             Ok((n, from)) if from.ip().is_loopback() => {
                 match proto::decode::<ToDriver>(&buf[..n]) {
-                    Ok(msg) => handle(msg, &mut last_tracking),
+                    Ok(msg) => handle(msg, &mut last_tracking, &mut presence),
                     Err(e) => log::warn!("bad datagram from server: {e}"),
                 }
             }
@@ -95,6 +97,7 @@ fn run(socket: UdpSocket, server: SocketAddr, stop: Arc<AtomicBool>) {
             log::info!("tracking timed out; marking devices disconnected");
             last_tracking = None;
             shared().tracking_active.store(false, Ordering::Release);
+            presence.iter_mut().for_each(Presence::reset);
             report_disconnected();
         }
     }
@@ -106,7 +109,7 @@ const HMD_VELOCITY_SCALE: f64 = 0.01;
 /// Share of the measured photon latency controllers are predicted over.
 const CONTROLLER_PREDICTION: f64 = 0.6;
 
-fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
+fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>, presence: &mut [Presence; 2]) {
     let s = shared();
     match msg {
         ToDriver::HeadsetConnected(info) => {
@@ -145,10 +148,14 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
             }
             devices::apply_display(&d);
             *s.display.lock().unwrap() = d;
-            devices::apply_controller_model(ControllerModel::from_headset_model(&info.model));
+            // The controllers the headset ships with, until it says which it has.
+            let model = ControllerModel::from_headset_model(&info.model);
+            devices::apply_controller_model(Hand::Left, model);
+            devices::apply_controller_model(Hand::Right, model);
         }
         ToDriver::HeadsetDisconnected => {
             *last_tracking = None;
+            presence.iter_mut().for_each(Presence::reset);
             s.tracking_active.store(false, Ordering::Release);
             report_disconnected();
         }
@@ -184,9 +191,11 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                 if id == k_unTrackedDeviceIndexInvalid {
                     continue;
                 }
+                let handles = *slot.handles.lock().unwrap();
+                let presence = &mut presence[hand as usize];
                 match &sample.controllers[hand as usize] {
-                    Some(c) => {
-                        let off = controller_raw_from_grip(model, hand);
+                    Some(c) if c.motion.flags.is_valid() => {
+                        let off = controller_raw_from_grip(model[hand as usize], hand);
                         let st = to_driver_pose(
                             &c.motion,
                             Some(off),
@@ -194,6 +203,7 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                             now,
                             &s.prediction,
                         );
+                        presence.seen(&st, &c.input, Instant::now());
                         // SteamVR predicts to vsync only (SecondsFromVsyncToPhotons is 0): call the
                         // sample older so it predicts towards the photons. Only part of the way:
                         // swings decelerate, and linear extrapolation over the full latency
@@ -202,11 +212,32 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                         predicted.time_offset_s -=
                             CONTROLLER_PREDICTION * s.photon_latency_us.load(Ordering::Acquire) as f64 * 1e-6;
                         h.pose_updated(id, &to_ovr_pose(&predicted));
-                        if let Some(handles) = *slot.handles.lock().unwrap() {
-                            devices::update_inputs(&handles, c, st.time_offset_s);
+                        if let Some(handles) = &handles {
+                            devices::update_inputs(handles, &c.input, st.time_offset_s);
                         }
                     }
-                    None => h.pose_updated(id, &DriverPose_t::disconnected()),
+                    // Not reported (put down: the Quest drops a resting controller within about
+                    // a second) or not locatable: keep it where it was last seen, so SteamVR
+                    // shows it resting, then in standby, instead of "not detected".
+                    c => {
+                        match presence.held() {
+                            Some(held) => h.pose_updated(id, &to_ovr_pose(&held)),
+                            None => h.pose_updated(id, &DriverPose_t::disconnected()),
+                        }
+                        if let Some(handles) = &handles {
+                            devices::update_inputs(handles, &c.map(|c| c.input).unwrap_or_default(), 0.0);
+                        }
+                    }
+                }
+                if let Some(handles) = &handles {
+                    h.update_bool(handles.proximity, presence.in_use(Instant::now()), 0.0);
+                }
+            }
+        }
+        ToDriver::Controllers(models) => {
+            for (hand, model) in [Hand::Left, Hand::Right].into_iter().zip(models) {
+                if let Some(model) = model {
+                    devices::apply_controller_model(hand, model);
                 }
             }
         }

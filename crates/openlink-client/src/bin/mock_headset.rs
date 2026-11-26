@@ -27,7 +27,7 @@
 use glam::{DQuat, DVec3};
 use openlink_client::{Client, TrackingSource};
 use openlink_protocol::{
-    buttons, Batteries, BatteryState, Codec, ControllerInput, ControllerState, Fov, HapticPulse, HeadsetInfo, Motion,
+    buttons, Batteries, BatteryState, Codec, ControllerModel, ControllerInput, ControllerState, Fov, HapticPulse, HeadsetInfo, Motion,
     MotionFlags, Pose, TrackingSample,
 };
 use std::f64::consts::{PI, TAU};
@@ -155,6 +155,11 @@ impl TrackingSource for Mock {
             hmd: Some(BatteryState { level: (0.2 + t / 600.0).min(1.0), charging: true }),
             controllers: [Some(BatteryState { level: (0.9 - t / 600.0).max(0.0), charging: false }), None],
         })
+    }
+
+    /// Touch Plus, as a Quest 3 has.
+    fn controllers(&mut self) -> Option<[Option<ControllerModel>; 2]> {
+        Some([Some(ControllerModel::QuestPlus); 2])
     }
 
     fn haptics(&mut self, p: HapticPulse) {

@@ -543,6 +543,7 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 }
                 to_driver(&driver_sock, &ToDriver::Battery(b));
             }
+            HeadsetMessage::Controllers(c) => to_driver(&driver_sock, &ToDriver::Controllers(c)),
             HeadsetMessage::FrameDisplayed { present_ns, received_ns, queued_ns, decoded_ns, display_ns } => {
                 let Some(received_pc) = clock.headset_to_pc(received_ns) else {
                     continue;
