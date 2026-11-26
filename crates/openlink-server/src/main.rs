@@ -2,9 +2,11 @@
 //!
 //! Runs the headset session in the background and shows a settings/status window.
 //! `openlink --headless` runs the session without a window (for servers or debugging).
+//! While a headset is connected, "OpenLink" output and input devices carry its audio.
 //! `openlink --dump-video PATH` (Linux) also writes every encoded frame to PATH as raw H.265.
 
 mod adapter;
+mod audio;
 mod config;
 mod encoder;
 mod gui;
@@ -51,7 +53,7 @@ fn main() {
             .position(|a| a == "--dump-video")
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from);
-        let sink = session.as_ref().and_then(|s| s.video_sink().ok());
+        let sink = session.as_ref().and_then(|s| s.link().ok());
         match video::VideoService::start(status.clone(), settings.clone(), sink, dump) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -60,6 +62,10 @@ fn main() {
             }
         }
     };
+
+    let _audio = session.as_ref().and_then(|s| s.link().ok()).and_then(|link| {
+        audio::AudioService::start(link).map_err(|e| log::error!("cannot start audio: {e}")).ok()
+    });
 
     if headless {
         if session.is_none() {

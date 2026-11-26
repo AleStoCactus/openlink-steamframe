@@ -119,6 +119,23 @@ impl Host {
         unsafe { call!(self.server, SetDisplayProjectionRaw, id, &left, &right) }
     }
 
+    /// Ask vrserver to restart SteamVR (it shows `reason` and relaunches itself).
+    pub fn request_restart(&self, reason: &str) {
+        let reason = CString::new(reason.replace('\0', "")).unwrap();
+        let empty = c"";
+        // SAFETY: valid interface and NUL-terminated strings that outlive the call.
+        unsafe {
+            call!(
+                self.server,
+                RequestRestart,
+                reason.as_ptr(),
+                empty.as_ptr(),
+                empty.as_ptr(),
+                empty.as_ptr()
+            )
+        }
+    }
+
     pub fn set_render_target_size(&self, id: u32, w: u32, h: u32) {
         // SAFETY: valid interface.
         unsafe { call!(self.server, SetRecommendedRenderTargetSize, id, w, h) }

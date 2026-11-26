@@ -8,11 +8,14 @@
 //!   lives inside `vrserver` and never touches the network itself; it only receives tracking that
 //!   the server has already converted into the PC clock domain.
 //!
+//! * **audio**, both ways on the headset socket: [`audio`] (game audio to the headset, its
+//!   microphone back).
 //! * **driver -> server video** (Linux): [`video_ipc`], a Unix socket carrying the compositor's
 //!   dmabufs and per-frame metadata.
 //!
 //! Every datagram is `[MAGIC: 4][PROTOCOL_VERSION: u16 LE][postcard payload]`.
 
+pub mod audio;
 pub mod clock;
 pub mod time;
 pub mod video;
@@ -23,7 +26,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -182,6 +185,37 @@ pub struct HeadsetInfo {
     pub decoders: Vec<Codec>,
 }
 
+impl HeadsetInfo {
+    /// Per-eye panel resolution, which is what "100%" encoded resolution means.
+    ///
+    /// OpenXR only reports a *recommended* render size, which Quest runtimes set well below the
+    /// panel (Quest 3: 1680x1760 for a 2064x2208 panel) to save GPU time in standalone apps.
+    /// The panel size is not queryable, so it comes from the model name; an unknown headset
+    /// falls back to its recommended size.
+    pub fn panel_size(&self) -> (u32, u32) {
+        let m: String = self.model.to_ascii_lowercase().split_whitespace().collect();
+        if m.contains("quest3s") {
+            (1832, 1920)
+        } else if m.contains("quest3") {
+            (2064, 2208)
+        } else if m.contains("questpro") {
+            (1800, 1920)
+        } else if m.contains("quest2") {
+            (1832, 1920)
+        } else {
+            (self.eye_width, self.eye_height)
+        }
+    }
+
+    /// Per-eye size to encode at `percent` of the panel resolution: even (video formats need
+    /// that) and at least 2.
+    pub fn encoded_size(&self, percent: u32) -> (u32, u32) {
+        let (w, h) = self.panel_size();
+        let scale = |v: u32| ((((v as u64 * percent as u64 + 50) / 100) as u32) & !1).max(2);
+        (scale(w), scale(h))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Codec {
     H264,
@@ -205,6 +239,10 @@ pub struct StreamConfig {
     pub eye_width: u32,
     pub eye_height: u32,
     pub bitrate_bps: u64,
+    /// The server streams game audio ([`audio::Stream::Speakers`]); the headset should play it.
+    pub speakers: bool,
+    /// The server wants the headset's microphone ([`audio::Stream::Microphone`]).
+    pub microphone: bool,
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -277,6 +315,8 @@ pub enum ServerMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToDriver {
+    /// The headset, with `eye_width`/`eye_height` replaced by the encoded per-eye size: that is
+    /// the render size SteamVR should recommend.
     HeadsetConnected(HeadsetInfo),
     HeadsetDisconnected,
     /// `sample.sample_time_ns` has already been converted to the PC monotonic clock
@@ -354,6 +394,26 @@ pub fn decode<T: DeserializeOwned>(buf: &[u8]) -> Result<T, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_size_is_relative_to_the_panel() {
+        let info = |model: &str| HeadsetInfo {
+            model: model.into(),
+            serial: String::new(),
+            eye_width: 1680,
+            eye_height: 1760,
+            refresh_rates: vec![90.0],
+            current_refresh_rate: 90.0,
+            ipd_m: 0.063,
+            fov: [Fov { angle_left: -0.9, angle_right: 0.8, angle_up: 0.8, angle_down: -0.9 }; 2],
+            decoders: vec![Codec::H265],
+        };
+        assert_eq!(info("Meta Quest 3").encoded_size(100), (2064, 2208));
+        assert_eq!(info("Meta Quest 3").encoded_size(50), (1032, 1104));
+        assert_eq!(info("Meta Quest 3S").encoded_size(100), (1832, 1920));
+        assert_eq!(info("Oculus Quest2").encoded_size(100), (1832, 1920));
+        assert_eq!(info("Unknown HMD").encoded_size(100), (1680, 1760));
+    }
 
     fn motion() -> Motion {
         Motion {

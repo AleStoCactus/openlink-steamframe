@@ -2,19 +2,21 @@
 //!
 //! Two threads:
 //! * **headset**: receives tracking/input from the headset, rewrites the timestamps into PC
-//!   time and forwards them to the driver immediately; runs clock sync.
+//!   time and forwards them to the driver immediately; runs clock sync. Microphone audio is
+//!   queued for the audio service.
 //! * **driver**: receives heartbeats and haptics from the SteamVR driver and routes haptics to
 //!   the headset.
 
 use crate::config::{ConnectionMode, Settings};
 use openlink_protocol::{
     self as proto,
+    audio::{self, JitterBuffer},
     clock::{ClockSample, ClockSync},
     time::monotonic_ns,
     Codec, FromDriver, HeadsetInfo, HeadsetMessage, ServerMessage, StreamConfig, ToDriver,
 };
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -23,6 +25,12 @@ const HEADSET_TIMEOUT: Duration = Duration::from_secs(2);
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOCK_PING_WARMUP: Duration = Duration::from_millis(20);
 const CLOCK_PING_STEADY: Duration = Duration::from_millis(250);
+/// How often a connected headset's stream configuration is re-sent: picks up saved settings
+/// within this time, and repeats the `Welcome` in case one was lost (the headset only asks
+/// with `Hello` until its first one arrives).
+const WELCOME_REPEAT: Duration = Duration::from_millis(500);
+/// Reserve the microphone buffer keeps against Wi-Fi jitter, on top of what the jitter needs.
+const MIC_MARGIN_MS: u32 = 10;
 
 #[derive(Debug, Clone, Default)]
 pub struct Status {
@@ -31,12 +39,65 @@ pub struct Status {
     /// The Steam Frame's USB wireless adapter, when plugged in.
     pub adapter: Option<crate::adapter::AdapterStatus>,
     pub last_error: Option<String>,
+    pub audio: AudioStatus,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AudioStatus {
+    /// The OpenLink output device exists (a headset that plays audio is connected).
+    pub speakers: bool,
+    /// The OpenLink microphone exists.
+    pub microphone: bool,
+    pub error: Option<String>,
+    /// Live signal levels, for the meters in the window.
+    pub levels: Arc<AudioLevels>,
+}
+
+/// Peak sample levels (0..1) of the headset's audio since the window last looked, kept in
+/// atomics because they are updated for every 5 ms packet.
+#[derive(Debug, Default)]
+pub struct AudioLevels {
+    speakers: AtomicU32,
+    microphone: AtomicU32,
+}
+
+impl AudioLevels {
+    /// Notes the peak |sample| of audio going to the headset's speakers.
+    pub fn speakers(&self, peak: u16) {
+        Self::note(&self.speakers, peak);
+    }
+
+    /// Notes s16le samples from the headset's microphone.
+    pub fn microphone(&self, pcm: &[u8]) {
+        let peak = pcm
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| i16::from_le_bytes(*b).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        Self::note(&self.microphone, peak);
+    }
+
+    fn note(slot: &AtomicU32, peak: u16) {
+        let peak = peak as f32 / 32768.0;
+        // f32 bit patterns of non-negative values order like the values themselves.
+        slot.fetch_max(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Peaks (speakers, microphone) since the last call.
+    pub fn take(&self) -> (f32, f32) {
+        let take = |a: &AtomicU32| f32::from_bits(a.swap(0, Ordering::Relaxed));
+        (take(&self.speakers), take(&self.microphone))
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct HeadsetStatus {
     pub addr: SocketAddr,
     pub info: HeadsetInfo,
+    /// What the headset was told to stream, including the encoded per-eye size.
+    pub stream: StreamConfig,
     pub clock_offset_ns: Option<i64>,
     pub min_rtt_ns: Option<i64>,
     pub tracking_hz: f32,
@@ -50,20 +111,26 @@ struct Shared {
     status: Arc<Mutex<Status>>,
     settings: Arc<Mutex<Settings>>,
     headset_addr: Mutex<Option<SocketAddr>>,
+    /// The headset as described to the driver (see [`driver_info`]).
     headset_info: Mutex<Option<HeadsetInfo>>,
+    /// What the connected headset was told to stream.
+    stream: Mutex<Option<StreamConfig>>,
+    /// Microphone audio from the headset, waiting to be recorded.
+    mic: Mutex<JitterBuffer>,
+    audio_levels: Arc<AudioLevels>,
     /// The headset needs an IDR: it just connected, or reported lost video.
     idr_requested: AtomicBool,
     stop: AtomicBool,
 }
 
-/// Where the video thread sends frames: the session's own socket, so the headset sees one
-/// peer, and the current headset address.
-pub struct VideoSink {
+/// What the video and audio services use to reach the headset: the session's own socket, so
+/// the headset sees one peer, and the current headset address.
+pub struct HeadsetLink {
     sock: UdpSocket,
     shared: Arc<Shared>,
 }
 
-impl VideoSink {
+impl HeadsetLink {
     pub fn headset(&self) -> Option<SocketAddr> {
         *self.shared.headset_addr.lock().unwrap()
     }
@@ -75,6 +142,24 @@ impl VideoSink {
     /// Whether an IDR was requested since the last call.
     pub fn take_idr_request(&self) -> bool {
         self.shared.idr_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// What the connected headset streams; `None` while none is connected.
+    pub fn stream_config(&self) -> Option<StreamConfig> {
+        self.shared.stream.lock().unwrap().clone()
+    }
+
+    /// Microphone audio received from the headset.
+    pub fn mic(&self) -> &Mutex<JitterBuffer> {
+        &self.shared.mic
+    }
+
+    pub fn audio_levels(&self) -> &AudioLevels {
+        &self.shared.audio_levels
+    }
+
+    pub fn status(&self) -> &Mutex<Status> {
+        &self.shared.status
     }
 }
 
@@ -96,11 +181,15 @@ impl Session {
         set_send_buffer(&video_sock, 8 << 20);
         driver_sock.set_read_timeout(Some(Duration::from_millis(100)))?;
 
+        let audio_levels = status.lock().unwrap().audio.levels.clone();
         let shared = Arc::new(Shared {
+            audio_levels,
             status,
             settings,
             headset_addr: Mutex::new(None),
             headset_info: Mutex::new(None),
+            stream: Mutex::new(None),
+            mic: Mutex::new(JitterBuffer::new(audio::MIC_CHANNELS, MIC_MARGIN_MS)),
             idr_requested: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
@@ -129,8 +218,8 @@ impl Session {
         })
     }
 
-    pub fn video_sink(&self) -> std::io::Result<VideoSink> {
-        Ok(VideoSink { sock: self.sock.try_clone()?, shared: self.shared.clone() })
+    pub fn link(&self) -> std::io::Result<HeadsetLink> {
+        Ok(HeadsetLink { sock: self.sock.try_clone()?, shared: self.shared.clone() })
     }
 }
 
@@ -184,8 +273,7 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
     // Until encoders are probed, assume H.264/HEVC are available everywhere.
     let codec = crate::encoder::negotiate(&[Codec::H264, Codec::H265], &info.decoders, pref)
         .unwrap_or(Codec::H264);
-    let scale = settings.resolution_scale.clamp(0.25, 2.0);
-    let even = |v: f32| ((v as u32) + 1) & !1;
+    let (eye_width, eye_height) = info.encoded_size(settings.resolution_percent.clamp(25, 200));
     // The configured rate if the headset has it, else its closest one.
     let refresh_rate = info
         .refresh_rates
@@ -196,14 +284,75 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
     StreamConfig {
         codec,
         refresh_rate,
-        eye_width: even(info.eye_width as f32 * scale),
-        eye_height: even(info.eye_height as f32 * scale),
+        eye_width,
+        eye_height,
         bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
+        speakers: settings.speakers,
+        microphone: settings.microphone,
+    }
+}
+
+/// The headset as SteamVR should see it: its recommended render size is the encoded size, so
+/// "100%" in SteamVR's render resolution setting renders exactly what is streamed, and that
+/// setting supersamples (or undersamples) from there. The driver keeps whatever size SteamVR
+/// started with and restarts SteamVR when it changes, so saving a new encoded resolution while
+/// a headset is connected restarts SteamVR.
+fn driver_info(info: &HeadsetInfo, stream: &StreamConfig) -> HeadsetInfo {
+    HeadsetInfo {
+        eye_width: stream.eye_width,
+        eye_height: stream.eye_height,
+        ..info.clone()
+    }
+}
+
+/// Tells the headset at `to` what to stream and the driver what display to present, and
+/// records both. `info` is the headset's own `Hello`. Used on connection and again whenever the
+/// saved settings change the stream, so the headset, encoder and SteamVR follow them live.
+fn welcome(
+    shared: &Shared,
+    sock: &UdpSocket,
+    driver_sock: &UdpSocket,
+    to: SocketAddr,
+    info: &HeadsetInfo,
+    cfg: StreamConfig,
+) {
+    // The headset switches to the stream's rate on Welcome; everything here (SteamVR, the
+    // encoder) runs at that rate, not the one it happened to report.
+    let mut info = info.clone();
+    info.current_refresh_rate = cfg.refresh_rate;
+    let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg.clone())), to);
+    *shared.stream.lock().unwrap() = Some(cfg.clone());
+    *shared.headset_addr.lock().unwrap() = Some(to);
+    let for_driver = driver_info(&info, &cfg);
+    *shared.headset_info.lock().unwrap() = Some(for_driver.clone());
+    to_driver(driver_sock, &ToDriver::HeadsetConnected(for_driver));
+    let mut status = shared.status.lock().unwrap();
+    match status.headset.as_mut().filter(|h| h.addr == to) {
+        // Same session, new settings: keep the clock and tracking figures.
+        Some(h) => {
+            h.info = info;
+            h.stream = cfg;
+        }
+        None => {
+            status.headset = Some(HeadsetStatus {
+                addr: to,
+                info,
+                stream: cfg,
+                clock_offset_ns: None,
+                min_rtt_ns: None,
+                tracking_hz: 0.0,
+                sample_age_ms: 0.0,
+                photon_latency_ms: None,
+            })
+        }
     }
 }
 
 fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
     let mut buf = [0u8; 2048];
+    // The connected headset's `Hello`, to work its stream out again when settings change.
+    let mut hello: Option<HeadsetInfo> = None;
+    let mut last_welcome = Instant::now();
     let mut clock = ClockSync::default();
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
@@ -236,6 +385,19 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 );
                 last_ping = Instant::now();
             }
+            if let Some(info) = hello.as_ref().filter(|_| last_welcome.elapsed() >= WELCOME_REPEAT) {
+                last_welcome = Instant::now();
+                let cfg = stream_config(&shared.settings.lock().unwrap(), info);
+                let have = shared.stream.lock().unwrap().clone();
+                if have.as_ref() != Some(&cfg) {
+                    log::info!("settings changed; streaming {cfg:?}");
+                    // The headset needs a fresh decoder, which starts at an IDR.
+                    shared.idr_requested.store(true, Ordering::Release);
+                    welcome(shared, &sock, &driver_sock, addr, info, cfg);
+                } else if let Some(cfg) = have {
+                    let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg)), addr);
+                }
+            }
         }
 
         let (n, from) = match sock.recv_from(&mut buf) {
@@ -254,6 +416,14 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
             }
         };
         let t_rx = monotonic_ns();
+        if let Some(p) = audio::parse(&buf[..n]) {
+            if current == Some(from) && p.stream == audio::Stream::Microphone {
+                shared.audio_levels.microphone(p.pcm);
+                shared.mic.lock().unwrap().push(p.seq, p.pcm);
+                last_rx = Instant::now();
+            }
+            continue;
+        }
         let msg = match proto::decode::<HeadsetMessage>(&buf[..n]) {
             Ok(m) => m,
             Err(e) => {
@@ -282,25 +452,15 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 clock = ClockSync::default();
                 shared.idr_requested.store(true, Ordering::Release);
             }
+            if current != Some(from) {
+                shared.mic.lock().unwrap().reset();
+                // A new session starts with fresh status (clock sync and all).
+                shared.status.lock().unwrap().headset = None;
+            }
             let cfg = stream_config(&shared.settings.lock().unwrap(), info);
-            // The headset switches to the stream's rate on Welcome; everything here (SteamVR,
-            // the encoder) runs at that rate, not the one it happened to report.
-            let mut info = info.clone();
-            info.current_refresh_rate = cfg.refresh_rate;
-            let info = &info;
-            let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg)), from);
-            *shared.headset_addr.lock().unwrap() = Some(from);
-            *shared.headset_info.lock().unwrap() = Some(info.clone());
-            to_driver(&driver_sock, &ToDriver::HeadsetConnected(info.clone()));
-            shared.status.lock().unwrap().headset = Some(HeadsetStatus {
-                addr: from,
-                info: info.clone(),
-                clock_offset_ns: None,
-                min_rtt_ns: None,
-                tracking_hz: 0.0,
-                sample_age_ms: 0.0,
-                photon_latency_ms: None,
-            });
+            welcome(shared, &sock, &driver_sock, from, info, cfg);
+            hello = Some(info.clone());
+            last_welcome = Instant::now();
             last_rx = Instant::now();
             continue;
         }
@@ -476,6 +636,8 @@ impl LatencyMeter {
 fn disconnect(shared: &Shared, driver_sock: &UdpSocket, clock: &mut ClockSync) {
     *shared.headset_addr.lock().unwrap() = None;
     *shared.headset_info.lock().unwrap() = None;
+    *shared.stream.lock().unwrap() = None;
+    shared.mic.lock().unwrap().reset();
     shared.status.lock().unwrap().headset = None;
     *clock = ClockSync::default();
     to_driver(driver_sock, &ToDriver::HeadsetDisconnected);

@@ -29,13 +29,21 @@ pub struct Settings {
     pub codec: CodecPreference,
     pub encoder: crate::encoder::BackendPreference,
     pub bitrate_mbps: u32,
-    /// Multiplier on the headset's recommended per-eye resolution.
-    pub resolution_scale: f32,
+    /// Encoded (streamed) per-eye resolution, in percent of the headset's panel resolution
+    /// ([`openlink_protocol::HeadsetInfo::encoded_size`]). SteamVR is told that size as its
+    /// recommended render size; its own render resolution setting then scales what games render
+    /// relative to it. (Replaces `resolution_scale`, a multiplier on the headset's much smaller
+    /// recommended size; an old value is ignored rather than reinterpreted.)
+    pub resolution_percent: u32,
     pub refresh_rate: f32,
     pub connection: ConnectionMode,
     /// Draw SteamVR's own layer (dashboard, laser, controllers) over a game's. Off where
     /// SteamVR leaves textures of that layer undrawn: they then cover the game, black.
     pub steamvr_layer_over_games: bool,
+    /// Offer an "OpenLink" output device whose sound plays in the headset.
+    pub speakers: bool,
+    /// Offer an "OpenLink" microphone fed by the headset's.
+    pub microphone: bool,
 }
 
 impl Default for Settings {
@@ -44,12 +52,13 @@ impl Default for Settings {
             codec: CodecPreference::Auto,
             encoder: crate::encoder::BackendPreference::Auto,
             bitrate_mbps: 200,
-            // Per-eye size relative to the headset's recommended one. Quest runtimes recommend
-            // less than panel resolution (Quest 3: 1680x1760 for a 2064x2208 panel).
-            resolution_scale: 1.2,
+            // Panel resolution (Quest 3: 2064x2208 per eye).
+            resolution_percent: 100,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
             steamvr_layer_over_games: true,
+            speakers: true,
+            microphone: true,
         }
     }
 }

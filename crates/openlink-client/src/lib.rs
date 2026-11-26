@@ -8,10 +8,17 @@
 //!   sends immediately;
 //! * a **receive thread** answers clock pings the instant they arrive, so the `t1`/`t2`
 //!   timestamps are not inflated by waiting for the next tracking tick. It also reassembles
-//!   the video stream and hands complete frames to [`Client::video_frames`].
+//!   the video stream and hands complete frames to [`Client::video_frames`], and queues game
+//!   audio for [`Client::speakers`].
+//!
+//! The microphone goes the other way through [`Client::microphone`], from whatever thread the
+//! platform records on.
 
 use openlink_protocol::{
-    self as proto, time::monotonic_ns, video, HapticPulse, HeadsetInfo, HeadsetMessage,
+    self as proto,
+    audio::{self, JitterBuffer, Packetizer},
+    time::monotonic_ns,
+    video, HapticPulse, HeadsetInfo, HeadsetMessage,
     ServerMessage, StreamConfig, TrackingSample,
 };
 use std::net::{SocketAddr, UdpSocket};
@@ -37,6 +44,8 @@ pub struct ClientState {
 
 /// Frames waiting for the decoder. More than this and the oldest are of no use anyway.
 const VIDEO_QUEUE: usize = 4;
+/// Reserve the game audio buffer keeps against Wi-Fi jitter, on top of what the jitter needs.
+const SPEAKER_MARGIN_MS: u32 = 10;
 
 pub struct Client {
     sock: UdpSocket,
@@ -44,6 +53,7 @@ pub struct Client {
     state: Arc<Mutex<ClientState>>,
     haptics: Receiver<HapticPulse>,
     video: Option<Receiver<video::Frame>>,
+    speakers: Arc<Mutex<JitterBuffer>>,
 }
 
 impl Client {
@@ -61,6 +71,8 @@ impl Client {
         let state = Arc::new(Mutex::new(ClientState::default()));
         let (tx, haptics) = mpsc::channel();
         let (video_tx, video) = mpsc::sync_channel(VIDEO_QUEUE);
+        let speakers = Arc::new(Mutex::new(JitterBuffer::new(audio::SPEAKER_CHANNELS, SPEAKER_MARGIN_MS)));
+        let rx_speakers = speakers.clone();
 
         let rx_sock = sock.try_clone()?;
         let rx_state = state.clone();
@@ -80,6 +92,12 @@ impl Client {
                         on_video(&rx_sock, &mut reassembler, &buf[..n], &video_tx, &rx_state);
                         continue;
                     }
+                    if let Some(p) = audio::parse(&buf[..n]) {
+                        if p.stream == audio::Stream::Speakers {
+                            rx_speakers.lock().unwrap().push(p.seq, p.pcm);
+                        }
+                        continue;
+                    }
                     let t1 = monotonic_ns();
                     match proto::decode::<ServerMessage>(&buf[..n]) {
                         Ok(ServerMessage::ClockPing { t0 }) => {
@@ -94,8 +112,9 @@ impl Client {
                             let mut st = rx_state.lock().unwrap();
                             if st.welcome.is_none() {
                                 log::info!("server accepted us: {cfg:?}");
-                                // A new session: its video starts over.
+                                // A new session: its video and audio start over.
                                 reassembler.restart();
+                                rx_speakers.lock().unwrap().reset();
                             }
                             st.welcome = Some(cfg);
                         }
@@ -117,7 +136,21 @@ impl Client {
             state,
             haptics,
             video: Some(video),
+            speakers,
         })
+    }
+
+    /// Game audio from the PC ([`audio::SPEAKER_CHANNELS`] interleaved, [`audio::SAMPLE_RATE`]),
+    /// for the audio output callback to [`JitterBuffer::pop`] from. Plays silence until the
+    /// server sends some; only sent when [`StreamConfig::speakers`] is set.
+    pub fn speakers(&self) -> Arc<Mutex<JitterBuffer>> {
+        self.speakers.clone()
+    }
+
+    /// For the audio input callback: sends the microphone to the PC. Only wanted when
+    /// [`StreamConfig::microphone`] is set.
+    pub fn microphone(&self) -> std::io::Result<MicSender> {
+        Ok(MicSender { sock: self.sock.try_clone()?, packetizer: Packetizer::new(audio::Stream::Microphone) })
     }
 
     /// Complete, decodable video frames (starting at an IDR), oldest first. Can be taken once.
@@ -338,5 +371,20 @@ impl FrameReporter {
     pub fn displayed(&self, present_ns: i64, received_ns: i64, queued_ns: i64, decoded_ns: i64, display_ns: i64) {
         let msg = HeadsetMessage::FrameDisplayed { present_ns, received_ns, queued_ns, decoded_ns, display_ns };
         let _ = self.sock.send(&proto::encode(&msg));
+    }
+}
+
+/// Sends microphone audio ([`audio::MIC_CHANNELS`] interleaved, [`audio::SAMPLE_RATE`]).
+pub struct MicSender {
+    sock: UdpSocket,
+    packetizer: Packetizer,
+}
+
+impl MicSender {
+    pub fn send(&mut self, samples: impl IntoIterator<Item = i16>) {
+        let sock = &self.sock;
+        self.packetizer.push(samples, |d| {
+            let _ = sock.send(d);
+        });
     }
 }

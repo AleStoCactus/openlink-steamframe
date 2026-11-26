@@ -23,7 +23,7 @@ mod import;
 mod vk;
 
 use crate::config::Settings;
-use crate::session::{Status, VideoSink};
+use crate::session::{Status, HeadsetLink};
 use ash::vk as avk;
 use import::{color_range, Imported};
 use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
@@ -48,7 +48,7 @@ struct Shared {
     status: Arc<Mutex<Status>>,
     settings: Arc<Mutex<Settings>>,
     dump: Option<PathBuf>,
-    sink: Option<Arc<VideoSink>>,
+    sink: Option<Arc<HeadsetLink>>,
 }
 
 impl VideoService {
@@ -57,7 +57,7 @@ impl VideoService {
     pub fn start(
         status: Arc<Mutex<Status>>,
         settings: Arc<Mutex<Settings>>,
-        sink: Option<VideoSink>,
+        sink: Option<HeadsetLink>,
         dump: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         let listener = Listener::bind()?;
@@ -103,7 +103,7 @@ const PACING_BPS: f64 = 1.2e9;
 
 /// Sends frames to the headset from its own thread, paced: Wi-Fi access points drop from a
 /// few hundred back-to-back datagrams once their queue fills. Ends when the sender is dropped.
-fn spawn_sender(sink: Option<Arc<VideoSink>>) -> std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)> {
+fn spawn_sender(sink: Option<Arc<HeadsetLink>>) -> std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<(video::FrameInfo, Vec<u8>)>(1);
     std::thread::Builder::new()
         .name("video-send".into())
@@ -148,17 +148,19 @@ impl Target {
     fn current(shared: &Shared) -> Self {
         let settings = shared.settings.lock().unwrap().clone();
         let status = shared.status.lock().unwrap();
-        // Before a headset connects, encode at Quest 3's recommended size so the pipeline can
-        // be tested.
-        let (w, h, fps) = status
-            .headset
-            .as_ref()
-            .map(|h| (h.info.eye_width, h.info.eye_height, h.info.current_refresh_rate))
-            .unwrap_or((1680, 1760, settings.refresh_rate));
-        let even = |v: f32| ((v.round() as u32) & !1).max(2);
+        // The size the headset was told (which SteamVR was also given as its render size).
+        // Before a headset connects, the setting applied to a Quest 3 panel so the pipeline
+        // can be tested.
+        let (eye_width, eye_height, fps) = match &status.headset {
+            Some(h) => (h.stream.eye_width, h.stream.eye_height, h.stream.refresh_rate),
+            None => {
+                let even = |v: u32| (((v * settings.resolution_percent.max(1) + 50) / 100) & !1).max(2);
+                (even(2064), even(2208), settings.refresh_rate)
+            }
+        };
         Self {
-            eye_width: even(w as f32 * settings.resolution_scale),
-            eye_height: even(h as f32 * settings.resolution_scale),
+            eye_width,
+            eye_height,
             fps,
             bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
         }
@@ -567,7 +569,7 @@ impl<'a> Connection<'a> {
         converted?;
         let t1 = Instant::now();
         let sink = self.shared.sink.as_deref();
-        if sink.is_some_and(VideoSink::take_idr_request) {
+        if sink.is_some_and(HeadsetLink::take_idr_request) {
             p.encoder.request_idr();
         }
         let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;

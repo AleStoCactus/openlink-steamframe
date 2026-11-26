@@ -401,7 +401,13 @@ pub struct IVRServerDriverHost_Vtbl {
         poses: *mut TrackedDevicePose_t,
         count: u32,
     ),
-    pub RequestRestart: *const c_void,
+    pub RequestRestart: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        reason: *const c_char,
+        executable: *const c_char,
+        arguments: *const c_char,
+        working_dir: *const c_char,
+    ),
     pub GetFrameTimings: *const c_void,
     pub SetDisplayEyeToHead: *const c_void,
     pub SetDisplayProjectionRaw: unsafe extern "C" fn(

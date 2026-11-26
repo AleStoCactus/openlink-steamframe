@@ -17,9 +17,10 @@ log.workspace = true
 glam.workspace = true
 android-activity = { version = "0.6", features = ["native-activity"] }
 android_logger = "0.15"
-ndk = { version = "0.9", features = ["media", "api-level-30", "nativewindow"] }
+ndk = { version = "0.9", features = ["audio", "media", "api-level-30", "nativewindow"] }
 ndk-sys = "0.6"
 openxr = { version = "0.22", features = ["loaded"] }
 khronos-egl = { version = "6", features = ["static", "no-pkg-config"] }
 glow = "0.18"
 libc = "0.2"
+jni = "0.22"
