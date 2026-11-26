@@ -201,23 +201,31 @@ impl App {
                 ui.label("Encoded Resolution");
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::Slider::new(&mut d.resolution_percent, 50..=150)
+                        egui::Slider::new(&mut d.resolution_percent, 50..=200)
                             .step_by(5.0)
                             .suffix("%"),
                     )
                     .on_hover_text(
-                        "Streamed resolution, relative to the headset's panel. SteamVR's 100% \
-                         is this size enlarged for the headset's lens, so it matches the stream's \
-                         sharpness at the center of view (as with other headsets, it is larger \
-                         than the panel); change the render resolution in SteamVR's settings. \
-                         Saving a new value while a headset is connected restarts \
-                         SteamVR, which only picks up a new size when it starts.",
+                        "Streamed resolution, relative to the headset's panel. The lens magnifies \
+                         the center of view less than the edges, so there the panel shows more \
+                         detail than a panel-sized picture carries: at 100% the center is softer \
+                         than the headset can show, and it matches the panel at the \"sharp \
+                         center\" value shown (Quest 3: about 155%, as other streamers send). \
+                         Pair a high value with foveated encoding, which keeps the center at this \
+                         resolution and encodes fewer pixels toward the edges. SteamVR's 100% is \
+                         this size enlarged for the lens; change the render resolution in \
+                         SteamVR's settings. Saving a new value while a headset is connected \
+                         restarts SteamVR, which only picks up a new size when it starts.",
                     );
                     match &headset {
                         Some(info) => {
                             let (w, h) = info.encoded_size(d.resolution_percent);
                             let (rw, rh) = info.render_size((w, h));
-                            ui.label(format!("{w} × {h} per eye (SteamVR 100%: {rw} × {rh})"));
+                            let (sx, sy) = info.lens_scale();
+                            let sharp = (sx.max(sy) * 100.0 / 5.0).ceil() * 5.0;
+                            ui.label(format!(
+                                "{w} × {h} per eye (SteamVR 100%: {rw} × {rh}; sharp center at {sharp:.0}%)"
+                            ));
                         }
                         None => {
                             ui.weak("connect a headset to see the size");
