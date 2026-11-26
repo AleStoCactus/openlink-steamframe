@@ -108,15 +108,31 @@ semaphore. Windows has no `SOCK_SEQPACKET`, so the link is loopback TCP with len
 messages and a writer thread whose bounded queue gives `try_send` the same never-block
 behaviour.
 
-**AMD's Windows Vulkan Video driver** (RX 6800, driver 32.0.21045) differs from RADV in three ways
-the encoder works around, all `cfg(windows)`: a session reset submitted on its own leaves every
-later encode completing without output (the feedback query never becomes available), so the
-reset goes into the first frame's coding scope; CBR and VBR are accepted but ignored (byte-
-identical streams at 20 and 200 Mbit/s), so the encoder runs at a constant QP that the server
-sets per frame from each frame's size and a VBV-like budget (`SoftRateControl`); and it writes
-SAO syntax into every slice header even when the SPS has SAO off, so decoders misparsed every
-slice after it (FFmpeg: `alignment_bit_equal_to_one=0`; the Quest 3 rejected the IDR and showed
-nothing), and the SPS now enables SAO.
+**AMD's Windows Vulkan Video driver** (RX 6800, driver 32.0.21045) differs from RADV in ways
+the encoder works around, all `cfg(windows)`:
+
+- A session reset submitted on its own leaves every later encode completing without output
+  (the feedback query never becomes available), so the reset goes into the first frame's coding
+  scope.
+- CBR and VBR are accepted but the bitrate is ignored (byte-identical streams at 20 and 200
+  Mbit/s). Its constant-QP mode works but encodes about three times slower (9.9 instead of
+  3.3 ms for 2176x1152). So the encoder stays in CBR and the server picks each frame's QP from
+  its size and a VBV-like budget (`SoftRateControl`), passing it as the layer's minimum and
+  maximum QP, which the driver does honour. The QP floor is 10, so the bitrate asked for is
+  spent: at 18 a Quest 3 stream used a quarter of 180 Mbit/s and looked softer than on Linux.
+- It writes SAO syntax into every slice header even when the SPS has SAO off, so decoders
+  misparsed every slice (FFmpeg: `alignment_bit_equal_to_one=0`; the Quest 3 rejected the IDR
+  and showed nothing). The SPS enables SAO.
+- Quality level 1 of its 4 is as fast as 0 and 0.35 dB better at the same bitrate; 2 and 3
+  are 25% slower.
+- A full-size Quest 3 frame (4160x2208) takes 10.3 ms whatever the QP, so with the convert
+  (1-1.6 ms) one after the other a 90 Hz stream managed 82 fps. Encodes are pipelined
+  (`encode::PIPELINED`): the next frame is converted into a second source image while the
+  current one encodes, and a finisher thread sends each frame the moment its encode completes,
+  so the overlap costs no latency (90 fps, nothing skipped). Linux encodes in sequence.
+
+When measuring the encoder (`--encode-selftest`), nothing else may be streaming: encodes from
+two processes share the video engine and each then takes about a frame's time.
 
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
