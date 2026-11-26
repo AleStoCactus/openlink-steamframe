@@ -38,6 +38,32 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
 | Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issue: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth |
 
+### Planned
+
+Beyond the rows above, these are on the way:
+
+**Video and display**
+
+- **Encoded resolution slider** in the desktop app, independent of SteamVR's render resolution.
+- **Lens-corrected 100% resolution:** SteamVR's 100% render resolution will account for the
+  headset's lens distortion, so it matches the panel's pixel density at the center of view.
+- **Automatic refresh rate and resolution detection:** the refresh rates and resolution the
+  headset supports are read from it and offered as options, instead of being entered by hand.
+- **Up to 240 Hz** on Quest 3 (v2.7 and later).
+- **Foveated streaming** with controls for the size of the full-detail region.
+
+**SteamVR integration**
+
+- **The real headset model** (e.g. Quest 3) reported in SteamVR, not a generic OpenLink HMD.
+- **Battery status** for the headset and both controllers in the SteamVR dashboard.
+- **SteamVR throttling options** that work: the behavior chosen in SteamVR's per-app settings is
+  applied to the stream.
+
+**Desktop app**
+
+- **Driver installation from the GUI**, so `scripts/install-driver.sh` is no longer needed.
+- **A clearer, more intuitive layout** overall.
+
 ## Wi-Fi and USB cable
 
 **Wi-Fi (working).** The default and the only mode in use today. The headset finds the PC by LAN
