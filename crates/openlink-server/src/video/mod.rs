@@ -148,17 +148,19 @@ impl Target {
     fn current(shared: &Shared) -> Self {
         let settings = shared.settings.lock().unwrap().clone();
         let status = shared.status.lock().unwrap();
-        // Before a headset connects, encode at Quest 3's recommended size so the pipeline can
-        // be tested.
-        let (w, h, fps) = status
-            .headset
-            .as_ref()
-            .map(|h| (h.info.eye_width, h.info.eye_height, h.info.current_refresh_rate))
-            .unwrap_or((1680, 1760, settings.refresh_rate));
-        let even = |v: f32| ((v.round() as u32) & !1).max(2);
+        // The size the headset was told (which SteamVR was also given as its render size).
+        // Before a headset connects, the setting applied to a Quest 3 panel so the pipeline
+        // can be tested.
+        let (eye_width, eye_height, fps) = match &status.headset {
+            Some(h) => (h.stream.eye_width, h.stream.eye_height, h.stream.refresh_rate),
+            None => {
+                let even = |v: u32| (((v * settings.resolution_percent.max(1) + 50) / 100) & !1).max(2);
+                (even(2064), even(2208), settings.refresh_rate)
+            }
+        };
         Self {
-            eye_width: even(w as f32 * settings.resolution_scale),
-            eye_height: even(h as f32 * settings.resolution_scale),
+            eye_width,
+            eye_height,
             fps,
             bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
         }

@@ -148,6 +148,13 @@ preferred wired path.
   therefore saves the last headset's info (`last-headset.bin` in the platform config dir),
   describes that display from SteamVR's start, and asks SteamVR to restart
   (`IVRServerDriverHost::RequestRestart`) when a headset with a different size or FOV connects.
+  The size the driver is given is the *encoded* per-eye size (the desktop app's "Encoded
+  Resolution" percentage of the headset's panel resolution, looked up by model since OpenXR only
+  reports the runtime's much smaller recommended size), so SteamVR's 100% renders exactly what is
+  streamed and its render resolution setting supersamples from there. The server re-checks the
+  settings every 500 ms while a headset is connected and, when the stream changes, sends the
+  headset a new `Welcome` (it rebuilds its swapchains and decoder) and the driver a new
+  `HeadsetConnected`, so saving a new resolution restarts SteamVR.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.

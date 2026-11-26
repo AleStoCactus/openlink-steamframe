@@ -25,6 +25,7 @@ pub fn run(status: Arc<Mutex<Status>>, settings: Arc<Mutex<Settings>>) -> eframe
                 settings,
                 draft,
                 save_error: None,
+                meters: Meters::default(),
             }))
         }),
     )
@@ -36,6 +37,29 @@ struct App {
     /// Edited copy; applied on "Save".
     draft: Settings,
     save_error: Option<String>,
+    meters: Meters,
+}
+
+/// What the audio meters show: peaks that fall back slowly, like a hardware meter, so a short
+/// sound stays visible.
+#[derive(Default)]
+struct Meters {
+    speakers: f32,
+    microphone: f32,
+    last: Option<std::time::Instant>,
+}
+
+impl Meters {
+    /// Folds in the peaks reported since the last frame.
+    fn update(&mut self, (speakers, microphone): (f32, f32)) {
+        let now = std::time::Instant::now();
+        let dt = self.last.map_or(0.0, |t| (now - t).as_secs_f32());
+        self.last = Some(now);
+        // Fall about 30 dB per second.
+        let fall = 10f32.powf(-1.5 * dt);
+        self.speakers = speakers.max(self.speakers * fall);
+        self.microphone = microphone.max(self.microphone * fall);
+    }
 }
 
 impl App {
@@ -80,10 +104,11 @@ impl App {
                         h.tracking_hz, h.sample_age_ms
                     ));
                     ui.end_row();
-                    ui.label("Panel");
+                    ui.label("Video");
+                    let (pw, ph) = h.info.panel_size();
                     ui.label(format!(
-                        "{}×{} per eye @ {} Hz",
-                        h.info.eye_width, h.info.eye_height, h.info.current_refresh_rate
+                        "{}×{} per eye encoded @ {} Hz (panel {pw}×{ph})",
+                        h.stream.eye_width, h.stream.eye_height, h.stream.refresh_rate,
                     ));
                     ui.end_row();
                     ui.label("Audio");
@@ -104,6 +129,11 @@ impl App {
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        let (audio, headset) = {
+            let st = self.status.lock().unwrap();
+            (st.audio.clone(), st.headset.as_ref().map(|h| h.info.clone()))
+        };
+        self.meters.update(audio.levels.take());
         let d = &mut self.draft;
         ui.heading("Video");
         egui::Grid::new("video")
@@ -155,8 +185,29 @@ impl App {
                 );
                 ui.end_row();
 
-                ui.label("Resolution scale");
-                ui.add(egui::Slider::new(&mut d.resolution_scale, 0.5..=1.5).step_by(0.05));
+                ui.label("Encoded Resolution");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut d.resolution_percent, 50..=150)
+                            .step_by(5.0)
+                            .suffix("%"),
+                    )
+                    .on_hover_text(
+                        "Streamed resolution, relative to the headset's panel. SteamVR renders \
+                         at this size at its own 100%; change the render resolution in SteamVR's \
+                         settings. Saving a new value while a headset is connected restarts \
+                         SteamVR, which only picks up a new size when it starts.",
+                    );
+                    match &headset {
+                        Some(info) => {
+                            let (w, h) = info.encoded_size(d.resolution_percent);
+                            ui.label(format!("{w} × {h} per eye"));
+                        }
+                        None => {
+                            ui.weak("connect a headset to see the size");
+                        }
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Refresh rate");
@@ -172,10 +223,23 @@ impl App {
 
         ui.add_space(12.0);
         ui.heading("Audio");
-        ui.checkbox(&mut d.speakers, "Headset speakers")
-            .on_hover_text("Adds an \"OpenLink\" output device; what plays on it is heard in the headset");
-        ui.checkbox(&mut d.microphone, "Headset microphone")
-            .on_hover_text("Adds an \"OpenLink\" input device carrying the headset's microphone");
+        egui::Grid::new("audio")
+            .num_columns(2)
+            .spacing([24.0, 6.0])
+            .show(ui, |ui| {
+                ui.checkbox(&mut d.speakers, "Headset speakers").on_hover_text(
+                    "Adds an \"OpenLink\" output device; what plays on it is heard in the headset",
+                );
+                meter(ui, self.meters.speakers, audio.speakers)
+                    .on_hover_text("Sound being sent to the headset");
+                ui.end_row();
+                ui.checkbox(&mut d.microphone, "Headset microphone").on_hover_text(
+                    "Adds an \"OpenLink\" input device carrying the headset's microphone",
+                );
+                meter(ui, self.meters.microphone, audio.microphone)
+                    .on_hover_text("Sound arriving from the headset's microphone");
+                ui.end_row();
+            });
 
         ui.add_space(12.0);
         ui.heading("Connection");
@@ -198,7 +262,10 @@ impl App {
             if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
                 self.draft = self.settings.lock().unwrap().clone();
             }
-            ui.weak("Changes apply on the next headset connection.");
+            ui.weak(
+                "Resolution, bitrate and refresh rate apply to a connected headset right away; \
+                 the rest on its next connection.",
+            );
         });
         if let Some(e) = &self.save_error {
             ui.colored_label(ui.visuals().error_fg_color, e);
@@ -214,8 +281,11 @@ impl eframe::App for App {
             ui.separator();
             self.settings_ui(ui);
         });
-        // Status comes from other threads; poll at a gentle rate.
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // Status comes from other threads; poll at a gentle rate, or smoothly enough for the
+        // audio meters while they can move.
+        let audio = self.status.lock().unwrap().audio.clone();
+        let fast = audio.speakers || audio.microphone;
+        ctx.request_repaint_after(Duration::from_millis(if fast { 33 } else { 250 }));
     }
 }
 
@@ -229,6 +299,31 @@ fn dot(ui: &mut egui::Ui, ok: bool, text: &str) {
         ui.colored_label(color, "●");
         ui.label(text);
     });
+}
+
+/// A horizontal level meter for a peak `level` (0..1), on a -60..0 dBFS scale. Empty when the
+/// device does not exist (`active` false).
+fn meter(ui: &mut egui::Ui, level: f32, active: bool) -> egui::Response {
+    const FLOOR_DB: f32 = -60.0;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(160.0, 10.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    if active && level > 0.0 {
+        let db = 20.0 * level.log10();
+        let frac = ((db - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0);
+        let color = if db > -1.0 {
+            egui::Color32::from_rgb(0xe5, 0x48, 0x4d)
+        } else if db > -12.0 {
+            egui::Color32::from_rgb(0xe3, 0xb3, 0x41)
+        } else {
+            egui::Color32::from_rgb(0x3f, 0xb9, 0x50)
+        };
+        let mut fill = rect;
+        fill.set_width(rect.width() * frac);
+        painter.rect_filled(fill, 2.0, color);
+    }
+    response
 }
 
 fn codec_label(c: CodecPreference) -> &'static str {

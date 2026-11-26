@@ -30,7 +30,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games. No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
 | Audio | 🟡 Partial | Linux: while a headset is connected, PipeWire gets an "OpenLink" output device (plays in the headset) and an "OpenLink" microphone, to pick in the sound settings. Uncompressed 48 kHz PCM with an adaptive jitter buffer; echo cancellation on the headset mic. Windows needs a virtual audio driver first |
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
-| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video and connection settings. Only some settings take effect (H.265 is the only encoder) |
+| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video, audio and connection settings, with level meters for the headset's audio. The encoded resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye) and applies live; SteamVR renders at that size at its own 100% and its render resolution setting scales from there. Only some settings take effect (H.265 is the only encoder) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+) |
 | Windows version | 📋 Planned | Tracking and driver parts are written with Windows in mind, but there is no Windows video path yet |
 | Steam Frame build | 📋 Planned | A client for Valve's Steam Frame |
@@ -44,7 +44,6 @@ Beyond the rows above, these are on the way:
 
 **Video and display**
 
-- **Encoded resolution slider** in the desktop app, independent of SteamVR's render resolution.
 - **Lens-corrected 100% resolution:** SteamVR's 100% render resolution will account for the
   headset's lens distortion, so it matches the panel's pixel density at the center of view.
 - **Automatic refresh rate and resolution detection:** the refresh rates and resolution the

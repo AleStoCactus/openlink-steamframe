@@ -53,9 +53,12 @@ impl Bridge {
     /// Sends game audio ([`audio::SPEAKER_CHANNELS`] interleaved) to the headset.
     pub fn play(&self, samples: impl IntoIterator<Item = i16>) {
         let Some(addr) = self.link.headset() else { return };
+        let mut peak = 0u16;
+        let samples = samples.into_iter().inspect(|s| peak = peak.max(s.unsigned_abs()));
         self.speakers.lock().unwrap().push(samples, |d| {
             let _ = self.link.send(d, addr);
         });
+        self.link.audio_levels().speakers(peak);
     }
 
     /// Game audio paused: drop a partly filled packet rather than send it late with the next.
