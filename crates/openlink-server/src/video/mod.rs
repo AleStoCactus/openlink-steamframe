@@ -20,6 +20,7 @@
 mod convert;
 mod encode;
 mod import;
+mod qp_map;
 mod vk;
 
 use crate::config::Settings;
@@ -135,11 +136,16 @@ struct Frame {
     present_ns: i64,
 }
 
-/// What to encode: per-eye picture size and frame rate.
+/// What to encode: per-eye picture size (after foveation) and frame rate.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Target {
     eye_width: u32,
     eye_height: u32,
+    /// How the eyes are squeezed into `eye_width` x `eye_height`. A change rebuilds the
+    /// pipeline, whose first frame is an IDR, as the headset's decoder needs for the new size.
+    foveation: Option<proto::foveation::Foveation>,
+    /// The headset's FOV, for the foveated quality falloff.
+    fov: Option<[proto::Fov; 2]>,
     fps: f32,
     bitrate_bps: u64,
 }
@@ -148,19 +154,25 @@ impl Target {
     fn current(shared: &Shared) -> Self {
         let settings = shared.settings.lock().unwrap().clone();
         let status = shared.status.lock().unwrap();
-        // The size the headset was told (which SteamVR was also given as its render size).
+        // The size the headset was told, squeezed by foveation (SteamVR renders larger,
+        // corrected for the lens, and the converter downsamples).
         // Before a headset connects, the setting applied to a Quest 3 panel so the pipeline
         // can be tested.
-        let (eye_width, eye_height, fps) = match &status.headset {
-            Some(h) => (h.stream.eye_width, h.stream.eye_height, h.stream.refresh_rate),
+        let (eye_width, eye_height, foveation, fov, fps) = match &status.headset {
+            Some(h) => {
+                let (w, h2) = h.stream.coded_eye_size();
+                (w, h2, h.stream.foveation, Some(h.info.fov), h.stream.refresh_rate)
+            }
             None => {
                 let even = |v: u32| (((v * settings.resolution_percent.max(1) + 50) / 100) & !1).max(2);
-                (even(2064), even(2208), settings.refresh_rate)
+                (even(2064), even(2208), None, None, settings.refresh_rate)
             }
         };
         Self {
             eye_width,
             eye_height,
+            foveation,
+            fov,
             fps,
             bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
         }
@@ -188,6 +200,11 @@ impl Target {
     }
 }
 
+/// QP added at the edge of the view when foveated (0 in the full-quality circle). Every 6 QP
+/// halves the bits a block gets, so this is about 40% of the center's bits per pixel, on top
+/// of the edge's already squeezed resolution.
+const EDGE_QP_OFFSET: f32 = 8.0;
+
 /// GPU objects for one encode configuration.
 struct Pipeline {
     /// What was asked for, before fitting it to the encoder.
@@ -207,6 +224,19 @@ struct Pipeline {
 impl Pipeline {
     fn new(ctx: &Context, requested: Target) -> Result<Self> {
         let target = requested.fit(encode::max_extent(ctx)?);
+        // Foveated: besides the squeezed resolution, fewer bits toward the edge of the view,
+        // in a circle around each lens's axis. Rate control holds the bitrate, so what the
+        // edges give up goes to the center. The padding past the eyes is black either way.
+        let (ew, eh) = (target.eye_width, target.eye_height);
+        let qp_offset = |x: u32, y: u32| -> f32 {
+            let (Some(f), Some(fov)) = (target.foveation, target.fov) else { return 0.0 };
+            if x >= 2 * ew || y >= eh {
+                return EDGE_QP_OFFSET;
+            }
+            let eye = (x / ew) as usize;
+            let p = [(x - eye as u32 * ew) as f32 / ew as f32, y as f32 / eh as f32];
+            EDGE_QP_OFFSET * f.falloff(&fov, eye, p)
+        };
         let encoder = encode::Encoder::new(
             ctx,
             &encode::EncoderConfig {
@@ -214,6 +244,7 @@ impl Pipeline {
                 height: target.eye_height,
                 fps: target.fps,
                 bitrate_bps: target.bitrate_bps,
+                qp_offset: (target.foveation.is_some() && target.fov.is_some()).then_some(&qp_offset as _),
             },
         )?;
         let converter = convert::Converter::new(
@@ -222,6 +253,7 @@ impl Pipeline {
             encoder.layout.coded_height,
             target.eye_width,
             target.eye_height,
+            target.foveation,
         )?;
         let pool = ctx.command_pool(ctx.compute_family)?;
         Ok(Self {
@@ -596,6 +628,7 @@ impl<'a> Connection<'a> {
                 idr,
                 render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
                 present_ns: frame.present_ns,
+                foveation: p.requested.foveation,
             };
             if self.sender.try_send((info, bitstream)).is_err() {
                 self.stats.send_errors += 1; // the sender is still busy with the previous frame
@@ -656,7 +689,7 @@ impl<'a> Connection<'a> {
     }
 }
 
-/// `openlink --encode-selftest WxH FRAMES [OUT [SOURCE.yuv]]`: drives the encoder alone (no
+/// `openlink --encode-selftest WxH FRAMES [OUT [SOURCE.yuv [QP_RIGHT [MBPS]]]]`: drives the encoder alone (no
 /// SteamVR) to debug Vulkan Video without the rest of the pipeline. The source is a scrolling
 /// test pattern, identical in the left and right halves (so per-half quality can be compared);
 /// SOURCE.yuv receives it as raw NV12 for `ffmpeg -lavfi psnr`.
@@ -670,7 +703,21 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let mut source_out = args.get(3).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
     let rdev = std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev();
     let ctx = Context::new(rdev)?;
-    let mut enc = encode::Encoder::new(&ctx, &encode::EncoderConfig { width, height, fps: 90.0, bitrate_bps: 200_000_000 })?;
+    // QP_RIGHT: a quantization delta map adding that much QP to the right half, to check that
+    // the implementation applies one (the halves' PSNR then differ).
+    let qp_right: Option<f32> = args.get(4).and_then(|v| v.parse().ok()).filter(|v| *v != 0.0);
+    let mbps: u64 = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(200);
+    let qp_offset = |x: u32, _y: u32| if x >= width / 2 { qp_right.unwrap_or(0.0) } else { 0.0 };
+    let mut enc = encode::Encoder::new(
+        &ctx,
+        &encode::EncoderConfig {
+            width,
+            height,
+            fps: 90.0,
+            bitrate_bps: mbps * 1_000_000,
+            qp_offset: qp_right.is_some().then_some(&qp_offset as _),
+        },
+    )?;
     let d = &ctx.device;
     let pool = ctx.command_pool(ctx.compute_family)?;
     let cmd = ctx.command_buffer(pool)?;

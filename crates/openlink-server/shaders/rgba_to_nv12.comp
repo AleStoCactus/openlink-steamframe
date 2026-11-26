@@ -15,12 +15,47 @@ layout(set = 0, binding = 5) uniform sampler2D overlay_right;
 layout(push_constant) uniform Push {
     // uMin, vMin, uMax, vMax of each eye's image within its texture.
     vec4 bounds[2];
+    // The same for SteamVR's overlay layer; all zero without one.
     vec4 overlay_bounds[2];
     // Output pixels per eye; the frame is two of these side by side, then black padding up to
     // the coded size.
     ivec2 eye_size;
-    int has_overlay;
+    // Foveated encoding (openlink_protocol::foveation), mirrored from Foveation::to_full, in
+    // pixels: the full-resolution and encoded eye size, the band length (0: not foveated) and,
+    // per eye, where the band starts (full x, encoded x, full y, encoded y). The encoded size
+    // is the one the parameters were made for; eye_size differs from it only if the encoder
+    // could not fit it and the picture was scaled down.
+    vec2 fov_full;
+    vec2 fov_coded;
+    vec2 fov_band;
+    vec4 fov_start[2];
 } pc;
+
+// Growth of the encoded pixel size along a side e full and l encoded pixels long.
+float growth(float e, float l) {
+    return 2.0 * max(e - l, 0.0) / max(l * l, 0.25);
+}
+
+// One axis of the inverse warp, in pixels. g: position in the encoded eye; full, coded: the
+// eye's lengths; band: the band's length; b0, c0: where it starts (full, encoded). Returns the
+// full-resolution position and, in width, how many full pixels one encoded pixel covers there
+// (1 in the band, up to the edge scale at the image edges).
+float unfoveate(float g, float full, float coded, float band, float b0, float c0, out float width) {
+    if (g < c0) {
+        float a = growth(b0, c0);
+        float d = c0 - g;
+        width = 1.0 + a * d;
+        return b0 - (d + 0.5 * a * d * d);
+    }
+    if (g > c0 + band) {
+        float a = growth(full - b0 - band, coded - c0 - band);
+        float d = g - c0 - band;
+        width = 1.0 + a * d;
+        return b0 + band + d + 0.5 * a * d * d;
+    }
+    width = 1.0;
+    return b0 + g - c0;
+}
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -30,12 +65,24 @@ vec3 sample_frame(ivec2 p) {
     }
     int eye = p.x >= pc.eye_size.x ? 1 : 0;
     vec2 local = (vec2(p.x - eye * pc.eye_size.x, p.y) + 0.5) / vec2(pc.eye_size);
+    // Size of this output pixel within the eye, as a fraction of the eye.
+    vec2 px = 1.0 / vec2(pc.eye_size);
+    if (pc.fov_band.x > 0.0) {
+        vec4 s = pc.fov_start[eye];
+        vec2 g = local * pc.fov_coded;
+        vec2 width;
+        vec2 x = vec2(unfoveate(g.x, pc.fov_full.x, pc.fov_coded.x, pc.fov_band.x, s.x, s.y, width.x),
+                      unfoveate(g.y, pc.fov_full.y, pc.fov_coded.y, pc.fov_band.y, s.z, s.w, width.y));
+        local = x / pc.fov_full;
+        px = width * pc.fov_coded / (vec2(pc.eye_size) * pc.fov_full);
+    }
     vec4 b = pc.bounds[eye];
     vec2 uv = mix(b.xy, b.zw, local);
-    // The eye textures are larger than the output (SteamVR supersamples). One bilinear tap
-    // per output pixel would alias (shimmering edges, crawling grid lines), so average four
-    // taps spread over the pixel's footprint: a tent filter about 2 source texels wide.
-    vec2 q = 0.25 * (b.zw - b.xy) / vec2(pc.eye_size);
+    // The eye textures are larger than the output (SteamVR supersamples, and foveation squeezes
+    // the edges further). One bilinear tap per output pixel would alias (shimmering edges,
+    // crawling grid lines), so average four taps spread over the pixel's footprint: a tent
+    // filter about 2 source texels wide.
+    vec2 q = 0.25 * (b.zw - b.xy) * px;
     vec3 c = vec3(0.0);
     if (eye == 0) {
         c += textureLod(left_eye, uv + vec2(-q.x, -q.y), 0.0).rgb;
@@ -49,8 +96,8 @@ vec3 sample_frame(ivec2 p) {
         c += textureLod(right_eye, uv + vec2(q.x, q.y), 0.0).rgb;
     }
     c *= 0.25;
-    if (pc.has_overlay != 0) {
-        vec4 ob = pc.overlay_bounds[eye];
+    vec4 ob = pc.overlay_bounds[eye];
+    if (any(notEqual(ob, vec4(0.0)))) {
         vec2 ouv = mix(ob.xy, ob.zw, local);
         vec4 o = eye == 0 ? textureLod(overlay_left, ouv, 0.0) : textureLod(overlay_right, ouv, 0.0);
         c = mix(c, o.rgb, o.a);

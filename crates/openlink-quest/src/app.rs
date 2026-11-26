@@ -105,6 +105,24 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
         if let Ok(r) = session.enumerate_display_refresh_rates() {
             refresh_rates = r;
         }
+        // Quest 3 on Horizon OS v2.7 runs at up to 207 Hz (240 Hz in developer mode, with display scaling), but its
+        // runtime never lists those rates: not at OpenXR API version 1.0.0, 1.0.63 or 1.1.63,
+        // although Meta documents 1.0.63+ as enough. It does accept them when requested
+        // (against the spec, which says an unlisted rate must be refused). So ask for each and
+        // keep the ones it takes, then go back to where it was; a runtime that follows the
+        // spec refuses them all and nothing changes.
+        let before = current_rate(&session, true);
+        let mut probed = Vec::new();
+        for &hz in openlink_protocol::high_refresh_rates(&props.system_name) {
+            if !refresh_rates.contains(&hz) && session.request_display_refresh_rate(hz).is_ok() {
+                probed.push(hz);
+                refresh_rates.push(hz);
+            }
+        }
+        if !probed.is_empty() {
+            let _ = session.request_display_refresh_rate(before);
+        }
+        log::info!("display refresh rates {refresh_rates:?} (accepted beyond the runtime's list: {probed:?})");
     }
 
     let output = Arc::new(Mutex::new(Output::default()));

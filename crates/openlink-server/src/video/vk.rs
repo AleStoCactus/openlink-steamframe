@@ -28,6 +28,9 @@ pub struct Context {
     pub video_encode_instance: ash::khr::video_encode_queue::InstanceFn,
     pub drm_modifier: ash::ext::image_drm_format_modifier::Device,
     pub name: String,
+    /// `VK_KHR_video_encode_quantization_map` is enabled: the encoder can lower the quality of
+    /// chosen regions (the edges of a foveated picture). Optional.
+    pub quantization_map: bool,
     /// Set when a GPU wait timed out or the device was lost. Nothing may wait on the
     /// device after that (it could block forever): its objects are leaked instead.
     lost: std::cell::Cell<bool>,
@@ -103,11 +106,22 @@ impl Context {
                 if !missing.is_empty() {
                     return Err(format!("{name} lacks {missing:?}"));
                 }
-                chosen = Some((pdev, name));
+                let mut qp_features = super::qp_map::Features {
+                    s_type: super::qp_map::ST_FEATURES,
+                    p_next: std::ptr::null_mut(),
+                    video_encode_quantization_map: vk::FALSE,
+                };
+                if has(super::qp_map::NAME) {
+                    let mut features =
+                        vk::PhysicalDeviceFeatures2 { p_next: (&raw mut qp_features).cast(), ..Default::default() };
+                    // SAFETY: the extension is supported, so its feature struct may be chained.
+                    unsafe { instance.get_physical_device_features2(pdev, &mut features) };
+                }
+                chosen = Some((pdev, name, qp_features.video_encode_quantization_map == vk::TRUE));
                 break;
             }
         }
-        let (pdev, name) = chosen.ok_or_else(|| {
+        let (pdev, name, quantization_map) = chosen.ok_or_else(|| {
             format!(
                 "no Vulkan device on render node {}:{}",
                 major(render_node),
@@ -145,9 +159,19 @@ impl Context {
             vk::DeviceQueueCreateInfo::default().queue_family_index(compute_family).queue_priorities(&prio),
             vk::DeviceQueueCreateInfo::default().queue_family_index(encode_family).queue_priorities(&prio),
         ];
-        let ext_ptrs: Vec<_> = DEVICE_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
+        let mut ext_ptrs: Vec<_> = DEVICE_EXTENSIONS.iter().map(|e| e.as_ptr()).collect();
+        let mut qp_features = super::qp_map::Features {
+            s_type: super::qp_map::ST_FEATURES,
+            p_next: std::ptr::null_mut(),
+            video_encode_quantization_map: vk::TRUE,
+        };
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default().host_query_reset(true);
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
+        if quantization_map {
+            ext_ptrs.push(super::qp_map::NAME.as_ptr());
+            // Hand-written struct, so chained by hand: v13 -> qp_features.
+            v13.p_next = (&raw mut qp_features).cast();
+        }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&ext_ptrs)
@@ -168,7 +192,10 @@ impl Context {
         let drm_modifier = ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
         // SAFETY: valid physical device.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
-        log::info!("video: Vulkan device {name} (compute family {compute_family}, encode family {encode_family})");
+        log::info!(
+            "video: Vulkan device {name} (compute family {compute_family}, encode family {encode_family}, \
+             quantization maps {quantization_map})"
+        );
         Ok(Self {
             lost: std::cell::Cell::new(false),
             _entry: entry,
@@ -188,6 +215,7 @@ impl Context {
             video_encode_instance,
             drm_modifier,
             name,
+            quantization_map,
         })
     }
 

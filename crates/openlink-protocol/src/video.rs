@@ -30,6 +30,8 @@ pub struct FrameInfo {
     /// The vsync SteamVR presented the frame for, server clock (`time::monotonic_ns`). SteamVR's
     /// `SecondsFromVsyncToPhotons` counts from here.
     pub present_ns: i64,
+    /// How the frame's eyes were squeezed, to be undone on display; `None` if they were not.
+    pub foveation: Option<crate::foveation::Foveation>,
 }
 
 /// Whether a datagram belongs to the video stream (rather than [`crate::ServerMessage`]).
@@ -224,7 +226,7 @@ mod tests {
     use super::*;
 
     fn info(idr: bool) -> FrameInfo {
-        FrameInfo { idr, render_pose: Pose::IDENTITY, present_ns: 5 }
+        FrameInfo { idr, render_pose: Pose::IDENTITY, present_ns: 5, foveation: None }
     }
 
     fn packets(p: &mut Packetizer, idr: bool, len: usize) -> Vec<Vec<u8>> {

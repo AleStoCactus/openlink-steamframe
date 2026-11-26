@@ -279,26 +279,35 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
         .copied()
         .min_by(|a, b| (a - settings.refresh_rate).abs().total_cmp(&(b - settings.refresh_rate).abs()))
         .unwrap_or(settings.refresh_rate);
+    let foveation = proto::foveation::Foveation::new(
+        settings.foveation_percent.clamp(20, 100) as f32 / 100.0,
+        &info.fov,
+        (eye_width, eye_height),
+    );
     StreamConfig {
         codec,
         refresh_rate,
         eye_width,
         eye_height,
+        foveation,
         bitrate_bps: settings.bitrate_mbps as u64 * 1_000_000,
         speakers: settings.speakers,
         microphone: settings.microphone,
     }
 }
 
-/// The headset as SteamVR should see it: its recommended render size is the encoded size, so
-/// "100%" in SteamVR's render resolution setting renders exactly what is streamed, and that
-/// setting supersamples (or undersamples) from there. The driver keeps whatever size SteamVR
-/// started with and restarts SteamVR when it changes, so saving a new encoded resolution while
-/// a headset is connected restarts SteamVR.
+/// The headset as SteamVR should see it: its recommended render size is the encoded size
+/// enlarged for the headset's lens ([`HeadsetInfo::render_size`]), as a native headset's is its
+/// panel size enlarged for its lens. SteamVR's 100% then matches the stream's pixel density at
+/// the center of the view, where the lens concentrates the panel's pixels, and the encoder
+/// downsamples to the encoded size. SteamVR's render resolution setting scales from there. The
+/// driver keeps whatever size SteamVR started with and restarts SteamVR when it changes, so
+/// saving a new encoded resolution while a headset is connected restarts SteamVR.
 fn driver_info(info: &HeadsetInfo, stream: &StreamConfig) -> HeadsetInfo {
+    let (eye_width, eye_height) = info.render_size((stream.eye_width, stream.eye_height));
     HeadsetInfo {
-        eye_width: stream.eye_width,
-        eye_height: stream.eye_height,
+        eye_width,
+        eye_height,
         ..info.clone()
     }
 }

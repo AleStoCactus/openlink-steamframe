@@ -2,7 +2,8 @@
 //!
 //! The picture holds both eyes side by side. Each eye's half is drawn full-screen into that
 //! eye's swapchain image; the OpenXR compositor then reprojects it from the pose SteamVR
-//! rendered with to the current head pose.
+//! rendered with to the current head pose. A foveated picture (squeezed edges, see
+//! `openlink_protocol::foveation`) is stretched back to full size on the way.
 
 use crate::egl;
 use glow::HasContext;
@@ -29,14 +30,48 @@ precision highp float;
 uniform samplerExternalOES picture;
 // This eye's part of the picture: u0, v0, u1, v1 (v0 = top row).
 uniform vec4 rect;
+// Foveation, mirrored from openlink_protocol::foveation::Foveation::to_coded, in pixels:
+// fov_size is the full-resolution and the encoded eye size (w, h, w, h), fov_band the band's
+// length (0: the picture is not foveated) and fov_start where it starts in this eye (full x,
+// encoded x, full y, encoded y).
+uniform vec4 fov_size;
+uniform vec2 fov_band;
+uniform vec4 fov_start;
 in vec2 uv;
 out vec4 color;
 vec3 srgb_to_linear(vec3 c) {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
 }
+// Growth of the encoded pixel size along a side e full and l encoded pixels long.
+float growth(float e, float l) {
+    return 2.0 * max(e - l, 0.0) / max(l * l, 0.25);
+}
+// Encoded pixels from the band for a point s full pixels from it.
+float squeeze(float a, float s) {
+    return 2.0 * s / (1.0 + sqrt(1.0 + 2.0 * a * s));
+}
+// One axis, in pixels: full-resolution position x -> position in the encoded eye.
+float foveate(float x, float full, float coded, float band, float b0, float c0) {
+    if (x < b0) {
+        return c0 - squeeze(growth(b0, c0), b0 - x);
+    }
+    if (x > b0 + band) {
+        return c0 + band + squeeze(growth(full - b0 - band, coded - c0 - band), x - b0 - band);
+    }
+    return c0 + x - b0;
+}
 void main() {
-    // GL framebuffers are bottom-up; the picture's first row is its top.
-    vec2 t = vec2(mix(rect.x, rect.z, uv.x), mix(rect.w, rect.y, uv.y));
+    // Position in the full eye image, y down (GL framebuffers are bottom-up; the picture's
+    // first row is its top).
+    vec2 p = vec2(uv.x, 1.0 - uv.y);
+    if (fov_band.x > 0.0) {
+        // The swapchain is the full-resolution size, so a fragment's center is a pixel center
+        // and, inside the band, lands on an encoded pixel's center.
+        vec2 x = p * fov_size.xy;
+        p = vec2(foveate(x.x, fov_size.x, fov_size.z, fov_band.x, fov_start.x, fov_start.y),
+                 foveate(x.y, fov_size.y, fov_size.w, fov_band.y, fov_start.z, fov_start.w)) / fov_size.zw;
+    }
+    vec2 t = mix(rect.xy, rect.zw, p);
     // The decoder outputs sRGB-encoded values; the swapchain is sRGB and encodes on write.
     color = vec4(srgb_to_linear(texture(picture, t).rgb), 1.0);
 }
@@ -62,6 +97,9 @@ pub struct Renderer {
     texture: glow::Texture,
     fbo: glow::Framebuffer,
     rect_loc: glow::UniformLocation,
+    fov_size_loc: Option<glow::UniformLocation>,
+    fov_band_loc: Option<glow::UniformLocation>,
+    fov_start_loc: Option<glow::UniformLocation>,
     frames: VecDeque<Current>,
 }
 
@@ -84,6 +122,9 @@ impl Renderer {
                 return Err(format!("program: {}", gl.get_program_info_log(program)));
             }
             let rect_loc = gl.get_uniform_location(program, "rect").ok_or("no rect uniform")?;
+            let fov_size_loc = gl.get_uniform_location(program, "fov_size");
+            let fov_band_loc = gl.get_uniform_location(program, "fov_band");
+            let fov_start_loc = gl.get_uniform_location(program, "fov_start");
             gl.use_program(Some(program));
             if let Some(loc) = gl.get_uniform_location(program, "picture") {
                 gl.uniform_1_i32(Some(&loc), 0);
@@ -100,6 +141,9 @@ impl Renderer {
                 program,
                 texture,
                 rect_loc,
+                fov_size_loc,
+                fov_band_loc,
+                fov_start_loc,
                 frames: VecDeque::new(),
                 gl,
             })
@@ -178,6 +222,18 @@ impl Renderer {
             gl.use_program(Some(self.program));
             let r = c.rects[eye];
             gl.uniform_4_f32(Some(&self.rect_loc), r[0], r[1], r[2], r[3]);
+            // Each picture is unwarped with the parameters it was encoded with.
+            match c.info.info.foveation {
+                Some(f) => {
+                    let ([fw, fh], [cw, ch], [bw, bh]) = (f.full, f.coded, f.band);
+                    let [[bx, cx], [by, cy]] = f.start[eye];
+                    let v = |n: u32| n as f32;
+                    gl.uniform_4_f32(self.fov_size_loc.as_ref(), v(fw), v(fh), v(cw), v(ch));
+                    gl.uniform_2_f32(self.fov_band_loc.as_ref(), v(bw), v(bh));
+                    gl.uniform_4_f32(self.fov_start_loc.as_ref(), v(bx), v(cx), v(by), v(cy));
+                }
+                None => gl.uniform_2_f32(self.fov_band_loc.as_ref(), 0.0, 0.0),
+            }
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(self.texture));
             gl.bind_vertex_array(Some(self.vao));

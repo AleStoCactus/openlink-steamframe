@@ -9,6 +9,7 @@
 //! `vkGetEncodedVideoSessionParametersKHR` and are prepended to every IDR.
 
 use super::import::color_range;
+use super::qp_map;
 use super::vk::{check, Context, Result};
 use ash::vk;
 use ash::vk::native::*;
@@ -22,12 +23,34 @@ const LOG2_MAX_POC_LSB_MINUS4: u8 = 12;
 /// (about 6 minutes at 90 fps).
 const MAX_GOP: u32 = 1 << 15;
 
-pub struct EncoderConfig {
+pub struct EncoderConfig<'a> {
     /// Picture size (what the decoder shows), before alignment.
     pub width: u32,
     pub height: u32,
     pub fps: f32,
     pub bitrate_bps: u64,
+    /// QP offset for the block whose center is at the given pixel (coded frame, may lie in the
+    /// padding past `width` x `height`): positive is lower quality. Applied with a quantization
+    /// delta map where the implementation has one, ignored otherwise. Rate control still holds
+    /// the bitrate, so raising QP somewhere lowers it elsewhere.
+    pub qp_offset: Option<&'a dyn Fn(u32, u32) -> f32>,
+}
+
+/// What the implementation offers for H.265 quantization delta maps.
+#[derive(Clone, Copy)]
+struct QpCaps {
+    max_extent: vk::Extent2D,
+    min_delta: i32,
+    max_delta: i32,
+}
+
+/// The delta map in use: an image of one QP offset per `texel` pixels, constant for the
+/// encoder's life.
+struct QpMap {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
 }
 
 /// Size constraints the converter must honour.
@@ -73,22 +96,98 @@ struct Caps {
     video: vk::VideoCapabilitiesKHR<'static>,
     encode: vk::VideoEncodeCapabilitiesKHR<'static>,
     h265: vk::VideoEncodeH265CapabilitiesKHR<'static>,
+    qp_map: Option<QpCaps>,
 }
 
 fn query_caps(ctx: &Context, profile: &Profile) -> Result<Caps> {
+    let mut h265q = qp_map::H265Capabilities {
+        s_type: qp_map::ST_H265_CAPABILITIES,
+        p_next: std::ptr::null_mut(),
+        min_qp_delta: 0,
+        max_qp_delta: 0,
+    };
+    let mut qcaps = qp_map::Capabilities {
+        s_type: qp_map::ST_CAPABILITIES,
+        p_next: (&raw mut h265q).cast(),
+        max_extent: vk::Extent2D::default(),
+    };
     let mut h265 = vk::VideoEncodeH265CapabilitiesKHR::default();
     let mut encode = vk::VideoEncodeCapabilitiesKHR::default();
     let mut video = vk::VideoCapabilitiesKHR::default();
+    if ctx.quantization_map {
+        h265.p_next = (&raw mut qcaps).cast();
+    }
     encode.p_next = (&raw mut h265).cast();
     video.p_next = (&raw mut encode).cast();
-    // SAFETY: valid physical device, profile and output chain.
+    // SAFETY: valid physical device, profile and output chain (the quantization map structs
+    // only when the extension is enabled).
     let r = unsafe {
         (ctx.video_queue_instance.get_physical_device_video_capabilities_khr)(ctx.pdev, &profile.info, &mut video)
     };
     check(r.result(), "vkGetPhysicalDeviceVideoCapabilitiesKHR")?;
     video.p_next = std::ptr::null_mut();
     encode.p_next = std::ptr::null_mut();
-    Ok(Caps { video, encode, h265 })
+    h265.p_next = std::ptr::null_mut();
+    let qp_map = (ctx.quantization_map && encode.flags.contains(qp_map::CAPABILITY_DELTA_MAP)).then_some(QpCaps {
+        max_extent: qcaps.max_extent,
+        min_delta: h265q.min_qp_delta,
+        max_delta: h265q.max_qp_delta,
+    });
+    Ok(Caps { video, encode, h265, qp_map })
+}
+
+/// A delta map format for `ctb`-sized coding tree blocks that can be written from the host
+/// (linear tiling): format and texel size. The smallest texel size wins (finer steps).
+fn qp_map_format(
+    ctx: &Context,
+    profile: &Profile,
+    ctb: vk::VideoEncodeH265CtbSizeFlagsKHR,
+) -> Result<Option<(vk::Format, vk::Extent2D)>> {
+    let mut list = profile.list();
+    let info = vk::PhysicalDeviceVideoFormatInfoKHR::default().image_usage(qp_map::USAGE_DELTA_MAP).push_next(&mut list);
+    let f = &ctx.video_queue_instance.get_physical_device_video_format_properties_khr;
+    let mut n = 0u32;
+    // SAFETY: Vulkan two-call enumeration; each output element carries its own chain of the
+    // extension's property structs, which live (boxed, unmoved) until the call returns.
+    unsafe {
+        check(f(ctx.pdev, &info, &mut n, std::ptr::null_mut()).result(), "vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
+        let mut h265: Vec<_> = (0..n)
+            .map(|_| qp_map::H265FormatProperties {
+                s_type: qp_map::ST_H265_FORMAT_PROPERTIES,
+                p_next: std::ptr::null_mut(),
+                compatible_ctb_sizes: vk::VideoEncodeH265CtbSizeFlagsKHR::empty(),
+            })
+            .collect();
+        let mut texel: Vec<_> = h265
+            .iter_mut()
+            .map(|h| qp_map::FormatProperties {
+                s_type: qp_map::ST_FORMAT_PROPERTIES,
+                p_next: (h as *mut qp_map::H265FormatProperties).cast(),
+                texel_size: vk::Extent2D::default(),
+            })
+            .collect();
+        let mut props: Vec<_> = texel
+            .iter_mut()
+            .map(|t| vk::VideoFormatPropertiesKHR { p_next: (t as *mut qp_map::FormatProperties).cast(), ..Default::default() })
+            .collect();
+        check(f(ctx.pdev, &info, &mut n, props.as_mut_ptr()).result(), "vkGetPhysicalDeviceVideoFormatPropertiesKHR")?;
+        let found: Vec<_> = (0..n as usize)
+            .map(|i| (props[i].format, texel[i].texel_size, props[i].image_tiling, props[i].image_usage_flags, h265[i].compatible_ctb_sizes))
+            .collect();
+        log::info!("H.265 quantization delta map formats (format, texel, tiling, usage, CTBs): {found:?}");
+        Ok(found
+            .into_iter()
+            .filter(|&(format, t, tiling, usage, ctbs)| {
+                tiling == vk::ImageTiling::LINEAR &&
+                ctbs.contains(ctb)
+                    && t.width == t.height
+                    && t.width.is_power_of_two()
+                    && usage.contains(qp_map::USAGE_DELTA_MAP)
+                    && matches!(format, vk::Format::R8_SINT | vk::Format::R16_SINT | vk::Format::R32_SINT)
+            })
+            .min_by_key(|&(_, t, ..)| t.width)
+            .map(|(format, t, ..)| (format, t)))
+    }
 }
 
 /// Largest picture the H.265 encoder takes.
@@ -127,6 +226,7 @@ pub struct Encoder {
     bitstream_memory: vk::DeviceMemory,
     bitstream_ptr: *const u8,
     query_pool: vk::QueryPool,
+    qp_map: Option<QpMap>,
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -184,6 +284,61 @@ impl Encoder {
         let d = &ctx.device;
         let vq = &ctx.video_queue;
 
+        let ctb_log2 = if caps.h265.ctb_sizes.contains(vk::VideoEncodeH265CtbSizeFlagsKHR::TYPE_64) {
+            6
+        } else if caps.h265.ctb_sizes.contains(vk::VideoEncodeH265CtbSizeFlagsKHR::TYPE_32) {
+            5
+        } else {
+            4
+        };
+        let ctb_flag = vk::VideoEncodeH265CtbSizeFlagsKHR::from_raw(1 << (ctb_log2 - 4));
+
+        // Quantization delta map, if asked for and offered.
+        let qp_plan = match (cfg.qp_offset, caps.qp_map) {
+            (None, _) => None,
+            (Some(_), None) => {
+                log::info!("H.265 encoder: no quantization delta maps here; encoding at uniform quality");
+                None
+            }
+            (Some(offset), Some(qcaps)) => match qp_map_format(ctx, &profile, ctb_flag)? {
+                None => {
+                    log::info!("H.265 encoder: no usable quantization delta map format; encoding at uniform quality");
+                    None
+                }
+                Some((format, texel)) => {
+                    let extent = vk::Extent2D {
+                        width: coded_width.div_ceil(texel.width),
+                        height: coded_height.div_ceil(texel.height),
+                    };
+                    if extent.width > qcaps.max_extent.width || extent.height > qcaps.max_extent.height {
+                        log::info!("H.265 encoder: delta map {extent:?} over the maximum {:?}; uniform quality", qcaps.max_extent);
+                        None
+                    } else {
+                        let deltas: Vec<i32> = (0..extent.height)
+                            .flat_map(|y| (0..extent.width).map(move |x| (x, y)))
+                            .map(|(x, y)| {
+                                let center = |i: u32, t: u32| i * t + t / 2;
+                                let v = offset(center(x, texel.width), center(y, texel.height)).round();
+                                (v as i32).clamp(qcaps.min_delta, qcaps.max_delta)
+                            })
+                            .collect();
+                        log::info!(
+                            "H.265 encoder: quantization delta map {}x{} of {}x{} px ({format:?}), QP offsets {}..{} (allowed {}..{})",
+                            extent.width,
+                            extent.height,
+                            texel.width,
+                            texel.height,
+                            deltas.iter().min().unwrap_or(&0),
+                            deltas.iter().max().unwrap_or(&0),
+                            qcaps.min_delta,
+                            qcaps.max_delta,
+                        );
+                        Some((format, texel, extent, deltas))
+                    }
+                }
+            },
+        };
+
         // Session.
         let session_info = vk::VideoSessionCreateInfoKHR::default()
             .queue_family_index(ctx.encode_family)
@@ -193,7 +348,8 @@ impl Encoder {
             .reference_picture_format(format)
             .max_dpb_slots(2)
             .max_active_reference_pictures(1)
-            .std_header_version(&caps.video.std_header_version);
+            .std_header_version(&caps.video.std_header_version)
+            .flags(if qp_plan.is_some() { qp_map::SESSION_ALLOW_DELTA_MAP } else { vk::VideoSessionCreateFlagsKHR::empty() });
         let mut session = vk::VideoSessionKHR::null();
         // SAFETY: valid create info.
         check(
@@ -203,13 +359,6 @@ impl Encoder {
         let session_memory = bind_session_memory(ctx, session)?;
 
         // Parameter sets.
-        let ctb_log2 = if caps.h265.ctb_sizes.contains(vk::VideoEncodeH265CtbSizeFlagsKHR::TYPE_64) {
-            6
-        } else if caps.h265.ctb_sizes.contains(vk::VideoEncodeH265CtbSizeFlagsKHR::TYPE_32) {
-            5
-        } else {
-            4
-        };
         let tb_max_log2 = if caps.h265.transform_block_sizes.contains(vk::VideoEncodeH265TransformBlockSizeFlagsKHR::TYPE_32) {
             5
         } else if caps.h265.transform_block_sizes.contains(vk::VideoEncodeH265TransformBlockSizeFlagsKHR::TYPE_16) {
@@ -269,6 +418,10 @@ impl Encoder {
 
         let mut pps: StdVideoH265PictureParameterSet = unsafe { std::mem::zeroed() };
         pps.flags.set_cu_qp_delta_enabled_flag(1);
+        if let Some((_, texel, ..)) = &qp_plan {
+            // QP may change every texel of the delta map, which can be smaller than a CTB.
+            pps.diff_cu_qp_delta_depth = ctb_log2.saturating_sub(texel.width.ilog2() as u8);
+        }
         pps.flags.set_pps_loop_filter_across_slices_enabled_flag(1);
         pps.num_ref_idx_l0_default_active_minus1 = 0;
 
@@ -277,13 +430,26 @@ impl Encoder {
             .std_vp_ss(&vpss)
             .std_sp_ss(&spss)
             .std_pp_ss(&ppss);
+        let qp_params = qp_map::SessionParameters {
+            s_type: qp_map::ST_SESSION_PARAMETERS,
+            p_next: std::ptr::null(),
+            texel_size: qp_plan.as_ref().map_or_else(vk::Extent2D::default, |(_, t, ..)| *t),
+        };
         let mut h265_params = vk::VideoEncodeH265SessionParametersCreateInfoKHR::default()
             .max_std_vps_count(1)
             .max_std_sps_count(1)
             .max_std_pps_count(1)
             .parameters_add_info(&add);
+        if qp_plan.is_some() {
+            h265_params.p_next = (&raw const qp_params).cast();
+        }
         let params_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(session)
+            .flags(if qp_plan.is_some() {
+                qp_map::PARAMETERS_MAP_COMPATIBLE
+            } else {
+                vk::VideoSessionParametersCreateFlagsKHR::empty()
+            })
             .push_next(&mut h265_params);
         let mut params = vk::VideoSessionParametersKHR::null();
         // SAFETY: valid create info; the std structs outlive the call.
@@ -374,6 +540,11 @@ impl Encoder {
             (src, src_memory, src_view, dpb, dpb_memory, dpb_views, bitstream, bitstream_memory, bitstream_ptr, query_pool)
         };
 
+        let qp_map = match qp_plan {
+            Some((format, _, extent, deltas)) => Some(create_qp_map(ctx, &profile, format, extent, &deltas)?),
+            None => None,
+        };
+
         let pool = ctx.command_pool(ctx.encode_family)?;
         let cmd = ctx.command_buffer(pool)?;
         let fence = ctx.fence()?;
@@ -425,6 +596,7 @@ impl Encoder {
             bitstream_memory,
             bitstream_ptr,
             query_pool,
+            qp_map,
             pool,
             cmd,
             fence,
@@ -585,6 +757,12 @@ impl Encoder {
             .std_picture_info(&std_pic);
 
         let ref_slots = [ref_slot_info];
+        let qp_info = qp_map::EncodeInfo {
+            s_type: qp_map::ST_ENCODE_INFO,
+            p_next: (&raw const h265_pic).cast(),
+            quantization_map: self.qp_map.as_ref().map_or(vk::ImageView::null(), |m| m.view),
+            extent: self.qp_map.as_ref().map_or_else(vk::Extent2D::default, |m| m.extent),
+        };
         let mut encode_info = vk::VideoEncodeInfoKHR::default()
             .dst_buffer(self.bitstream)
             .dst_buffer_offset(0)
@@ -595,6 +773,10 @@ impl Encoder {
             encode_info = encode_info.reference_slots(&ref_slots);
         }
         encode_info.p_next = (&raw const h265_pic).cast();
+        if self.qp_map.is_some() {
+            encode_info = encode_info.flags(qp_map::ENCODE_WITH_DELTA_MAP);
+            encode_info.p_next = (&raw const qp_info).cast();
+        }
 
         let layers = [self.rc_layer];
         let rc = self.rate_control_info(&layers);
@@ -622,7 +804,19 @@ impl Encoder {
             .src_access_mask(vk::AccessFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
             .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR);
-        let barriers_first = [src_barrier, dpb_barrier];
+        // The delta map was written from the host before the first submit (which makes host
+        // writes visible) and is only read from here on.
+        let qp_barrier = vk::ImageMemoryBarrier2::default()
+            .image(self.qp_map.as_ref().map_or(vk::Image::null(), |m| m.image))
+            .subresource_range(color_range())
+            .old_layout(vk::ImageLayout::PREINITIALIZED)
+            .new_layout(qp_map::LAYOUT)
+            .src_stage_mask(vk::PipelineStageFlags2::HOST)
+            .src_access_mask(vk::AccessFlags2::HOST_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR);
+        let barriers_first_qp = [src_barrier, dpb_barrier, qp_barrier];
+        let barriers_first = if self.qp_map.is_some() { &barriers_first_qp[..] } else { &barriers_first_qp[..2] };
         let barriers = [src_barrier];
         let first = !self.dpb_initialised;
         self.dpb_initialised = true;
@@ -638,7 +832,7 @@ impl Encoder {
             )?;
             d.cmd_pipeline_barrier2(
                 self.cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(if first { &barriers_first } else { &barriers }),
+                &vk::DependencyInfo::default().image_memory_barriers(if first { barriers_first } else { &barriers }),
             );
             (vq.cmd_begin_video_coding_khr)(self.cmd, &begin);
             d.cmd_begin_query(self.cmd, self.query_pool, 0, vk::QueryControlFlags::empty());
@@ -687,6 +881,11 @@ impl Encoder {
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
             d.destroy_query_pool(self.query_pool, None);
+            if let Some(m) = self.qp_map {
+                d.destroy_image_view(m.view, None);
+                d.destroy_image(m.image, None);
+                d.free_memory(m.memory, None);
+            }
             d.unmap_memory(self.bitstream_memory);
             d.destroy_buffer(self.bitstream, None);
             d.free_memory(self.bitstream_memory, None);
@@ -705,6 +904,82 @@ impl Encoder {
             }
         }
         drop(self.profile);
+    }
+}
+
+/// Creates the delta map image, linear and host visible, and writes `deltas` (row-major,
+/// `extent`) into it directly: implementations need not allow transfers into a quantization
+/// map (RADV does not). It starts `PREINITIALIZED`, which keeps the writes; the first encode
+/// moves it to the quantization map layout.
+fn create_qp_map(ctx: &Context, profile: &Profile, format: vk::Format, extent: vk::Extent2D, deltas: &[i32]) -> Result<QpMap> {
+    let d = &ctx.device;
+    let mut list = profile.list();
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::LINEAR)
+        .usage(qp_map::USAGE_DELTA_MAP)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::PREINITIALIZED)
+        .push_next(&mut list);
+    let texel = match format {
+        vk::Format::R8_SINT => 1,
+        vk::Format::R16_SINT => 2,
+        _ => 4,
+    };
+    // SAFETY: valid create infos; the mapping covers the image's memory, and each row is
+    // written within the row pitch the implementation reports.
+    unsafe {
+        let image = check(d.create_image(&info, None), "vkCreateImage (QP map)")?;
+        let memory = match ctx.bind_image_memory(image, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT) {
+            Ok(m) => m,
+            Err(e) => {
+                d.destroy_image(image, None);
+                return Err(e);
+            }
+        };
+        let fail = |e| {
+            d.destroy_image(image, None);
+            d.free_memory(memory, None);
+            e
+        };
+        let layout = d.get_image_subresource_layout(
+            image,
+            vk::ImageSubresource { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, array_layer: 0 },
+        );
+        let base = check(d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()), "vkMapMemory (QP map)")
+            .map_err(fail)?
+            .cast::<u8>()
+            .add(layout.offset as usize);
+        for (y, row) in deltas.chunks(extent.width as usize).enumerate() {
+            let dst = base.add(y * layout.row_pitch as usize);
+            for (x, &v) in row.iter().enumerate() {
+                let p = dst.add(x * texel);
+                match texel {
+                    1 => p.write(v as i8 as u8),
+                    2 => p.cast::<[u8; 2]>().write_unaligned((v as i16).to_ne_bytes()),
+                    _ => p.cast::<[u8; 4]>().write_unaligned(v.to_ne_bytes()),
+                }
+            }
+        }
+        d.unmap_memory(memory);
+        let view = check(
+            d.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_range()),
+                None,
+            ),
+            "vkCreateImageView (QP map)",
+        )
+        .map_err(fail)?;
+        Ok(QpMap { image, memory, view, extent })
     }
 }
 

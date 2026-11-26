@@ -92,6 +92,35 @@ without a round trip through system memory.
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
 
+**Foveated encoding** (`openlink_protocol::foveation`). The converter can squeeze each eye's
+edges before encoding, and the Quest renderer stretches them back when it draws the picture into
+the (full-size) eye swapchain. Each axis is warped separately: a band around the lens's optical
+axis (where the FOV's tangents are 0, so off center on the Quest's asymmetric FOV) keeps one
+encoded pixel per pixel, and beyond it the size of an encoded pixel grows linearly to about 4
+pixels at the image edge, so resolution has no visible step at the band. The warp is defined in
+whole pixels: the band starts on an even pixel in both the full and the encoded picture, and
+each side's curve is fitted to its own (whole) full and encoded length, which keeps both
+directions in closed form (a quadratic and its inverse). That alignment matters: a first version
+kept the band in fractions of the image, so every encoded pixel sat a fraction of a pixel off
+the displayed one, and the headset's bilinear sampling blended neighbours everywhere; the center
+came out visibly softer than unfoveated at every setting. At a 50% band the Quest 3 encodes
+1444x1546 per eye instead of 2064x2208, about half the pixels, so less encode time, and the
+bitrate goes mostly to the center. Because the warp is separable, the full-resolution region is
+a rectangle and the corners are squeezed on both axes.
+
+On top of that, where the GPU has `VK_KHR_video_encode_quantization_map` (RADV does, with 64x64
+R32_SINT texels that only a linear, host-written image accepts), the encoder gets a QP delta map
+that is round rather than rectangular: 0 inside the largest circle around the optical axis that
+fits in the band, rising smoothly (in tangent space, so by angle from the axis) to +8 QP at the
+edge of the view (`Foveation::falloff`). CBR still holds the bitrate, so the bits the edges give
+up go to the center: in `--encode-selftest` at 60 Mbit/s, +8 QP on one half cost that half
+1.2 dB PSNR and gave the other 0.5 dB at the same size. At a bitrate the content does not need,
+RADV pads with filler instead and the center gains nothing. Without the extension the encoder
+logs it and encodes at uniform quality. The parameters ride in every frame's
+`FrameInfo`, so a picture is always unwarped with what it was warped with; changing the band size
+changes the coded size, so the server rebuilds its encoder (the first frame is an IDR) and the
+headset its decoder, but SteamVR's render size does not depend on it, so SteamVR keeps running.
+
 ## Audio
 
 Both directions share the headset socket (`openlink_protocol::audio`): game audio stereo
@@ -150,11 +179,17 @@ preferred wired path.
   (`IVRServerDriverHost::RequestRestart`) when a headset with a different size or FOV connects.
   The size the driver is given is the *encoded* per-eye size (the desktop app's "Encoded
   Resolution" percentage of the headset's panel resolution, looked up by model since OpenXR only
-  reports the runtime's much smaller recommended size), so SteamVR's 100% renders exactly what is
-  streamed and its render resolution setting supersamples from there. The server re-checks the
-  settings every 500 ms while a headset is connected and, when the stream changes, sends the
-  headset a new `Welcome` (it rebuilds its swapchains and decoder) and the driver a new
-  `HeadsetConnected`, so saving a new resolution restarts SteamVR.
+  reports the runtime's much smaller recommended size), enlarged for the lens. The lens
+  concentrates the panel's pixels at the center of view, so a flat render target over the same
+  FOV must be larger than the panel to match that density, which is why native headsets' 100% is
+  above their panel size (Index: 1.4x). The matching size is the center pixels per radian times
+  the FOV's tangent span; the lens profile is not queryable through OpenXR, so the center density
+  comes from Meta's published PPD per model (`HeadsetInfo::render_size`; Quest 3: 25 PPD, 1.54x,
+  about 3174x3429 at 100%; an unknown headset gets 1x). The converter downsamples SteamVR's
+  frames to the encoded size, and SteamVR's render resolution setting scales from there. The
+  server re-checks the settings every 500 ms while a headset is connected and, when the stream
+  changes, sends the headset a new `Welcome` (it rebuilds its swapchains and decoder) and the
+  driver a new `HeadsetConnected`, so saving a new resolution restarts SteamVR.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.
@@ -168,5 +203,5 @@ preferred wired path.
 3. **Video on Windows.** Direct mode capture, NVENC/AMF, UDP video transport, decode and
    reprojection on the headset.
 4. **Video on Linux.** Capture spike, then VA-API/NVENC/Vulkan Video.
-5. **Quality.** FEC and adaptive bitrate, foveated encoding, audio on Windows, USB NCM discovery,
+5. **Quality.** FEC and adaptive bitrate, foveated encoding (done), audio on Windows, USB NCM discovery,
    Quest Pro face/eye tracking, hand tracking with skeletal input.
