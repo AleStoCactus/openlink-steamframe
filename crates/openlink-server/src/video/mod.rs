@@ -1,4 +1,4 @@
-//! Video pipeline (Linux): compositor frames from the driver -> NV12 -> H.265.
+//! Video pipeline: compositor frames from the driver -> NV12 -> H.265.
 //!
 //! ```text
 //!  driver (vrserver)                       server, video thread
@@ -11,6 +11,10 @@
 //!                                          -> Annex B bitstream -> UDP to the headset
 //! ```
 //!
+//! That is Linux. On Windows the textures are D3D11 shared textures: the server opens them
+//! with D3D11 and copies each frame into textures Vulkan can import, ordered by fences
+//! ([`d3d`]); the rest is the same.
+//!
 //! Each frame goes to the headset as [`openlink_protocol::video`] datagrams, with the HMD pose
 //! SteamVR rendered it with. New headsets and reported losses get an IDR.
 //!
@@ -18,6 +22,8 @@
 //! is processed and the older ones are released straight away.
 
 mod convert;
+#[cfg(windows)]
+mod d3d;
 mod encode;
 mod import;
 mod qp_map;
@@ -27,11 +33,12 @@ use crate::config::Settings;
 use crate::session::{Status, HeadsetLink};
 use ash::vk as avk;
 use import::{color_range, Imported};
-use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
+use openlink_protocol::video_ipc::{self as vipc, Attachment, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
 use openlink_protocol::{self as proto, video};
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -216,6 +223,8 @@ struct Pipeline {
     fence: avk::Fence,
     converted: avk::Semaphore,
     /// Receive the compositor's write fences, one per texture read (two eyes, two overlay).
+    /// Linux only; Windows waits on [`vk::Context::copied`].
+    #[cfg_attr(windows, allow(dead_code))]
     fence_sems: [avk::Semaphore; 4],
     /// Compositor write fences seen: already signalled, still pending, unavailable.
     fence_stats: (u32, u32, u32),
@@ -288,6 +297,7 @@ impl Pipeline {
     fn convert(
         &mut self,
         ctx: &Context,
+        frame_id: u64,
         eyes: [&Imported; 2],
         bounds: [[f32; 4]; 2],
         overlay: Option<([&Imported; 2], [[f32; 4]; 2])>,
@@ -300,38 +310,40 @@ impl Pipeline {
                 unique.push(img);
             }
         }
-        // Wait for the compositor's rendering into the textures (implicit dmabuf fences).
         let mut waits = Vec::new();
-        for (eye, sem) in unique.iter().zip(self.fence_sems) {
-            let Some(sync) = eye.write_fence() else {
-                self.fence_stats.2 += 1;
-                continue;
-            };
-            // Diagnostics: is the compositor's write still in flight when we get here?
-            let mut pfd = libc::pollfd { fd: sync.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: valid fd and pollfd.
-            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } == 1;
-            if signaled { self.fence_stats.0 += 1 } else { self.fence_stats.1 += 1 }
-            let info = avk::ImportSemaphoreFdInfoKHR::default()
-                .semaphore(sem)
-                .flags(avk::SemaphoreImportFlags::TEMPORARY)
-                .handle_type(avk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                .fd(sync.as_raw_fd());
-            // SAFETY: valid semaphore and sync file; Vulkan owns the fd on success.
-            match unsafe { ctx.ext_sem_fd.import_semaphore_fd(&info) } {
-                Ok(()) => {
-                    let _ = sync.into_raw_fd();
+        // Timeline semaphore values for `waits` (Windows), or empty (binary semaphores).
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut wait_values = Vec::new();
+        #[cfg(target_os = "linux")]
+        self.wait_for_compositor(ctx, &unique, &mut waits);
+        #[cfg(windows)]
+        {
+            // Copy the driver's textures into the ones Vulkan imported, once the compositor's
+            // rendering is done (the driver's frame fence); then wait for the copies.
+            let pairs: Vec<_> = unique.iter().map(|i| (&i.d3d.copy, &i.d3d.src)).collect();
+            let fenced = ctx.d3d.has_driver_fence() as u32 * unique.len() as u32;
+            self.fence_stats.1 += fenced;
+            self.fence_stats.2 += unique.len() as u32 - fenced;
+            let value = ctx.d3d.copy(frame_id, &pairs)?;
+            match ctx.copied {
+                Some(sem) => {
                     waits.push(sem);
+                    wait_values.push(value);
                 }
-                Err(e) => log::warn!("video: cannot import compositor fence: {e:?}"),
+                None => ctx.d3d.wait_cpu(value)?,
             }
         }
+        #[cfg(not(windows))]
+        let _ = frame_id;
 
+        // Dmabufs come from the "foreign" queue family; D3D11 memory from "external".
+        let foreign =
+            if cfg!(windows) { avk::QUEUE_FAMILY_EXTERNAL } else { avk::QUEUE_FAMILY_FOREIGN_EXT };
         let ownership = |img: &Imported, acquire: bool| {
             let (src_q, dst_q) = if acquire {
-                (avk::QUEUE_FAMILY_FOREIGN_EXT, ctx.compute_family)
+                (foreign, ctx.compute_family)
             } else {
-                (ctx.compute_family, avk::QUEUE_FAMILY_FOREIGN_EXT)
+                (ctx.compute_family, foreign)
             };
             let b = avk::ImageMemoryBarrier2::default()
                 .image(img.image)
@@ -376,15 +388,47 @@ impl Pipeline {
             let stages = vec![avk::PipelineStageFlags::COMPUTE_SHADER; waits.len()];
             let cmds = [self.cmd];
             let signal = [self.converted];
+            let mut timeline = avk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
             let submit = avk::SubmitInfo::default()
                 .wait_semaphores(&waits)
                 .wait_dst_stage_mask(&stages)
                 .command_buffers(&cmds)
                 .signal_semaphores(&signal);
+            let submit = if wait_values.is_empty() { submit } else { submit.push_next(&mut timeline) };
             check(d.queue_submit(ctx.compute_queue, &[submit], self.fence), "vkQueueSubmit (convert)")?;
             ctx.wait_fence(self.fence, "convert")?;
         }
         Ok(())
+    }
+
+    /// Linux: makes `waits` wait for the compositor's rendering into the textures (implicit
+    /// dmabuf fences).
+    #[cfg(target_os = "linux")]
+    fn wait_for_compositor(&mut self, ctx: &Context, unique: &[&Imported], waits: &mut Vec<avk::Semaphore>) {
+        for (eye, sem) in unique.iter().zip(self.fence_sems) {
+            let Some(sync) = eye.write_fence() else {
+                self.fence_stats.2 += 1;
+                continue;
+            };
+            // Diagnostics: is the compositor's write still in flight when we get here?
+            let mut pfd = libc::pollfd { fd: sync.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: valid fd and pollfd.
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } == 1;
+            if signaled { self.fence_stats.0 += 1 } else { self.fence_stats.1 += 1 }
+            let info = avk::ImportSemaphoreFdInfoKHR::default()
+                .semaphore(sem)
+                .flags(avk::SemaphoreImportFlags::TEMPORARY)
+                .handle_type(avk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                .fd(sync.as_raw_fd());
+            // SAFETY: valid semaphore and sync file; Vulkan owns the fd on success.
+            match unsafe { ctx.ext_sem_fd.import_semaphore_fd(&info) } {
+                Ok(()) => {
+                    let _ = sync.into_raw_fd();
+                    waits.push(sem);
+                }
+                Err(e) => log::warn!("video: cannot import compositor fence: {e:?}"),
+            }
+        }
     }
 }
 
@@ -413,6 +457,12 @@ struct Connection<'a> {
     stats: Stats,
     failed: bool,
     eye_layout: Option<String>,
+    /// vrserver's process id, from the driver's hello.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    driver_pid: u32,
+    /// Windows: the driver's frame fence, opened once there is a D3D11 device.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    sync_fence: Option<u64>,
 }
 
 impl<'a> Connection<'a> {
@@ -444,6 +494,8 @@ impl<'a> Connection<'a> {
             stats: Stats::default(),
             failed: false,
             eye_layout: None,
+            driver_pid: 0,
+            sync_fence: None,
         }
     }
 
@@ -473,9 +525,16 @@ impl<'a> Connection<'a> {
                 };
                 timeout = 0;
                 match proto::decode::<DriverVideoMsg>(&buf[..n]) {
-                    Ok(DriverVideoMsg::Hello { driver_version }) => log::info!("video: driver {driver_version}"),
+                    Ok(DriverVideoMsg::Hello { driver_version, pid }) => {
+                        log::info!("video: driver {driver_version} (vrserver pid {pid})");
+                        self.driver_pid = pid;
+                    }
                     Ok(DriverVideoMsg::TextureSet(set)) => self.import_set(&set, fds),
                     Ok(DriverVideoMsg::TexturesDestroyed { handles }) => self.forget(&handles),
+                    Ok(DriverVideoMsg::SyncFence { handle }) => {
+                        self.sync_fence = Some(handle);
+                        self.open_sync_fence();
+                    }
                     Ok(DriverVideoMsg::Frame { frame_id, eyes, overlay, hmd_pose, present_ns }) => {
                         if let Some(old) = newest.replace(Frame { id: frame_id, eyes, overlay, hmd_pose, present_ns }) {
                             self.stats.skipped += 1;
@@ -492,7 +551,21 @@ impl<'a> Connection<'a> {
         self.shutdown();
     }
 
-    fn import_set(&mut self, set: &vipc::TextureSet, fds: Vec<OwnedFd>) {
+    /// Windows: opens the driver's frame fence on the D3D11 device, once both exist.
+    fn open_sync_fence(&mut self) {
+        #[cfg(windows)]
+        if let Some(ctx) = &self.ctx {
+            let Some(handle) = self.sync_fence.take() else { return };
+            match ctx.d3d.set_driver_fence(self.driver_pid, handle) {
+                Ok(()) => log::info!("video: frame fence shared with the driver"),
+                Err(e) => log::error!("video: {e}; frames may be read before the compositor finishes them"),
+            }
+        }
+    }
+
+    fn import_set(&mut self, set: &vipc::TextureSet, fds: Vec<Attachment>) {
+        // Linux: one fd per plane rides along. Windows: textures have no planes and nothing
+        // rides along.
         let planes: usize = set.textures.iter().map(|t| t.planes.len()).sum();
         if fds.len() != planes {
             log::error!("video: texture set with {planes} planes came with {} fds", fds.len());
@@ -506,11 +579,12 @@ impl<'a> Connection<'a> {
                     self.failed = true;
                 }
             }
+            self.open_sync_fence();
         }
         let Some(ctx) = &self.ctx else { return };
         let mut fds = fds.into_iter();
         for tex in &set.textures {
-            let tex_fds: Vec<OwnedFd> = fds.by_ref().take(tex.planes.len()).collect();
+            let tex_fds: Vec<Attachment> = fds.by_ref().take(tex.planes.len()).collect();
             match Imported::new(ctx, set, tex, tex_fds) {
                 Ok(img) => {
                     self.imports.insert(tex.handle, img);
@@ -595,7 +669,7 @@ impl<'a> Connection<'a> {
             let (l, r) = (self.imports.get(&o[0].texture)?, self.imports.get(&o[1].texture)?);
             Some(([l, r], [o[0].bounds, o[1].bounds]))
         });
-        let converted = p.convert(ctx, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds], overlay);
+        let converted = p.convert(ctx, frame.id, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds], overlay);
         release(frame.id);
         converted?;
         let t1 = Instant::now();
@@ -694,15 +768,22 @@ impl<'a> Connection<'a> {
 /// test pattern, identical in the left and right halves (so per-half quality can be compared);
 /// SOURCE.yuv receives it as raw NV12 for `ffmpeg -lavfi psnr`.
 pub fn selftest(args: &[String]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let size = args.first().ok_or("usage: --encode-selftest WxH FRAMES [OUT]")?;
     let (w, h) = size.split_once('x').ok_or("size must be WxH")?;
     let (width, height): (u32, u32) = (w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?);
     let frames: u32 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(300);
     let mut out = args.get(2).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
     let mut source_out = args.get(3).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
-    let rdev = std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev();
-    let ctx = Context::new(rdev)?;
+    // Linux: the first render node, where the driver allocates too. Windows: the first GPU
+    // that can encode.
+    #[cfg(target_os = "linux")]
+    let gpu = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev()
+    };
+    #[cfg(windows)]
+    let gpu = 0;
+    let ctx = Context::new(gpu)?;
     // QP_RIGHT: a quantization delta map adding that much QP to the right half, to check that
     // the implementation applies one (the halves' PSNR then differ).
     let qp_right: Option<f32> = args.get(4).and_then(|v| v.parse().ok()).filter(|v| *v != 0.0);

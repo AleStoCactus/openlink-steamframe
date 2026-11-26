@@ -20,13 +20,22 @@ pub struct Context {
     pub compute_queue: vk::Queue,
     pub encode_family: u32,
     pub encode_queue: vk::Queue,
+    #[cfg(target_os = "linux")]
     pub ext_mem_fd: ash::khr::external_memory_fd::Device,
+    #[cfg(target_os = "linux")]
     pub ext_sem_fd: ash::khr::external_semaphore_fd::Device,
+    /// Windows: the D3D11 side of the import (opens the driver's textures, copies them into
+    /// textures Vulkan can import), on the same adapter.
+    #[cfg(windows)]
+    pub d3d: super::d3d::Bridge,
+    /// Windows: `d3d`'s copy fence as a timeline semaphore, or `None` if this implementation
+    /// cannot import it (the CPU then waits for the copies).
+    #[cfg(windows)]
+    pub copied: Option<vk::Semaphore>,
     pub video_queue: ash::khr::video_queue::DeviceFn,
     pub video_queue_instance: ash::khr::video_queue::InstanceFn,
     pub video_encode: ash::khr::video_encode_queue::DeviceFn,
     pub video_encode_instance: ash::khr::video_encode_queue::InstanceFn,
-    pub drm_modifier: ash::ext::image_drm_format_modifier::Device,
     pub name: String,
     /// `VK_KHR_video_encode_quantization_map` is enabled: the encoder can lower the quality of
     /// chosen regions (the edges of a foveated picture). Optional.
@@ -39,6 +48,7 @@ pub struct Context {
 /// Longest a single convert or encode may take before the GPU is presumed hung.
 const GPU_TIMEOUT_NS: u64 = 1_000_000_000;
 
+#[cfg(target_os = "linux")]
 const DEVICE_EXTENSIONS: &[&CStr] = &[
     ash::khr::external_memory_fd::NAME,
     ash::ext::external_memory_dma_buf::NAME,
@@ -50,16 +60,65 @@ const DEVICE_EXTENSIONS: &[&CStr] = &[
     ash::khr::video_encode_h265::NAME,
 ];
 
-fn major(rdev: u64) -> u64 {
-    libc::major(rdev) as u64
+#[cfg(windows)]
+const DEVICE_EXTENSIONS: &[&CStr] = &[
+    ash::khr::external_memory_win32::NAME,
+    ash::khr::external_semaphore_win32::NAME,
+    ash::khr::video_queue::NAME,
+    ash::khr::video_encode_queue::NAME,
+    ash::khr::video_encode_h265::NAME,
+];
+
+/// The GPU the driver's textures are on, for messages.
+#[cfg(target_os = "linux")]
+fn describe_gpu(render_node: u64) -> String {
+    format!("render node {}:{}", libc::major(render_node), libc::minor(render_node))
 }
-fn minor(rdev: u64) -> u64 {
-    libc::minor(rdev) as u64
+#[cfg(windows)]
+fn describe_gpu(luid: u64) -> String {
+    format!("adapter LUID {luid:#x}")
+}
+
+/// Whether physical device `pdev` is the GPU `render_node` names (0: any GPU).
+fn gpu_matches(instance: &ash::Instance, pdev: vk::PhysicalDevice, render_node: u64, has_drm: bool) -> bool {
+    if render_node == 0 {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+        if !has_drm {
+            return false;
+        }
+        // SAFETY: the DRM struct is supported.
+        unsafe { instance.get_physical_device_properties2(pdev, &mut props) };
+        drm.has_render != 0
+            && drm.render_major as u64 == libc::major(render_node) as u64
+            && drm.render_minor as u64 == libc::minor(render_node) as u64
+    }
+    #[cfg(windows)]
+    {
+        let _ = has_drm;
+        luid(instance, pdev) == Some(render_node)
+    }
+}
+
+/// The DXGI adapter LUID of `pdev` (`HighPart << 32 | LowPart`, as the driver sends it).
+#[cfg(windows)]
+pub fn luid(instance: &ash::Instance, pdev: vk::PhysicalDevice) -> Option<u64> {
+    let mut id = vk::PhysicalDeviceIDProperties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+    // SAFETY: core 1.1 query.
+    unsafe { instance.get_physical_device_properties2(pdev, &mut props) };
+    // LUID is { LowPart: u32, HighPart: i32 } in memory, so little-endian bytes are exactly that.
+    (id.device_luid_valid != 0).then(|| u64::from_le_bytes(id.device_luid))
 }
 
 impl Context {
-    /// Opens the Vulkan device whose DRM render node is `render_node` (an `st_rdev`), or the
-    /// first device with H.265 encode if `render_node` is 0.
+    /// Opens the Vulkan device on the GPU `render_node` names (Linux: a DRM render node's
+    /// `st_rdev`; Windows: a DXGI adapter LUID), or the first device with H.265 encode if
+    /// `render_node` is 0.
     pub fn new(render_node: u64) -> Result<Self> {
         // SAFETY: loading the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("cannot load Vulkan: {e}"))?;
@@ -85,23 +144,18 @@ impl Context {
             // SAFETY: valid physical device.
             let exts = unsafe { instance.enumerate_device_extension_properties(pdev) }.unwrap_or_default();
             let has = |n: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
-            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
-            if has(ash::ext::physical_device_drm::NAME) {
-                // SAFETY: the DRM struct is supported.
-                unsafe { instance.get_physical_device_properties2(pdev, &mut props) };
-            }
-            let name = props
-                .properties
-                .device_name_as_c_str()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // SAFETY: valid physical device.
+            let props = unsafe { instance.get_physical_device_properties(pdev) };
+            let name =
+                props.device_name_as_c_str().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
             let missing: Vec<_> = DEVICE_EXTENSIONS.iter().filter(|n| !has(n)).collect();
-            let node_matches = render_node == 0
-                || (drm.has_render != 0
-                    && drm.render_major as u64 == major(render_node)
-                    && drm.render_minor as u64 == minor(render_node));
-            log::debug!("Vulkan device {name}: render node match {node_matches}, missing {missing:?}");
+            let node_matches = gpu_matches(&instance, pdev, render_node, has(ash::ext::physical_device_drm::NAME));
+            log::debug!("Vulkan device {name}: GPU match {node_matches}, missing {missing:?}");
+            // Without a GPU named, skip devices that cannot encode (e.g. an integrated GPU
+            // listed first) rather than failing on them.
+            if render_node == 0 && !missing.is_empty() {
+                continue;
+            }
             if node_matches {
                 if !missing.is_empty() {
                     return Err(format!("{name} lacks {missing:?}"));
@@ -122,11 +176,11 @@ impl Context {
             }
         }
         let (pdev, name, quantization_map) = chosen.ok_or_else(|| {
-            format!(
-                "no Vulkan device on render node {}:{}",
-                major(render_node),
-                minor(render_node)
-            )
+            if render_node == 0 {
+                format!("no Vulkan device has {DEVICE_EXTENSIONS:?}")
+            } else {
+                format!("no Vulkan device on {}", describe_gpu(render_node))
+            }
         })?;
 
         // Queue families: one with compute, one with H.265 encode.
@@ -165,7 +219,10 @@ impl Context {
             p_next: std::ptr::null_mut(),
             video_encode_quantization_map: vk::TRUE,
         };
-        let mut v12 = vk::PhysicalDeviceVulkan12Features::default().host_query_reset(true);
+        // Windows: the D3D11 copy's fence is imported as a timeline semaphore.
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+            .host_query_reset(true)
+            .timeline_semaphore(cfg!(windows));
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
         if quantization_map {
             ext_ptrs.push(super::qp_map::NAME.as_ptr());
@@ -187,9 +244,35 @@ impl Context {
         };
         let video_queue = ash::khr::video_queue::DeviceFn::load(load);
         let video_encode = ash::khr::video_encode_queue::DeviceFn::load(load);
+        #[cfg(target_os = "linux")]
         let ext_mem_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
+        #[cfg(target_os = "linux")]
         let ext_sem_fd = ash::khr::external_semaphore_fd::Device::new(&instance, &device);
-        let drm_modifier = ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
+        #[cfg(windows)]
+        let ext_sem_win32 = ash::khr::external_semaphore_win32::Device::new(&instance, &device);
+        #[cfg(windows)]
+        let d3d = {
+            let luid = luid(&instance, pdev).ok_or("the Vulkan device has no LUID")?;
+            match super::d3d::Bridge::new(luid) {
+                Ok(b) => b,
+                Err(e) => {
+                    // SAFETY: nothing was created from the device yet.
+                    unsafe {
+                        device.destroy_device(None);
+                        instance.destroy_instance(None);
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        #[cfg(windows)]
+        let copied = match import_fence(&device, &ext_sem_win32, &d3d) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("video: {e}; the CPU waits for each frame's copy instead");
+                None
+            }
+        };
         // SAFETY: valid physical device.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         log::info!(
@@ -207,13 +290,18 @@ impl Context {
             compute_queue,
             encode_family,
             encode_queue,
+            #[cfg(target_os = "linux")]
             ext_mem_fd,
+            #[cfg(target_os = "linux")]
             ext_sem_fd,
+            #[cfg(windows)]
+            d3d,
+            #[cfg(windows)]
+            copied,
             video_queue,
             video_queue_instance,
             video_encode,
             video_encode_instance,
-            drm_modifier,
             name,
             quantization_map,
         })
@@ -312,6 +400,37 @@ impl Context {
     }
 }
 
+/// Imports the D3D11 copy fence as a timeline semaphore (a D3D11 fence is a D3D12 fence
+/// underneath, which is the handle type Vulkan names).
+#[cfg(windows)]
+fn import_fence(
+    device: &ash::Device,
+    ext: &ash::khr::external_semaphore_win32::Device,
+    d3d: &super::d3d::Bridge,
+) -> Result<vk::Semaphore> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = d3d.fence_handle()?;
+    let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+    // SAFETY: valid create info.
+    let sem = check(
+        unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None) },
+        "vkCreateSemaphore (timeline)",
+    )?;
+    let info = vk::ImportSemaphoreWin32HandleInfoKHR::default()
+        .semaphore(sem)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::D3D12_FENCE)
+        .handle(handle.as_raw_handle() as _);
+    // SAFETY: valid semaphore and NT handle; Vulkan does not take ownership of the handle.
+    match unsafe { ext.import_semaphore_win32_handle(&info) } {
+        Ok(()) => Ok(sem),
+        Err(e) => {
+            // SAFETY: unused semaphore.
+            unsafe { device.destroy_semaphore(sem, None) };
+            Err(format!("cannot import the D3D11 copy fence: {e:?}"))
+        }
+    }
+}
+
 impl Drop for Context {
     fn drop(&mut self) {
         if self.lost.get() {
@@ -323,6 +442,10 @@ impl Drop for Context {
         // (they borrow the context).
         unsafe {
             let _ = self.device.device_wait_idle();
+            #[cfg(windows)]
+            if let Some(s) = self.copied {
+                self.device.destroy_semaphore(s, None);
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }

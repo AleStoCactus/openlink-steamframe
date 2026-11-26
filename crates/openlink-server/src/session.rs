@@ -172,9 +172,9 @@ impl Session {
         status: Arc<Mutex<Status>>,
         settings: Arc<Mutex<Settings>>,
     ) -> std::io::Result<Self> {
-        let headset_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, proto::SERVER_PORT))?;
+        let headset_sock = openlink_protocol::net::bind_udp((Ipv4Addr::UNSPECIFIED, proto::SERVER_PORT))?;
         headset_sock.set_read_timeout(Some(Duration::from_millis(10)))?;
-        let driver_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT))?;
+        let driver_sock = openlink_protocol::net::bind_udp((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT))?;
         let video_sock = headset_sock.try_clone()?;
         set_send_buffer(&video_sock, 8 << 20);
         driver_sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -249,7 +249,19 @@ fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
             log::warn!("cannot enlarge the UDP send buffer: {}", std::io::Error::last_os_error());
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{setsockopt, SOCKET, SOL_SOCKET, SO_SNDBUF};
+        // SAFETY: valid socket and option value.
+        let r = unsafe {
+            setsockopt(SOCKET(sock.as_raw_socket() as usize), SOL_SOCKET, SO_SNDBUF, Some(&bytes.to_ne_bytes()))
+        };
+        if r != 0 {
+            log::warn!("cannot enlarge the UDP send buffer: {}", std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = (sock, bytes);
 }
 

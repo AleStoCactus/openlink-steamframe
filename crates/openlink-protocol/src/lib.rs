@@ -10,24 +10,24 @@
 //!
 //! * **audio**, both ways on the headset socket: [`audio`] (game audio to the headset, its
 //!   microphone back).
-//! * **driver -> server video** (Linux): [`video_ipc`], a Unix socket carrying the compositor's
-//!   dmabufs and per-frame metadata.
+//! * **driver -> server video**: [`video_ipc`], the compositor's textures (dmabufs on Linux,
+//!   D3D11 shared textures on Windows) and per-frame metadata.
 //!
 //! Every datagram is `[MAGIC: 4][PROTOCOL_VERSION: u16 LE][postcard payload]`.
 
 pub mod audio;
 pub mod clock;
 pub mod foveation;
+pub mod net;
 pub mod time;
 pub mod video;
-#[cfg(target_os = "linux")]
 pub mod video_ipc;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 /// [`HeadsetInfo::high_refresh_rates`] by model name, for the headset to probe before it has a
 /// `HeadsetInfo`.
