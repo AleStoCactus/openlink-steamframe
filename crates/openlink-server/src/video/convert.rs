@@ -385,6 +385,35 @@ impl Converter {
         }
     }
 
+    /// Records a copy of the luma plane (as written by the last [`Self::record`]) into
+    /// `buffer`, tightly packed (`width` bytes per row). For `--convert-selftest`.
+    pub fn record_luma_readback(&self, ctx: &Context, cmd: vk::CommandBuffer, buffer: vk::Buffer) {
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: self.width,
+            buffer_image_height: self.height,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D { width: self.width, height: self.height, depth: 1 },
+        };
+        // SAFETY: recording into a command buffer in the recording state; after `record` the
+        // plane is in TRANSFER_SRC_OPTIMAL, and the copy barrier there covers transfer reads.
+        unsafe {
+            ctx.device.cmd_copy_image_to_buffer(
+                cmd,
+                self.y.image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[region],
+            )
+        };
+    }
+
     pub fn destroy(self, ctx: &Context) {
         let d = &ctx.device;
         // SAFETY: the caller guarantees the GPU is idle.

@@ -2,8 +2,8 @@
 //!
 //! Runs the headset session in the background and shows a settings/status window.
 //! `openlink --headless` runs the session without a window (for servers or debugging).
-//! While a headset is connected, "OpenLink" output and input devices carry its audio.
-//! `openlink --dump-video PATH` (Linux) also writes every encoded frame to PATH as raw H.265.
+//! While a headset is connected, its audio reaches the PC (see [`audio`]).
+//! `openlink --dump-video PATH` also writes every encoded frame to PATH as raw H.265.
 
 mod adapter;
 mod audio;
@@ -11,7 +11,7 @@ mod config;
 mod encoder;
 mod gui;
 mod session;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod video;
 
 use config::Settings;
@@ -23,10 +23,18 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let headless = args.iter().any(|a| a == "--headless");
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     if let Some(i) = args.iter().position(|a| a == "--encode-selftest") {
         if let Err(e) = video::selftest(&args[i + 1..]) {
             log::error!("selftest: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(any(target_os = "linux", windows))]
+    if let Some(i) = args.iter().position(|a| a == "--convert-selftest") {
+        if let Err(e) = video::convert_selftest(&args[i + 1..]) {
+            log::error!("convert selftest: {e}");
             std::process::exit(1);
         }
         return;
@@ -46,7 +54,7 @@ fn main() {
         }
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     let _video = {
         let dump = args
             .iter()
@@ -64,7 +72,7 @@ fn main() {
     };
 
     let _audio = session.as_ref().and_then(|s| s.link().ok()).and_then(|link| {
-        audio::AudioService::start(link).map_err(|e| log::error!("cannot start audio: {e}")).ok()
+        audio::AudioService::start(link, settings.clone()).map_err(|e| log::error!("cannot start audio: {e}")).ok()
     });
 
     if headless {

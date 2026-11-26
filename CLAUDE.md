@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 OpenLink streams SteamVR to standalone headsets (Quest first) so they behave like a native SteamVR
 headset. Rust workspace, GPL-3.0, a new codebase (not derived from ALVR). Linux is the development
-platform; Windows is an equal target, so platform code sits behind `cfg` with Windows in mind.
+platform; Windows is an equal target and works with the same pipeline, so platform code sits
+behind `cfg` and every change must keep both building.
 
 ## Commands
 
@@ -31,10 +32,30 @@ adb logcat -s OpenLink
   bump**: the installed driver silently ignores messages of another version.
 - `scripts/build-quest.sh` only builds the Android lib; `target/release/openlink` can be stale.
 - Server debug: `openlink --dump-video out.h265`, `openlink --encode-selftest 4128x2208 600 out.h265`.
+  `openlink --convert-selftest SRC.rgba 5710x6172 2064x2208 out.gray` runs the downscale alone
+  (compare with `ffmpeg ... scale=...:flags=lanczos` for sharpness).
 - Quest debug properties (`adb shell setprop …`): `debug.openlink.server <ip>` (skip LAN discovery),
-  `debug.openlink.freeze 1`, `debug.openlink.swap_eyes 1`.
+  `debug.openlink.freeze 1`, `debug.openlink.swap_eyes 1`,
+  `debug.openlink.layer_filter none|sharpen|supersample|quality-supersample` (default: quality
+  sharpening by the Quest compositor; read live).
 - Server build needs PipeWire headers and clang (pipewire crate, bindgen); the video path needs
   a GPU with Vulkan Video H.265 encode.
+
+Windows (PowerShell; MSVC toolchain, Vulkan SDK for `glslc`, which `build.rs` also finds via
+`VULKAN_SDK`):
+
+```powershell
+scripts\install-driver.ps1                    # build + register the driver (SteamVR must be closed); -Remove unregisters
+scripts\build-quest.ps1 [-Install]            # signed APK (SDK in ANDROID_HOME or %LOCALAPPDATA%\Android\Sdk)
+Start-Process steam://run/250820              # SteamVR
+cargo check --target x86_64-unknown-linux-gnu -p openlink-protocol -p openlink-driver -p openlink-client   # Linux type-check
+```
+
+- SteamVR logs: `%ProgramFiles(x86)%\Steam\logs\vrserver.txt`. Validation:
+  `$env:VK_INSTANCE_LAYERS='VK_LAYER_KHRONOS_validation'`.
+- The server cannot be checked for Linux from Windows (PipeWire headers), and vice versa the
+  Windows code cannot be checked from Linux without the MSVC target; say so when a change was
+  only built on one.
 
 ## Architecture
 
@@ -69,10 +90,26 @@ Quest app (openlink-quest + openlink-client)  ──UDP 9757──  server `open
   (`render_pose.rs` corrects SteamVR's one-frame-stale compositor pose) and the Quest reprojects
   from it. The headset reports display timing back so the server paces SteamVR's vsync and
   photon latency to it.
+- **Video (Windows)**: same component, but the driver creates D3D11 textures with legacy shared
+  handles (`direct_mode/windows.rs`; Linux allocation is in `direct_mode/linux.rs`) and signals
+  a shared `ID3D11Fence` per frame after acquiring SteamVR's sync texture. `video_ipc` runs over
+  loopback TCP 9760. The server opens the textures with D3D11 and copies each frame into
+  NT-handle textures imported into Vulkan (`video/d3d.rs`). AMD's Windows driver needs the
+  session reset in the first frame's coding scope, ignores Vulkan's bitrate (so on Windows
+  `encode.rs` sets QP per frame through CBR's min/max QP, `SoftRateControl`; its constant-QP
+  mode is 3x slower) and always writes SAO slice syntax (so the SPS enables SAO). Windows
+  pipelines encodes (`encode::PIPELINED`: two source images, a finisher thread). Never time
+  `--encode-selftest` while a stream is running: both share the video engine. Check any encoder change's output with FFmpeg
+  (`ffmpeg -err_detect +bitstream -i out.h265 -f null -`): the Quest decoder only says
+  "Unsupported input buffer".
 - **Audio**: 48 kHz s16 PCM in 5 ms datagrams both ways, with an adaptive `JitterBuffer`
   (`protocol/src/audio.rs`) on each receiver. Linux server creates PipeWire `Audio/Sink` and
   `Audio/Source` streams named "OpenLink" only while a headset is connected
-  (`server/src/audio/pipewire.rs`); platform-neutral logic is in `audio::Bridge`; Windows is a stub.
+  (`server/src/audio/pipewire.rs`); platform-neutral logic is in `audio::Bridge`. Windows
+  (`audio/windows.rs`, WASAPI) cannot create devices: it loopback-captures the default output
+  and plays the mic into a virtual cable (`Settings::microphone_device`).
+- UDP sockets are bound with `protocol::net::bind_udp`: on Windows it disables
+  `SIO_UDP_CONNRESET`, without which a send to a not-yet-running peer fails the next receive.
   Quest uses AAudio (`quest/src/audio.rs`) and requests `RECORD_AUDIO` via JNI.
 - **Headset client** (`openlink-client`) is platform-independent: the `TrackingSource` trait is the
   seam between the OpenXR implementation (`openlink-quest/src/tracking.rs`) and `mock-headset`,
@@ -84,4 +121,5 @@ Quest app (openlink-quest + openlink-client)  ──UDP 9757──  server `open
 
 - Comments and docs explain *why* (measurements, SteamVR quirks) in full sentences; keep that
   style, and update `README.md`'s status table and `docs/ARCHITECTURE.md` when behaviour changes.
-- Linux-only modules are gated with `#[cfg(target_os = "linux")]`; keep Windows builds possible.
+- Linux-only modules are gated with `#[cfg(target_os = "linux")]`, Windows-only with
+  `#[cfg(windows)]`; code both platforms share is gated `any(target_os = "linux", windows)`.

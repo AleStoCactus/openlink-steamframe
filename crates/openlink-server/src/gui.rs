@@ -47,9 +47,12 @@ mod palette {
 }
 use palette::*;
 
-const RESOLUTION_HELP: &str = "Streamed resolution, relative to the headset's panel. SteamVR's 100% is \
-     this size enlarged for the headset's lens, so it matches the stream's sharpness at the center of view \
-     (as with other headsets, it is larger than the panel); change the render resolution in SteamVR's \
+const RESOLUTION_HELP: &str = "Streamed resolution, relative to the headset's panel. The lens magnifies \
+     the center of view less than the edges, so there the panel shows more detail than a panel-sized \
+     picture carries: at 100% the center is softer than the headset can show, and it matches the panel at \
+     the \"sharp center\" value (Quest 3: about 155%, as other streamers send). Pair a high value with \
+     foveated encoding, which keeps the center at this resolution and encodes fewer pixels toward the \
+     edges. SteamVR's 100% is this size enlarged for the lens; change the render resolution in SteamVR's \
      settings. Saving a new value while a headset is connected restarts SteamVR, which only picks up a new \
      size when it starts.";
 const FOVEATION_HELP: &str = "How much of each eye's width and height, around the center of the lens, is \
@@ -376,15 +379,20 @@ impl App {
             None => format!("{}% of the panel", d.resolution_percent),
         };
         card(open, ui, Head::new("Encoded resolution", subtitle, Icon::Frame, TEAL), None, |ui| {
-            wide_slider(ui, egui::Slider::new(&mut d.resolution_percent, 50..=150).step_by(5.0).suffix("%"));
+            wide_slider(ui, egui::Slider::new(&mut d.resolution_percent, 50..=200).step_by(5.0).suffix("%"));
             match headset {
                 Some(info) => {
                     let (w, h) = info.encoded_size(d.resolution_percent);
                     let (rw, rh) = info.render_size((w, h));
                     let (pw, ph) = info.panel_size();
+                    // Where the stream matches the panel's density at the center of view.
+                    let (sx, sy) = info.lens_scale();
+                    let sharp = (sx.max(sy) * 100.0 / 5.0).ceil() * 5.0;
+                    let sharp_color = if d.resolution_percent as f32 >= sharp { TEAL } else { TEXT };
                     kv(ui, "Per eye", value(format!("{w} × {h}"), TEXT));
                     kv(ui, "Panel", value(format!("{pw} × {ph}"), TEXT_DIM));
                     kv(ui, "SteamVR 100%", value(format!("{rw} × {rh}"), TEXT));
+                    kv(ui, "Sharp center", value(format!("{sharp:.0}%"), sharp_color));
                 }
                 None => help(ui, "Connect a headset to see the size."),
             }
@@ -486,24 +494,28 @@ impl App {
             (false, false) => "Off".to_string(),
         };
 
-        let s = subtitle(a.speakers, d.speakers, "\"OpenLink\" output device ready");
+        // Windows cannot create devices: there the speakers capture the default output and the
+        // microphone plays into a virtual cable, so "ready" means streaming.
+        let ready = |device: &'static str| if cfg!(windows) { "Streaming" } else { device };
+
+        let s = subtitle(a.speakers, d.speakers, ready("\"OpenLink\" output device ready"));
         card(open, ui, Head::new("Headset speakers", s, Icon::Speaker, TEAL), Some(&mut d.speakers), |ui| {
             meter(ui, meters.speakers, a.speakers).on_hover_text("Sound being sent to the headset");
-            help(
-                ui,
-                "Adds an \"OpenLink\" output device; what plays on it is heard in the headset. Applies on the \
-                 next connection.",
-            );
+            help(ui, &format!("{}. Applies on the next connection.", crate::audio::SPEAKERS_HINT));
         });
 
-        let s = subtitle(a.microphone, d.microphone, "\"OpenLink\" microphone ready");
+        let s = subtitle(a.microphone, d.microphone, ready("\"OpenLink\" microphone ready"));
         card(open, ui, Head::new("Headset microphone", s, Icon::Mic, BLUE), Some(&mut d.microphone), |ui| {
             meter(ui, meters.microphone, a.microphone).on_hover_text("Sound arriving from the headset's microphone");
-            help(
-                ui,
-                "Adds an \"OpenLink\" input device carrying the headset's microphone. Applies on the next \
-                 connection.",
-            );
+            if cfg!(windows) {
+                row(ui, "Plays into", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut d.microphone_device).desired_width(190.0)).on_hover_text(
+                        "An output device, by (part of) its name: a virtual audio cable such as VB-CABLE's \
+                         \"CABLE Input\". Choose its other end as the microphone in games.",
+                    );
+                });
+            }
+            help(ui, &format!("{}. Applies on the next connection.", crate::audio::MICROPHONE_HINT));
         });
 
         if let Some(e) = &a.error {
@@ -690,12 +702,12 @@ fn link_card(ui: &mut Ui, st: &Status) {
         }
         let a = &st.audio;
         let audio = match (a.speakers, a.microphone) {
-            (true, true) => value("output + microphone", TEAL),
-            (true, false) => value("output", TEAL),
+            (true, true) => value("speakers + microphone", TEAL),
+            (true, false) => value("speakers", TEAL),
             (false, true) => value("microphone", TEAL),
             (false, false) => value("off", TEXT_FAINT),
         };
-        kv(ui, "Audio devices", audio);
+        kv(ui, "Audio", audio);
     });
 }
 

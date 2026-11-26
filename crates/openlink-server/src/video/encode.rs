@@ -5,6 +5,10 @@
 //! implementation offers it, with a VBV of about one and a half frames so a frame's size stays
 //! close to the average.
 //!
+//! On Windows the encoder runs at a constant QP chosen per frame by [`SoftRateControl`]
+//! instead: AMD's Windows driver accepts CBR and VBR but encodes at its default QP whatever
+//! the bitrate (measured: identical streams at 20 and 200 Mbit/s).
+//!
 //! The implementation writes the slice NAL units; VPS/SPS/PPS come from
 //! `vkGetEncodedVideoSessionParametersKHR` and are prepended to every IDR.
 
@@ -16,6 +20,149 @@ use ash::vk::native::*;
 
 const NO_REFERENCE_PICTURE: u8 = 0xFF;
 const BITSTREAM_SIZE: u64 = 16 << 20;
+/// Reset the session in the first frame's command buffer instead of a submission of its own.
+/// AMD's Windows driver needs this: after a reset submitted alone, every encode completes
+/// without encoding (its feedback query never becomes available). RADV is happy either way, and
+/// keeps the separate reset it was developed with.
+const RESET_WITH_FIRST_FRAME: bool = cfg!(windows);
+/// Rate control by choosing each frame's QP ourselves ([`SoftRateControl`]): AMD's Windows
+/// driver accepts CBR's bitrate but ignores it. The QP is passed as the CBR layer's minimum and
+/// maximum QP, which it does honour. (Its constant-QP mode would be the obvious way, but it
+/// encodes about three times slower there: 9.9 instead of 3.3 ms for 2176x1152.)
+const SOFTWARE_RATE_CONTROL: bool = cfg!(windows);
+
+/// Convert the next frame while the current one encodes ([`Encoder::submit`] and
+/// [`Pending::finish`] on another thread), with two source images. On AMD's Windows driver a
+/// full-size Quest 3 frame (4160x2208) takes 10.3 ms to encode, which with the 1-1.6 ms convert
+/// did not fit a 90 Hz frame done one after the other (82 fps). Linux encodes in sequence.
+pub const PIPELINED: bool = cfg!(windows);
+
+/// An encode in flight, finished with [`Pending::finish`] (on any thread).
+pub struct Pending {
+    device: ash::Device,
+    fence: vk::Fence,
+    query_pool: vk::QueryPool,
+    bitstream: *const u8,
+    /// VPS/SPS/PPS to put in front, for an IDR.
+    headers: Option<Vec<u8>>,
+    pub idr: bool,
+    pub submitted: std::time::Instant,
+}
+
+// SAFETY: Vulkan handles and a pointer into persistently mapped memory. Only one thread uses
+// them at a time: the encoder does not submit again (or get destroyed) before the pending
+// encode is finished.
+unsafe impl Send for Pending {}
+
+pub struct FinishError {
+    pub message: String,
+    /// The GPU timed out or the device was lost.
+    pub lost: bool,
+}
+
+impl Pending {
+    /// Waits for the encode (bounded) and returns its Annex B bitstream.
+    pub fn finish(self) -> std::result::Result<Vec<u8>, FinishError> {
+        let d = &self.device;
+        let fail = |message: String, lost: bool| FinishError { message, lost };
+        // SAFETY: our fence, query pool and mapped bitstream (see `Send` above).
+        unsafe {
+            match d.wait_for_fences(&[self.fence], true, super::vk::GPU_TIMEOUT_NS) {
+                Ok(()) => d.reset_fences(&[self.fence]).map_err(|e| fail(format!("vkResetFences: {e:?}"), false))?,
+                Err(e) => {
+                    let lost = matches!(e, vk::Result::TIMEOUT | vk::Result::ERROR_DEVICE_LOST);
+                    return Err(fail(format!("encode: {e:?}"), lost));
+                }
+            }
+            // No WAIT: the fence has signalled, so the feedback is written or never will be
+            // (RADV busy-polls for it, and gives up only after its own long timeout).
+            // One element = one query: ash passes the slice length as the query count.
+            let mut result = [Feedback::default()];
+            d.get_query_pool_results(self.query_pool, 0, &mut result, vk::QueryResultFlags::WITH_STATUS_KHR)
+                .map_err(|e| fail(format!("vkGetQueryPoolResults (encode feedback): {e:?}"), false))?;
+            let Feedback { offset, size, status } = result[0];
+            if status <= 0 {
+                return Err(fail(format!("encode failed with query status {status}"), false));
+            }
+            let headers = self.headers.unwrap_or_default();
+            let mut out = Vec::with_capacity(size as usize + headers.len());
+            out.extend_from_slice(&headers);
+            out.extend_from_slice(std::slice::from_raw_parts(self.bitstream.add(offset as usize), size as usize));
+            Ok(out)
+        }
+    }
+}
+
+/// Encode quality level. On AMD's Windows driver (4 levels), 1 is as fast as 0 and better:
+/// +0.35 dB PSNR at the same bitrate (2144x1148 test pattern, 20 Mbit/s, 3.3 ms either way);
+/// 2 and 3 cost 25% more time for no gain over 1. RADV keeps its default.
+const QUALITY_LEVEL: u32 = if cfg!(windows) { 1 } else { 0 };
+
+/// Layer QP limits: both at `qp`, or none.
+fn qp_limit_layer(qp: Option<i32>) -> vk::VideoEncodeH265RateControlLayerInfoKHR<'static> {
+    let q = qp.unwrap_or(0);
+    let qps = vk::VideoEncodeH265QpKHR { qp_i: q, qp_p: q, qp_b: q };
+    vk::VideoEncodeH265RateControlLayerInfoKHR::default()
+        .use_min_qp(qp.is_some())
+        .min_qp(qps)
+        .use_max_qp(qp.is_some())
+        .max_qp(qps)
+}
+
+fn same_qp_limits(a: &vk::VideoEncodeH265RateControlLayerInfoKHR, b: &vk::VideoEncodeH265RateControlLayerInfoKHR) -> bool {
+    a.use_min_qp == b.use_min_qp && a.use_max_qp == b.use_max_qp && a.min_qp.qp_p == b.min_qp.qp_p && a.max_qp.qp_p == b.max_qp.qp_p
+}
+
+/// Rate control from the outside: constant QP per frame, adjusted after each frame by how far
+/// its size and a VBV-like budget are from the target.
+struct SoftRateControl {
+    /// Bytes per frame at the target bitrate.
+    target: f64,
+    /// Bytes the stream may run ahead of the target (the VBV).
+    budget: f64,
+    /// Bytes sent beyond the target so far, drained at the target rate (never negative).
+    excess: f64,
+    qp: f64,
+    min_qp: f64,
+    max_qp: f64,
+}
+
+impl SoftRateControl {
+    fn new(bitrate_bps: u64, fps: f32, vbv_ms: u32, min_qp: i32, max_qp: i32) -> Self {
+        let target = bitrate_bps as f64 / 8.0 / fps.max(1.0) as f64;
+        Self {
+            target,
+            budget: (bitrate_bps as f64 / 8.0 * vbv_ms as f64 / 1000.0).max(target),
+            excess: 0.0,
+            // A typical starting point; the first frames correct it.
+            qp: 28.0f64.clamp(min_qp as f64, max_qp as f64),
+            // Low enough that the bitrate asked for is spent (at 18, a Quest 3 stream used a
+            // quarter of 180 Mbit/s and looked softer than RADV's CBR at the same setting);
+            // below this the bits buy nothing visible.
+            min_qp: (min_qp as f64).max(10.0),
+            max_qp: max_qp as f64,
+        }
+    }
+
+    fn qp(&self) -> i32 {
+        self.qp.round() as i32
+    }
+
+    /// A frame of `bytes` was encoded at [`Self::qp`]; choose the next QP. Every 6 QP halves
+    /// the size, so the frame's distance from the target is `6 * log2(bytes / target)` QP.
+    /// Half of that is applied (scene changes would otherwise make it oscillate), plus a push
+    /// from the excess so the average holds. IDRs are excluded from the size term: they are
+    /// meant to be large, and only their excess has to be paid back.
+    fn update(&mut self, bytes: usize, idr: bool) {
+        let bytes = bytes.max(1) as f64;
+        self.excess = (self.excess + bytes - self.target).max(0.0);
+        let size_term = if idr { 0.0 } else { 0.5 * 6.0 * (bytes / self.target).log2() };
+        let excess_term = 3.0 * (self.excess / self.budget).min(2.0);
+        // Down slowly (a frame smaller than the target is often just a still moment), up fast.
+        let step = (size_term + excess_term).clamp(-1.0, 4.0);
+        self.qp = (self.qp + step).clamp(self.min_qp, self.max_qp);
+    }
+}
 /// `log2_max_pic_order_cnt_lsb_minus4` at its maximum: POC LSBs wrap every 65536 frames.
 /// (At 4, POC passed its 8-bit LSB range after 256 frames and the encode hung the GPU.)
 const LOG2_MAX_POC_LSB_MINUS4: u8 = 12;
@@ -216,9 +363,12 @@ pub struct Encoder {
     /// VPS + SPS + PPS, prepended to IDR frames.
     headers: Vec<u8>,
     /// NV12 source picture, written by the compute queue, read by the encode queue.
+    /// The image the next frame is converted into.
     pub src: vk::Image,
     src_memory: vk::DeviceMemory,
     src_view: vk::ImageView,
+    /// With [`PIPELINED`]: a second source image, swapped with `src` at each submit.
+    spare_src: Option<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
     dpb: vk::Image,
     dpb_memory: vk::DeviceMemory,
     dpb_views: [vk::ImageView; 2],
@@ -232,9 +382,15 @@ pub struct Encoder {
     fence: vk::Fence,
     rc_mode: vk::VideoEncodeRateControlModeFlagsKHR,
     rc_layer: vk::VideoEncodeRateControlLayerInfoKHR<'static>,
+    /// Windows: the QP limits in effect, chained to `rc_layer` (see [`SoftRateControl`]).
+    rc_layer_h265: vk::VideoEncodeH265RateControlLayerInfoKHR<'static>,
     rc_h265: vk::VideoEncodeH265RateControlInfoKHR<'static>,
     vbv_ms: u32,
     constant_qp: i32,
+    /// `VkVideoEncodeQualityLevelInfoKHR` level ([`QUALITY_LEVEL`]); 0 is the default.
+    quality_level: u32,
+    /// Windows: the QP of each frame, chosen here (see [`SOFTWARE_RATE_CONTROL`]).
+    soft_rc: Option<SoftRateControl>,
     pub layout: Layout,
     /// Frames since the last IDR.
     frame_in_gop: u32,
@@ -253,7 +409,7 @@ impl Encoder {
         let coded_width = align(align(cfg.width, 8), granularity.width.max(caps.encode.encode_input_picture_granularity.width));
         let coded_height = align(align(cfg.height, 8), granularity.height.max(caps.encode.encode_input_picture_granularity.height));
         log::info!(
-            "H.265 encode caps: coded {}x{}..{}x{}, granularity {}x{}, {} DPB slots, rate control {:?}, max level {}, ctb {:?}, qp {}..{}",
+            "H.265 encode caps: coded {}x{}..{}x{}, granularity {}x{}, {} DPB slots, rate control {:?}, max level {}, ctb {:?}, qp {}..{}, {} quality levels",
             caps.video.min_coded_extent.width,
             caps.video.min_coded_extent.height,
             caps.video.max_coded_extent.width,
@@ -266,6 +422,7 @@ impl Encoder {
             caps.h265.ctb_sizes,
             caps.h265.min_qp,
             caps.h265.max_qp,
+            caps.encode.max_quality_levels,
         );
         if coded_width > caps.video.max_coded_extent.width || coded_height > caps.video.max_coded_extent.height {
             return Err(format!(
@@ -396,6 +553,13 @@ impl Encoder {
         sps.flags.set_sps_temporal_id_nesting_flag(1);
         sps.flags.set_sps_sub_layer_ordering_info_present_flag(1);
         sps.flags.set_vui_parameters_present_flag(1);
+        // AMD's Windows driver writes SAO syntax into every slice header whatever the SPS says,
+        // so the SPS must say SAO is on or decoders misparse every slice after the SAO flags
+        // (FFmpeg: "alignment_bit_equal_to_one=0"; the Quest shows nothing). RADV follows the
+        // SPS and keeps SAO off.
+        if cfg!(windows) {
+            sps.flags.set_sample_adaptive_offset_enabled_flag(1);
+        }
         sps.chroma_format_idc = StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420;
         sps.pic_width_in_luma_samples = coded_width;
         sps.pic_height_in_luma_samples = coded_height;
@@ -443,6 +607,8 @@ impl Encoder {
         if qp_plan.is_some() {
             h265_params.p_next = (&raw const qp_params).cast();
         }
+        let quality_level = QUALITY_LEVEL.min(caps.encode.max_quality_levels.saturating_sub(1));
+        let mut quality_info = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(quality_level);
         let params_info = vk::VideoSessionParametersCreateInfoKHR::default()
             .video_session(session)
             .flags(if qp_plan.is_some() {
@@ -451,6 +617,8 @@ impl Encoder {
                 vk::VideoSessionParametersCreateFlagsKHR::empty()
             })
             .push_next(&mut h265_params);
+        // Parameters must be made for the quality level the session runs at.
+        let params_info = if quality_level != 0 { params_info.push_next(&mut quality_info) } else { params_info };
         let mut params = vk::VideoSessionParametersKHR::null();
         // SAFETY: valid create info; the std structs outlive the call.
         check(
@@ -539,6 +707,16 @@ impl Encoder {
             let query_pool = check(d.create_query_pool(&qp_info, None), "vkCreateQueryPool")?;
             (src, src_memory, src_view, dpb, dpb_memory, dpb_views, bitstream, bitstream_memory, bitstream_ptr, query_pool)
         };
+        let spare_src = if PIPELINED {
+            // SAFETY: as above.
+            unsafe {
+                let image = check(d.create_image(&src_info, None), "vkCreateImage (encode src)")?;
+                let memory = ctx.bind_image_memory(image, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+                Some((image, memory, view(image, 0)?))
+            }
+        } else {
+            None
+        };
 
         let qp_map = match qp_plan {
             Some((format, _, extent, deltas)) => Some(create_qp_map(ctx, &profile, format, extent, &deltas)?),
@@ -565,19 +743,32 @@ impl Encoder {
             .max_bitrate(bitrate)
             .frame_rate_numerator(fps_milli)
             .frame_rate_denominator(1000);
+        // A flat reference pattern (every P frame refers to the previous one) is a hint that the
+        // spec allows only together with REGULAR_GOP, which on-demand IDRs break. RADV ignores
+        // the invalid combination; AMD's Windows driver is not given it.
+        let rc_flags = if cfg!(windows) {
+            vk::VideoEncodeH265RateControlFlagsKHR::empty()
+        } else {
+            vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT
+        };
         let rc_h265 = vk::VideoEncodeH265RateControlInfoKHR::default()
-            .flags(vk::VideoEncodeH265RateControlFlagsKHR::REFERENCE_PATTERN_FLAT)
+            .flags(rc_flags)
             .gop_frame_count(0)
             .idr_period(0)
             .consecutive_b_frame_count(0)
             .sub_layer_count(1);
         let vbv_ms = ((1500.0 / cfg.fps).ceil() as u32).max(1);
         log::info!(
-            "H.265 encoder: {}x{} (coded {coded_width}x{coded_height}) @ {} fps, {:.0} Mbit/s, rate control {rc_mode:?}, VBV {vbv_ms} ms",
+            "H.265 encoder: {}x{} (coded {coded_width}x{coded_height}) @ {} fps, {:.0} Mbit/s, rate control {}, VBV {vbv_ms} ms",
             cfg.width,
             cfg.height,
             cfg.fps,
-            bitrate as f64 / 1e6
+            bitrate as f64 / 1e6,
+            if SOFTWARE_RATE_CONTROL {
+                format!("{rc_mode:?} with the QP set per frame")
+            } else {
+                format!("{rc_mode:?}")
+            }
         );
 
         let mut enc = Self {
@@ -589,6 +780,7 @@ impl Encoder {
             src,
             src_memory,
             src_view,
+            spare_src,
             dpb,
             dpb_memory,
             dpb_views,
@@ -602,15 +794,21 @@ impl Encoder {
             fence,
             rc_mode,
             rc_layer,
+            rc_layer_h265: qp_limit_layer(None),
             rc_h265,
             vbv_ms,
             constant_qp: 26.clamp(caps.h265.min_qp, caps.h265.max_qp),
+            quality_level,
+            soft_rc: SOFTWARE_RATE_CONTROL
+                .then(|| SoftRateControl::new(bitrate, cfg.fps, vbv_ms, caps.h265.min_qp, caps.h265.max_qp)),
             layout: Layout { coded_width, coded_height },
             frame_in_gop: 0,
             idr_requested: true,
             dpb_initialised: false,
         };
-        enc.reset(ctx)?;
+        if !RESET_WITH_FIRST_FRAME {
+            enc.reset(ctx)?;
+        }
         Ok(enc)
     }
 
@@ -665,10 +863,10 @@ impl Encoder {
         Ok(())
     }
 
-    /// Encodes the picture in `src` (in `TRANSFER_DST_OPTIMAL`, written by work that signals
-    /// `wait`) and returns the Annex B bitstream and whether it is an IDR. Blocks until the
-    /// GPU is done.
-    pub fn encode(&mut self, ctx: &Context, wait: vk::Semaphore) -> Result<(Vec<u8>, bool)> {
+    /// Starts encoding the picture in `src` (in `TRANSFER_DST_OPTIMAL`, written by work that
+    /// signals `wait`). The result must be collected with [`Pending::finish`] before the next
+    /// submit (they share the bitstream buffer, feedback query and fence).
+    pub fn submit(&mut self, ctx: &Context, wait: vk::Semaphore) -> Result<Pending> {
         let d = &ctx.device;
         let vq = &ctx.video_queue;
         let idr = std::mem::take(&mut self.idr_requested) || self.frame_in_gop == 0 || self.frame_in_gop >= MAX_GOP;
@@ -749,7 +947,7 @@ impl Encoder {
         slice.MaxNumMergeCand = 5;
         let mut nalu = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default().std_slice_segment_header(&slice);
         if self.rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
-            nalu.constant_qp = self.constant_qp;
+            nalu.constant_qp = self.soft_rc.as_ref().map_or(self.constant_qp, SoftRateControl::qp);
         }
         let nalus = [nalu];
         let h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
@@ -778,13 +976,44 @@ impl Encoder {
             encode_info.p_next = (&raw const qp_info).cast();
         }
 
-        let layers = [self.rc_layer];
+        // Software rate control in CBR mode: the frame's QP goes in as the layer's QP limits.
+        // `rc` is the rate control state in effect (what `begin` must state), `rc_next` this
+        // frame's; a change is applied with a control command inside the coding scope.
+        let qp_limits = self.soft_rc.as_ref().filter(|_| self.rc_mode != vk::VideoEncodeRateControlModeFlagsKHR::DISABLED);
+        let next_h265 = qp_limits.map_or(self.rc_layer_h265, |rc| qp_limit_layer(Some(rc.qp())));
+        let (mut layer, mut layer_next) = (self.rc_layer, self.rc_layer);
+        if qp_limits.is_some() {
+            layer.p_next = (&raw const self.rc_layer_h265).cast();
+            layer_next.p_next = (&raw const next_h265).cast();
+        }
+        let (layers, layers_next) = ([layer], [layer_next]);
         let rc = self.rate_control_info(&layers);
+        let rc_next = self.rate_control_info(&layers_next);
         let mut begin = vk::VideoBeginCodingInfoKHR::default()
             .video_session(self.session)
             .video_session_parameters(self.params)
             .reference_slots(begin_slots);
-        begin.p_next = (&raw const rc).cast();
+        // Reset in this command buffer (see `RESET_WITH_FIRST_FRAME`): the session has no rate
+        // control state yet, so begin without one and set it with the reset.
+        let reset_here = RESET_WITH_FIRST_FRAME && !self.dpb_initialised;
+        if !reset_here {
+            begin.p_next = (&raw const rc).cast();
+        }
+        let control_flags = if reset_here {
+            vk::VideoCodingControlFlagsKHR::RESET | vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+        } else if qp_limits.is_some() && !same_qp_limits(&next_h265, &self.rc_layer_h265) {
+            vk::VideoCodingControlFlagsKHR::ENCODE_RATE_CONTROL
+        } else {
+            vk::VideoCodingControlFlagsKHR::empty()
+        };
+        let mut control = vk::VideoCodingControlInfoKHR::default().flags(control_flags);
+        control.p_next = (&raw const rc_next).cast();
+        let mut quality = vk::VideoEncodeQualityLevelInfoKHR::default().quality_level(self.quality_level);
+        quality.p_next = (&raw const rc_next).cast();
+        if reset_here && self.quality_level != 0 {
+            control.flags |= vk::VideoCodingControlFlagsKHR::ENCODE_QUALITY_LEVEL;
+            control.p_next = (&raw const quality).cast();
+        }
 
         let src_barrier = vk::ImageMemoryBarrier2::default()
             .image(self.src)
@@ -835,6 +1064,10 @@ impl Encoder {
                 &vk::DependencyInfo::default().image_memory_barriers(if first { barriers_first } else { &barriers }),
             );
             (vq.cmd_begin_video_coding_khr)(self.cmd, &begin);
+            if !control_flags.is_empty() {
+                (vq.cmd_control_video_coding_khr)(self.cmd, &control);
+            }
+            self.rc_layer_h265 = next_h265;
             d.cmd_begin_query(self.cmd, self.query_pool, 0, vk::QueryControlFlags::empty());
             (ctx.video_encode.cmd_encode_video_khr)(self.cmd, &encode_info);
             d.cmd_end_query(self.cmd, self.query_pool, 0);
@@ -849,27 +1082,44 @@ impl Encoder {
                 .wait_semaphores(&waits)
                 .wait_dst_stage_mask(&stages);
             check(d.queue_submit(ctx.encode_queue, &[submit], self.fence), "vkQueueSubmit (encode)")?;
-            ctx.wait_fence(self.fence, "encode")?;
+        }
+        self.frame_in_gop += 1;
+        // The next frame is converted into the other source image while this one encodes.
+        if let Some(spare) = &mut self.spare_src {
+            std::mem::swap(&mut self.src, &mut spare.0);
+            std::mem::swap(&mut self.src_memory, &mut spare.1);
+            std::mem::swap(&mut self.src_view, &mut spare.2);
+        }
+        Ok(Pending {
+            device: d.clone(),
+            fence: self.fence,
+            query_pool: self.query_pool,
+            bitstream: self.bitstream_ptr,
+            headers: idr.then(|| self.headers.clone()),
+            idr,
+            submitted: std::time::Instant::now(),
+        })
+    }
 
-            // No WAIT: the fence has signalled, so the feedback is written or never will be
-            // (RADV busy-polls for it, and gives up only after its own long timeout).
-            // One element = one query: ash passes the slice length as the query count.
-            let mut result = [Feedback::default()];
-            check(
-                d.get_query_pool_results(self.query_pool, 0, &mut result, vk::QueryResultFlags::WITH_STATUS_KHR),
-                "vkGetQueryPoolResults (encode feedback)",
-            )?;
-            let Feedback { offset, size, status } = result[0];
-            if status <= 0 {
-                return Err(format!("encode failed with query status {status}"));
+    /// [`Self::submit`] and [`Pending::finish`]: encodes the picture in `src` and returns the
+    /// Annex B bitstream and whether it is an IDR. Blocks until the GPU is done.
+    pub fn encode(&mut self, ctx: &Context, wait: vk::Semaphore) -> Result<(Vec<u8>, bool)> {
+        let pending = self.submit(ctx, wait)?;
+        let idr = pending.idr;
+        let out = pending.finish().map_err(|e| {
+            if e.lost {
+                ctx.mark_lost();
             }
-            let mut out = Vec::with_capacity(size as usize + if idr { self.headers.len() } else { 0 });
-            if idr {
-                out.extend_from_slice(&self.headers);
-            }
-            out.extend_from_slice(std::slice::from_raw_parts(self.bitstream_ptr.add(offset as usize), size as usize));
-            self.frame_in_gop += 1;
-            Ok((out, idr))
+            e.message
+        })?;
+        self.finished(out.len(), idr);
+        Ok((out, idr))
+    }
+
+    /// A frame of `bytes` came out of the encoder (for rate control).
+    pub fn finished(&mut self, bytes: usize, idr: bool) {
+        if let Some(rc) = &mut self.soft_rc {
+            rc.update(bytes, idr);
         }
     }
 
@@ -878,6 +1128,11 @@ impl Encoder {
         let vq = &ctx.video_queue;
         // SAFETY: the caller guarantees the GPU is idle.
         unsafe {
+            if let Some((image, memory, view)) = self.spare_src {
+                d.destroy_image_view(view, None);
+                d.destroy_image(image, None);
+                d.free_memory(memory, None);
+            }
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
             d.destroy_query_pool(self.query_pool, None);

@@ -76,6 +76,7 @@ pub mod prop {
     pub const CurrentUniverseId_Uint64: i32 = 2004;
     pub const IsOnDesktop_Bool: i32 = 2007;
     pub const DriverDirectModeSendsVsyncEvents_Bool: i32 = 2043;
+    pub const GraphicsAdapterLuid_Uint64: i32 = 2045;
     pub const ControllerRoleHint_Int32: i32 = 3007;
     pub const ControllerType_String: i32 = 7000;
 }

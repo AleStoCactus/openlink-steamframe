@@ -13,21 +13,30 @@
 //! The driver also decides which texture of a swap set the compositor renders into next
 //! (`GetNextSwapTextureSetIndex`), and skips textures the encoder has not released yet.
 //!
-//! Windows: not wired up yet (needs D3D11 shared textures created by the driver).
+//! Windows: the driver creates every swap texture (the compositor's and applications') as a
+//! D3D11 texture with a legacy shared handle, which the server opens too; see [`platform`].
+//!
+//! Allocation and per-frame GPU sync are per platform ([`platform`]); choosing what to stream,
+//! texture bookkeeping and vsync are shared.
 
-use crate::gbm;
 use crate::host::host;
 use crate::ovr::*;
 use crate::video;
 use openlink_protocol::time::monotonic_ns;
-use openlink_protocol::video_ipc::{self as vipc, DmabufPlane, DmabufTexture};
+use openlink_protocol::video_ipc::{self as vipc, DriverVideoMsg, RawAttachment};
 use std::collections::VecDeque;
-use std::ffi::{c_void, CStr, CString};
-use std::os::fd::{AsRawFd, RawFd};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "linux")]
+#[path = "direct_mode/linux.rs"]
+pub(crate) mod platform;
+#[cfg(windows)]
+#[path = "direct_mode/windows.rs"]
+pub(crate) mod platform;
 
 #[repr(C)]
 pub struct DirectModeObj {
@@ -55,11 +64,7 @@ const SET_SIZE: usize = 3;
 
 struct Texture {
     handle: SharedTextureHandle_t,
-    /// `Some` when we allocated it with GBM (the compositor's own textures).
-    bo: Option<gbm::Bo>,
-    /// SteamVR's dmabuf for an image it allocated (applications' textures); its layout is in
-    /// the buffer's kernel metadata rather than a modifier.
-    shared: Option<std::os::fd::OwnedFd>,
+    mem: platform::TextureMem,
     /// Newest frame the server is still reading this texture for.
     busy: Option<u64>,
 }
@@ -75,43 +80,26 @@ struct TextureSet {
 
 impl TextureSet {
     fn streamable(&self) -> bool {
-        self.textures.iter().all(|t| t.bo.is_some() || t.shared.is_some())
+        self.textures.iter().all(|t| t.mem.streamable())
     }
 
-    /// The announcement for the server, and the fds that go with it.
-    fn announcement(&self, render_node: u64) -> Option<(vipc::TextureSet, Vec<RawFd>)> {
+    /// The announcement for the server, and what rides along with it (Linux: the fds).
+    fn announcement(&self, render_node: u64) -> Option<(vipc::TextureSet, Vec<RawAttachment>)> {
         if !self.streamable() {
             return None;
         }
-        let mut fds = Vec::new();
-        let textures = self
-            .textures
-            .iter()
-            .map(|t| match (&t.bo, &t.shared) {
-                (Some(bo), _) => {
-                    fds.extend(bo.planes.iter().map(|p| p.fd.as_raw_fd()));
-                    DmabufTexture {
-                        handle: t.handle,
-                        planes: bo.planes.iter().map(|p| DmabufPlane { offset: p.offset, stride: p.stride }).collect(),
-                    }
-                }
-                (None, Some(fd)) => {
-                    fds.push(fd.as_raw_fd());
-                    DmabufTexture { handle: t.handle, planes: vec![DmabufPlane { offset: 0, stride: 0 }] }
-                }
-                (None, None) => unreachable!("streamable() checked"),
-            })
-            .collect();
+        let mut attachments = Vec::new();
+        let textures = self.textures.iter().map(|t| t.mem.describe(t.handle, &mut attachments)).collect();
         let set = vipc::TextureSet {
             render_node,
             width: self.desc.nWidth,
             height: self.desc.nHeight,
             drm_format: self.drm_format,
-            modifier: self.textures[0].bo.as_ref().map_or(vipc::DRM_FORMAT_MOD_INVALID, |bo| bo.modifier),
+            modifier: self.textures[0].mem.modifier(),
             vk_format: self.desc.nFormat,
             textures,
         };
-        Some((set, fds))
+        Some((set, attachments))
     }
 }
 
@@ -127,12 +115,6 @@ pub struct CompositorStats {
     pub starved: u64,
 }
 
-enum Gbm {
-    Untried,
-    Failed,
-    Ready(gbm::Device),
-}
-
 struct Compositor {
     last_layer_shape: Option<Vec<bool>>,
     sets: Vec<TextureSet>,
@@ -140,7 +122,7 @@ struct Compositor {
     presents: VecDeque<Instant>,
     layer_counts: VecDeque<usize>,
     last_log: Option<Instant>,
-    gbm: Gbm,
+    gpu: platform::Gpu,
     next_frame_id: u64,
     frames_sent: u64,
     starved: u64,
@@ -163,7 +145,7 @@ impl Default for Compositor {
             presents: VecDeque::new(),
             layer_counts: VecDeque::new(),
             last_log: None,
-            gbm: Gbm::Untried,
+            gpu: platform::Gpu::default(),
             next_frame_id: 1,
             frames_sent: 0,
             starved: 0,
@@ -201,23 +183,30 @@ pub fn stats() -> CompositorStats {
     })
 }
 
-/// Called by [`crate::video`] when the server connects: `send` gets every current set, then
-/// `publish` runs, all under the compositor lock, so a set created meanwhile is either in the
-/// announcement or sent through the published channel, never neither.
-pub(crate) fn announce_all(send: &mut dyn FnMut(&vipc::TextureSet, &[RawFd]), publish: impl FnOnce()) {
+/// Called by [`crate::video`] when the server connects: `send` gets the platform's setup
+/// messages and every current set, then `publish` runs, all under the compositor lock, so a set
+/// created meanwhile is either in the announcement or sent through the published channel,
+/// never neither.
+pub(crate) fn announce_all(send: &mut dyn FnMut(&DriverVideoMsg, &[RawAttachment]), publish: impl FnOnce()) {
     with(|c| {
-        let rdev = match &c.gbm {
-            Gbm::Ready(d) => d.rdev(),
-            _ => 0,
-        };
+        for msg in c.gpu.connect_messages() {
+            send(&msg, &[]);
+        }
+        let rdev = c.gpu.render_node();
         for s in &mut c.sets {
             s.textures.iter_mut().for_each(|t| t.busy = None);
-            if let Some((set, fds)) = s.announcement(rdev) {
-                send(&set, &fds);
+            if let Some((set, attachments)) = s.announcement(rdev) {
+                send(&DriverVideoMsg::TextureSet(set), &attachments);
             }
         }
         publish();
     })
+}
+
+/// Windows: creates the D3D11 device, returning the adapter SteamVR must render on.
+#[cfg(windows)]
+pub(crate) fn adapter_luid() -> Option<u64> {
+    with(|c| c.gpu.init())
 }
 
 /// The server finished with `frame_id` (and every frame before it).
@@ -240,185 +229,6 @@ pub(crate) fn release_all() {
     })
 }
 
-const fn fourcc(s: &[u8; 4]) -> u32 {
-    u32::from_le_bytes(*s)
-}
-
-/// The DRM format with the same memory layout as a compositor `VkFormat`.
-fn drm_format_for(vk_format: u32) -> Option<u32> {
-    Some(match vk_format {
-        37 | 43 => fourcc(b"AB24"), // R8G8B8A8_UNORM / _SRGB
-        44 | 50 => fourcc(b"AR24"), // B8G8R8A8_UNORM / _SRGB
-        64 => fourcc(b"AB30"),      // A2B10G10R10_UNORM_PACK32
-        58 => fourcc(b"AR30"),      // A2R10G10B10_UNORM_PACK32
-        _ => return None,
-    })
-}
-
-/// The render node of the GPU SteamVR's compositor runs on: `OPENLINK_RENDER_NODE` if set,
-/// else the first node made by the vendor of the compositor's modifiers, else renderD128.
-/// With an integrated GPU beside a discrete one, renderD128 is often the integrated one,
-/// which can neither share buffers with the compositor nor encode.
-fn render_node(compositor_modifiers: &[u64]) -> CString {
-    const FALLBACK: &CStr = c"/dev/dri/renderD128";
-    if let Ok(path) = std::env::var("OPENLINK_RENDER_NODE") {
-        return CString::new(path).unwrap_or_else(|_| FALLBACK.into());
-    }
-    let Some(vendor) = pci_vendor_of(compositor_modifiers) else { return FALLBACK.into() };
-    let mut nodes: Vec<u32> = std::fs::read_dir("/sys/class/drm")
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix("renderD")?.parse().ok())
-        .collect();
-    nodes.sort_unstable();
-    nodes
-        .into_iter()
-        .find(|n| {
-            std::fs::read_to_string(format!("/sys/class/drm/renderD{n}/device/vendor"))
-                .is_ok_and(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16) == Ok(vendor))
-        })
-        .and_then(|n| CString::new(format!("/dev/dri/renderD{n}")).ok())
-        .unwrap_or_else(|| FALLBACK.into())
-}
-
-/// PCI vendor of the GPU that makes these modifiers, from the vendor byte of the first
-/// vendor-specific one (`fourcc_mod_code`). `None` if all are generic, such as LINEAR.
-fn pci_vendor_of(modifiers: &[u64]) -> Option<u32> {
-    modifiers.iter().find_map(|&m| match m >> 56 {
-        0x01 => Some(0x8086), // DRM_FORMAT_MOD_VENDOR_INTEL
-        0x02 => Some(0x1002), // DRM_FORMAT_MOD_VENDOR_AMD
-        0x03 => Some(0x10de), // DRM_FORMAT_MOD_VENDOR_NVIDIA
-        _ => None,
-    })
-}
-
-/// Allocates `desc` as dmabufs and imports them into SteamVR. `None` (with a log line) when
-/// this path is unavailable; the caller then falls back to SteamVR's own allocation.
-/// `allow_compression`: AMD DCC-compressed modifiers are fine for the compositor, but
-/// applications (games under Proton) reject textures that use them.
-fn create_dmabuf_textures(
-    c: &mut Compositor,
-    desc: &SwapTextureSetDesc_t,
-    allow_compression: bool,
-) -> Option<(u32, Vec<Texture>)> {
-    let h = host();
-    let drm_format = drm_format_for(desc.nFormat);
-    // The compositor's modifiers also tell which GPU it renders on.
-    let compositor_modifiers = drm_format.map(|f| h.dmabuf_modifiers(f)).unwrap_or_default();
-    if matches!(c.gbm, Gbm::Untried) {
-        let node = render_node(&compositor_modifiers);
-        c.gbm = match gbm::Device::open(&node) {
-            Ok(d) => {
-                log::info!("allocating compositor textures with GBM on {}", node.to_string_lossy());
-                Gbm::Ready(d)
-            }
-            Err(e) => {
-                log::warn!("GBM unavailable ({e}); frames cannot be streamed");
-                Gbm::Failed
-            }
-        };
-    }
-    let Gbm::Ready(dev) = &c.gbm else { return None };
-    if desc.nSampleCount > 1 {
-        log::warn!("multisampled swap textures ({}x) cannot be streamed", desc.nSampleCount);
-        return None;
-    }
-    let Some(drm_format) = drm_format else {
-        log::warn!("no DRM format for VkFormat {}; this set cannot be streamed", desc.nFormat);
-        return None;
-    };
-    let mut modifiers = compositor_modifiers;
-    // On GFX12 (RDNA4) the server reads what the compositor cleared as the texture's old
-    // content: SteamVR's layer over a game came out opaque black in two frames of three.
-    modifiers.retain(|&m| !amd_dcc(m) || (allow_compression && !amd_gfx12(m)));
-    if modifiers.is_empty() {
-        log::warn!("compositor reports no dmabuf modifiers for format {drm_format:#x}");
-        return None;
-    }
-
-    let mut textures = Vec::with_capacity(SET_SIZE);
-    for _ in 0..SET_SIZE {
-        let Some(bo) = dev.create(desc.nWidth, desc.nHeight, drm_format, &modifiers) else {
-            log::warn!("GBM allocation of {}x{} failed", desc.nWidth, desc.nHeight);
-            release_handles(&textures);
-            return None;
-        };
-        if bo.planes.len() > MaxDmabufPlaneCount {
-            log::warn!("{} planes is more than SteamVR accepts", bo.planes.len());
-            release_handles(&textures);
-            return None;
-        }
-        let mut attrs = DmabufAttributes_t {
-            pNext: std::ptr::null_mut(),
-            unWidth: desc.nWidth,
-            unHeight: desc.nHeight,
-            unDepth: 1,
-            unMipLevels: 1,
-            unArrayLayers: 1,
-            unSampleCount: 1,
-            unFormat: drm_format,
-            ulModifier: bo.modifier,
-            unPlaneCount: bo.planes.len() as u32,
-            plane: [DmabufPlane_t::default(); MaxDmabufPlaneCount],
-        };
-        for (dst, p) in attrs.plane.iter_mut().zip(&bo.planes) {
-            *dst = DmabufPlane_t { unOffset: p.offset, unStride: p.stride, nFd: p.fd.as_raw_fd() };
-        }
-        let Some(handle) = h.import_dmabuf(&mut attrs) else {
-            log::warn!("ImportDmabuf refused modifier {:#x}", bo.modifier);
-            release_handles(&textures);
-            return None;
-        };
-        textures.push(Texture { handle, bo: Some(bo), shared: None, busy: None });
-    }
-    Some((drm_format, textures))
-}
-
-fn release_handles(textures: &[Texture]) {
-    let h = host();
-    textures.iter().for_each(|t| h.unref_resource(t.handle));
-}
-
-/// SteamVR allocates the images itself. The compositor runs, but the server cannot read them.
-fn create_steamvr_textures(desc: &SwapTextureSetDesc_t) -> Option<Vec<Texture>> {
-    let h = host();
-    let mut textures = Vec::with_capacity(SET_SIZE);
-    for _ in 0..SET_SIZE {
-        match h.new_shared_vulkan_image(desc.nFormat, desc.nWidth, desc.nHeight) {
-            Some(handle) => {
-                // Its dmabuf, so the server can read it (an application's layer).
-                let shared = h.shared_fd(handle);
-                if shared.is_none() {
-                    log::warn!("no fd for SteamVR image {handle:#x}; this set cannot be streamed");
-                }
-                textures.push(Texture { handle, bo: None, shared, busy: None })
-            }
-            None => {
-                release_handles(&textures);
-                return None;
-            }
-        }
-    }
-    Some(textures)
-}
-
-/// Whether an AMD format modifier uses DCC compression (`AMD_FMT_MOD_DCC`, bit 13 of an
-/// `AMD_FMT_MOD` modifier, vendor 0x02 in the top byte).
-fn amd_dcc(modifier: u64) -> bool {
-    modifier >> 56 == 0x02 && modifier & (1 << 13) != 0
-}
-
-/// Whether an AMD format modifier is for GFX12 (RDNA4) or newer: `AMD_FMT_MOD_TILE_VERSION`
-/// (the low byte) 5 or more.
-fn amd_gfx12(modifier: u64) -> bool {
-    modifier >> 56 == 0x02 && modifier & 0xff >= 5
-}
-
-/// Whether `pid` is SteamVR's compositor (`vrcompositor`).
-fn is_compositor(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == "vrcompositor")
-}
-
 unsafe extern "C" fn create_swap_texture_set(
     _this: *mut c_void,
     pid: u32,
@@ -429,47 +239,30 @@ unsafe extern "C" fn create_swap_texture_set(
         let desc = *desc;
         *out = SwapTextureSet_t::default();
         with(|c| {
-            // Only the compositor can use our GBM dmabufs: applications (e.g. games under
-            // Proton) reject them, compressed or not, and ask again in an endless loop.
-            let compositor = is_compositor(pid);
-            let dmabuf = if compositor { create_dmabuf_textures(c, &desc, true) } else { None };
-            let (drm_format, textures) = match dmabuf {
-                Some(t) => t,
-                None => match create_steamvr_textures(&desc) {
-                    Some(t) => (drm_format_for(desc.nFormat).unwrap_or(0), t),
-                    None => {
-                        log::error!(
-                            "cannot allocate swap textures {}x{} format {} (pid {pid})",
-                            desc.nWidth,
-                            desc.nHeight,
-                            desc.nFormat
-                        );
-                        return;
-                    }
-                },
+            let Some((drm_format, textures)) = c.gpu.create(pid, &desc) else {
+                log::error!(
+                    "cannot allocate swap textures {}x{} format {} (pid {pid})",
+                    desc.nWidth,
+                    desc.nHeight,
+                    desc.nFormat
+                );
+                return;
             };
-            let set = TextureSet { pid, compositor: is_compositor(pid), desc, drm_format, textures };
+            let textures = textures.into_iter().map(|(handle, mem)| Texture { handle, mem, busy: None }).collect();
+            let set = TextureSet { pid, compositor: platform::is_compositor(pid), desc, drm_format, textures };
             log::info!(
                 "swap texture set for pid {pid}: {}x{} format {} -> {:x?} ({})",
                 desc.nWidth,
                 desc.nHeight,
                 desc.nFormat,
                 set.textures.iter().map(|t| t.handle).collect::<Vec<_>>(),
-                match set.textures[0].bo.as_ref() {
-                    Some(bo) => format!("dmabuf, modifier {:#x}, {} plane(s)", bo.modifier, bo.planes.len()),
-                    None if set.streamable() => "SteamVR-allocated, shared as dmabuf".into(),
-                    None => "SteamVR-allocated, not streamable".into(),
-                }
+                set.textures[0].mem.kind(set.streamable())
             );
             for (dst, t) in (*out).rSharedTextureHandles.iter_mut().zip(&set.textures) {
                 *dst = t.handle;
             }
-            let rdev = match &c.gbm {
-                Gbm::Ready(d) => d.rdev(),
-                _ => 0,
-            };
-            if let Some((ann, fds)) = set.announcement(rdev) {
-                video::send_set(&ann, &fds);
+            if let Some((ann, attachments)) = set.announcement(c.gpu.render_node()) {
+                video::send_set(&ann, &attachments);
             }
             c.sets.push(set);
         })
@@ -486,8 +279,9 @@ fn remove_sets(pred: impl Fn(&TextureSet) -> bool) {
         let handles: Vec<u64> = gone.iter().flat_map(|s| s.textures.iter().map(|t| t.handle)).collect();
         log::info!("releasing swap textures {handles:x?}");
         video::send_destroyed(handles);
-        // Dropping the bos closes our fds; the server and SteamVR hold their own references.
-        gone.iter().for_each(|s| release_handles(&s.textures));
+        // Dropping the textures' memory closes our references (Linux: fds); the server and
+        // SteamVR hold their own.
+        c.gpu.release(gone.iter().flat_map(|s| s.textures.iter().map(|t| t.handle)));
     })
 }
 
@@ -543,6 +337,7 @@ fn send_frame(
     base: &[SubmitLayerPerEye_t; 2],
     overlay: Option<&[SubmitLayerPerEye_t; 2]>,
     now_ns: i64,
+    sync_texture: SharedTextureHandle_t,
 ) {
     let streamable = |h: SharedTextureHandle_t| {
         c.sets.iter().any(|s| s.streamable() && s.textures.iter().any(|t| t.handle == h))
@@ -570,6 +365,11 @@ fn send_frame(
         },
         present_ns: target_vsync_ns(now_ns),
     };
+    // Windows: the server's reads wait for the compositor's writes through a fence signalled
+    // here. Linux: nothing to do (implicit dmabuf fences).
+    if !c.gpu.frame_ready(sync_texture, frame_id) {
+        return;
+    }
     if !video::send_frame(&msg) {
         return;
     }
@@ -582,7 +382,7 @@ fn send_frame(
     }
 }
 
-unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHandle_t) {
+unsafe extern "C" fn present(_this: *mut c_void, sync_texture: SharedTextureHandle_t) {
     crate::guard((), || {
         let now = Instant::now();
         let now_ns = monotonic_ns();
@@ -638,7 +438,7 @@ unsafe extern "C" fn present(_this: *mut c_void, _sync_texture: SharedTextureHan
                         .filter(|l| is_compositor(l) && l.iter().all(|e| streamable(e.hTexture)))
                         .max_by_key(|l| rank(l[0].hTexture).1)
                 };
-                send_frame(c, base, overlay, now_ns);
+                send_frame(c, base, overlay, now_ns, sync_texture);
             }
             c.layer_counts.push_back(layers.len());
             c.presents.push_back(now);
@@ -753,33 +553,5 @@ impl Drop for VsyncThread {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{amd_dcc, amd_gfx12, pci_vendor_of};
-
-    #[test]
-    fn gfx12_dcc_is_recognised() {
-        // What RADV offered for the compositor on an RX 9070 XT: GFX12, 64K_2D, DCC.
-        const GFX12_DCC: u64 = 0x0200_0000_0008_2305;
-        assert!(amd_dcc(GFX12_DCC) && amd_gfx12(GFX12_DCC));
-        // GFX10.3 (RDNA2) with DCC keeps it.
-        const GFX10_RBPLUS_DCC: u64 = 0x0200_0000_0000_2003 | (0x18 << 8);
-        assert!(amd_dcc(GFX10_RBPLUS_DCC) && !amd_gfx12(GFX10_RBPLUS_DCC));
-        assert!(!amd_gfx12(0));
-    }
-
-    #[test]
-    fn modifier_vendor_names_the_gpu() {
-        const LINEAR: u64 = 0;
-        const I915_X_TILED: u64 = 0x0100_0000_0000_0001;
-        const AMD_GFX12: u64 = 0x0200_0000_1866_bf04;
-        // LINEAR says nothing; the first vendor-specific modifier decides.
-        assert_eq!(pci_vendor_of(&[LINEAR, AMD_GFX12]), Some(0x1002));
-        assert_eq!(pci_vendor_of(&[I915_X_TILED, LINEAR]), Some(0x8086));
-        assert_eq!(pci_vendor_of(&[LINEAR]), None);
-        assert_eq!(pci_vendor_of(&[]), None);
     }
 }

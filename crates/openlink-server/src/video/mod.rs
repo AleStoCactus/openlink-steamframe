@@ -1,4 +1,4 @@
-//! Video pipeline (Linux): compositor frames from the driver -> NV12 -> H.265.
+//! Video pipeline: compositor frames from the driver -> NV12 -> H.265.
 //!
 //! ```text
 //!  driver (vrserver)                       server, video thread
@@ -11,6 +11,10 @@
 //!                                          -> Annex B bitstream -> UDP to the headset
 //! ```
 //!
+//! That is Linux. On Windows the textures are D3D11 shared textures: the server opens them
+//! with D3D11 and copies each frame into textures Vulkan can import, ordered by fences
+//! ([`d3d`]); the rest is the same.
+//!
 //! Each frame goes to the headset as [`openlink_protocol::video`] datagrams, with the HMD pose
 //! SteamVR rendered it with. New headsets and reported losses get an IDR.
 //!
@@ -18,6 +22,8 @@
 //! is processed and the older ones are released straight away.
 
 mod convert;
+#[cfg(windows)]
+mod d3d;
 mod encode;
 mod import;
 mod qp_map;
@@ -27,11 +33,12 @@ use crate::config::Settings;
 use crate::session::{Status, HeadsetLink};
 use ash::vk as avk;
 use import::{color_range, Imported};
-use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
+use openlink_protocol::video_ipc::{self as vipc, Attachment, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
 use openlink_protocol::{self as proto, video};
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -216,9 +223,108 @@ struct Pipeline {
     fence: avk::Fence,
     converted: avk::Semaphore,
     /// Receive the compositor's write fences, one per texture read (two eyes, two overlay).
+    /// Linux only; Windows waits on [`vk::Context::copied`].
+    #[cfg_attr(windows, allow(dead_code))]
     fence_sems: [avk::Semaphore; 4],
     /// Compositor write fences seen: already signalled, still pending, unavailable.
     fence_stats: (u32, u32, u32),
+    /// With [`encode::PIPELINED`]: `converted` and this alternate, as an encode may still
+    /// wait on the previous convert's.
+    converted_spare: avk::Semaphore,
+    /// With [`encode::PIPELINED`]: finishes encodes and sends them (created on first use).
+    finisher: Option<Finisher>,
+}
+
+/// When and with what pose a frame was rendered, and when its convert ran.
+struct FrameMeta {
+    present_ns: i64,
+    hmd_pose: [[f32; 4]; 3],
+    /// For `--dump-video`'s pose file: the left eye's texture and SteamVR's layer over it (0
+    /// if none).
+    textures: [u64; 2],
+    t0: Instant,
+    t1: Instant,
+}
+
+struct FinishJob {
+    pending: encode::Pending,
+    /// `None` when no headset is connected (nothing to send).
+    info: Option<video::FrameInfo>,
+    /// Return the bitstream (for `--dump-video`).
+    keep: bool,
+}
+
+struct FinishDone {
+    /// Bytes, and the bitstream if it was to be kept.
+    result: std::result::Result<(usize, Option<Vec<u8>>), encode::FinishError>,
+    idr: bool,
+    encode: Duration,
+    send_error: bool,
+}
+
+/// [`encode::PIPELINED`]: a thread that waits for each encode and sends it to the headset the
+/// moment it is done, while the video thread converts the next frame.
+struct Finisher {
+    jobs: Option<std::sync::mpsc::SyncSender<FinishJob>>,
+    done: std::sync::mpsc::Receiver<FinishDone>,
+    /// The frame being encoded.
+    in_flight: Option<FrameMeta>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Finisher {
+    fn new(sender: std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)>) -> Self {
+        let (jobs, rx) = std::sync::mpsc::sync_channel::<FinishJob>(1);
+        let (done_tx, done) = std::sync::mpsc::sync_channel::<FinishDone>(1);
+        let thread = std::thread::Builder::new()
+            .name("video-finish".into())
+            .spawn(move || {
+                for job in rx {
+                    let (idr, submitted) = (job.pending.idr, job.pending.submitted);
+                    let result = job.pending.finish();
+                    let encode = submitted.elapsed();
+                    let mut send_error = false;
+                    let result = result.map(|bitstream| {
+                        let bytes = bitstream.len();
+                        let kept = job.keep.then(|| bitstream.clone());
+                        if let Some(mut info) = job.info {
+                            info.idr = idr;
+                            // A failure: the sender is still busy with the previous frame.
+                            send_error = sender.try_send((info, bitstream)).is_err();
+                        }
+                        (bytes, kept)
+                    });
+                    if done_tx.send(FinishDone { result, idr, encode, send_error }).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("spawn video finisher");
+        Self { jobs: Some(jobs), done, in_flight: None, thread: Some(thread) }
+    }
+
+    fn start(&mut self, job: FinishJob, meta: FrameMeta) {
+        if let Some(jobs) = &self.jobs {
+            if jobs.send(job).is_ok() {
+                self.in_flight = Some(meta);
+            }
+        }
+    }
+
+    /// Waits for the frame in flight, if there is one.
+    fn wait(&mut self) -> Option<(FrameMeta, FinishDone)> {
+        let meta = self.in_flight.take()?;
+        self.done.recv().ok().map(|d| (meta, d))
+    }
+
+    /// Finishes what is in flight and ends the thread.
+    fn join(mut self) {
+        let _ = self.wait();
+        self.jobs.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl Pipeline {
@@ -266,15 +372,22 @@ impl Pipeline {
             converted: ctx.semaphore()?,
             fence_sems: [ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?, ctx.semaphore()?],
             fence_stats: (0, 0, 0),
+            converted_spare: ctx.semaphore()?,
+            finisher: None,
         })
     }
 
-    fn destroy(self, ctx: &Context) {
+    fn destroy(mut self, ctx: &Context) {
+        // The finisher may still read the encoder's bitstream buffer.
+        if let Some(f) = self.finisher.take() {
+            f.join();
+        }
         // SAFETY: the device is idle (caller).
         unsafe {
             let d = &ctx.device;
             d.destroy_fence(self.fence, None);
             d.destroy_semaphore(self.converted, None);
+            d.destroy_semaphore(self.converted_spare, None);
             self.fence_sems.iter().for_each(|&s| d.destroy_semaphore(s, None));
             d.destroy_command_pool(self.pool, None);
         }
@@ -288,6 +401,7 @@ impl Pipeline {
     fn convert(
         &mut self,
         ctx: &Context,
+        frame_id: u64,
         eyes: [&Imported; 2],
         bounds: [[f32; 4]; 2],
         overlay: Option<([&Imported; 2], [[f32; 4]; 2])>,
@@ -300,38 +414,40 @@ impl Pipeline {
                 unique.push(img);
             }
         }
-        // Wait for the compositor's rendering into the textures (implicit dmabuf fences).
         let mut waits = Vec::new();
-        for (eye, sem) in unique.iter().zip(self.fence_sems) {
-            let Some(sync) = eye.write_fence() else {
-                self.fence_stats.2 += 1;
-                continue;
-            };
-            // Diagnostics: is the compositor's write still in flight when we get here?
-            let mut pfd = libc::pollfd { fd: sync.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            // SAFETY: valid fd and pollfd.
-            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } == 1;
-            if signaled { self.fence_stats.0 += 1 } else { self.fence_stats.1 += 1 }
-            let info = avk::ImportSemaphoreFdInfoKHR::default()
-                .semaphore(sem)
-                .flags(avk::SemaphoreImportFlags::TEMPORARY)
-                .handle_type(avk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                .fd(sync.as_raw_fd());
-            // SAFETY: valid semaphore and sync file; Vulkan owns the fd on success.
-            match unsafe { ctx.ext_sem_fd.import_semaphore_fd(&info) } {
-                Ok(()) => {
-                    let _ = sync.into_raw_fd();
+        // Timeline semaphore values for `waits` (Windows), or empty (binary semaphores).
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut wait_values = Vec::new();
+        #[cfg(target_os = "linux")]
+        self.wait_for_compositor(ctx, &unique, &mut waits);
+        #[cfg(windows)]
+        {
+            // Copy the driver's textures into the ones Vulkan imported, once the compositor's
+            // rendering is done (the driver's frame fence); then wait for the copies.
+            let pairs: Vec<_> = unique.iter().map(|i| (&i.d3d.copy, &i.d3d.src)).collect();
+            let fenced = ctx.d3d.has_driver_fence() as u32 * unique.len() as u32;
+            self.fence_stats.1 += fenced;
+            self.fence_stats.2 += unique.len() as u32 - fenced;
+            let value = ctx.d3d.copy(frame_id, &pairs)?;
+            match ctx.copied {
+                Some(sem) => {
                     waits.push(sem);
+                    wait_values.push(value);
                 }
-                Err(e) => log::warn!("video: cannot import compositor fence: {e:?}"),
+                None => ctx.d3d.wait_cpu(value)?,
             }
         }
+        #[cfg(not(windows))]
+        let _ = frame_id;
 
+        // Dmabufs come from the "foreign" queue family; D3D11 memory from "external".
+        let foreign =
+            if cfg!(windows) { avk::QUEUE_FAMILY_EXTERNAL } else { avk::QUEUE_FAMILY_FOREIGN_EXT };
         let ownership = |img: &Imported, acquire: bool| {
             let (src_q, dst_q) = if acquire {
-                (avk::QUEUE_FAMILY_FOREIGN_EXT, ctx.compute_family)
+                (foreign, ctx.compute_family)
             } else {
-                (ctx.compute_family, avk::QUEUE_FAMILY_FOREIGN_EXT)
+                (ctx.compute_family, foreign)
             };
             let b = avk::ImageMemoryBarrier2::default()
                 .image(img.image)
@@ -376,15 +492,47 @@ impl Pipeline {
             let stages = vec![avk::PipelineStageFlags::COMPUTE_SHADER; waits.len()];
             let cmds = [self.cmd];
             let signal = [self.converted];
+            let mut timeline = avk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
             let submit = avk::SubmitInfo::default()
                 .wait_semaphores(&waits)
                 .wait_dst_stage_mask(&stages)
                 .command_buffers(&cmds)
                 .signal_semaphores(&signal);
+            let submit = if wait_values.is_empty() { submit } else { submit.push_next(&mut timeline) };
             check(d.queue_submit(ctx.compute_queue, &[submit], self.fence), "vkQueueSubmit (convert)")?;
             ctx.wait_fence(self.fence, "convert")?;
         }
         Ok(())
+    }
+
+    /// Linux: makes `waits` wait for the compositor's rendering into the textures (implicit
+    /// dmabuf fences).
+    #[cfg(target_os = "linux")]
+    fn wait_for_compositor(&mut self, ctx: &Context, unique: &[&Imported], waits: &mut Vec<avk::Semaphore>) {
+        for (eye, sem) in unique.iter().zip(self.fence_sems) {
+            let Some(sync) = eye.write_fence() else {
+                self.fence_stats.2 += 1;
+                continue;
+            };
+            // Diagnostics: is the compositor's write still in flight when we get here?
+            let mut pfd = libc::pollfd { fd: sync.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            // SAFETY: valid fd and pollfd.
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } == 1;
+            if signaled { self.fence_stats.0 += 1 } else { self.fence_stats.1 += 1 }
+            let info = avk::ImportSemaphoreFdInfoKHR::default()
+                .semaphore(sem)
+                .flags(avk::SemaphoreImportFlags::TEMPORARY)
+                .handle_type(avk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                .fd(sync.as_raw_fd());
+            // SAFETY: valid semaphore and sync file; Vulkan owns the fd on success.
+            match unsafe { ctx.ext_sem_fd.import_semaphore_fd(&info) } {
+                Ok(()) => {
+                    let _ = sync.into_raw_fd();
+                    waits.push(sem);
+                }
+                Err(e) => log::warn!("video: cannot import compositor fence: {e:?}"),
+            }
+        }
     }
 }
 
@@ -413,6 +561,12 @@ struct Connection<'a> {
     stats: Stats,
     failed: bool,
     eye_layout: Option<String>,
+    /// vrserver's process id, from the driver's hello.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    driver_pid: u32,
+    /// Windows: the driver's frame fence, opened once there is a D3D11 device.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    sync_fence: Option<u64>,
 }
 
 impl<'a> Connection<'a> {
@@ -444,6 +598,8 @@ impl<'a> Connection<'a> {
             stats: Stats::default(),
             failed: false,
             eye_layout: None,
+            driver_pid: 0,
+            sync_fence: None,
         }
     }
 
@@ -473,9 +629,16 @@ impl<'a> Connection<'a> {
                 };
                 timeout = 0;
                 match proto::decode::<DriverVideoMsg>(&buf[..n]) {
-                    Ok(DriverVideoMsg::Hello { driver_version }) => log::info!("video: driver {driver_version}"),
+                    Ok(DriverVideoMsg::Hello { driver_version, pid }) => {
+                        log::info!("video: driver {driver_version} (vrserver pid {pid})");
+                        self.driver_pid = pid;
+                    }
                     Ok(DriverVideoMsg::TextureSet(set)) => self.import_set(&set, fds),
                     Ok(DriverVideoMsg::TexturesDestroyed { handles }) => self.forget(&handles),
+                    Ok(DriverVideoMsg::SyncFence { handle }) => {
+                        self.sync_fence = Some(handle);
+                        self.open_sync_fence();
+                    }
                     Ok(DriverVideoMsg::Frame { frame_id, eyes, overlay, hmd_pose, present_ns }) => {
                         if let Some(old) = newest.replace(Frame { id: frame_id, eyes, overlay, hmd_pose, present_ns }) {
                             self.stats.skipped += 1;
@@ -492,7 +655,21 @@ impl<'a> Connection<'a> {
         self.shutdown();
     }
 
-    fn import_set(&mut self, set: &vipc::TextureSet, fds: Vec<OwnedFd>) {
+    /// Windows: opens the driver's frame fence on the D3D11 device, once both exist.
+    fn open_sync_fence(&mut self) {
+        #[cfg(windows)]
+        if let Some(ctx) = &self.ctx {
+            let Some(handle) = self.sync_fence.take() else { return };
+            match ctx.d3d.set_driver_fence(self.driver_pid, handle) {
+                Ok(()) => log::info!("video: frame fence shared with the driver"),
+                Err(e) => log::error!("video: {e}; frames may be read before the compositor finishes them"),
+            }
+        }
+    }
+
+    fn import_set(&mut self, set: &vipc::TextureSet, fds: Vec<Attachment>) {
+        // Linux: one fd per plane rides along. Windows: textures have no planes and nothing
+        // rides along.
         let planes: usize = set.textures.iter().map(|t| t.planes.len()).sum();
         if fds.len() != planes {
             log::error!("video: texture set with {planes} planes came with {} fds", fds.len());
@@ -506,11 +683,12 @@ impl<'a> Connection<'a> {
                     self.failed = true;
                 }
             }
+            self.open_sync_fence();
         }
         let Some(ctx) = &self.ctx else { return };
         let mut fds = fds.into_iter();
         for tex in &set.textures {
-            let tex_fds: Vec<OwnedFd> = fds.by_ref().take(tex.planes.len()).collect();
+            let tex_fds: Vec<Attachment> = fds.by_ref().take(tex.planes.len()).collect();
             match Imported::new(ctx, set, tex, tex_fds) {
                 Ok(img) => {
                     self.imports.insert(tex.handle, img);
@@ -596,7 +774,7 @@ impl<'a> Connection<'a> {
             let (l, r) = (self.imports.get(&o[0].texture)?, self.imports.get(&o[1].texture)?);
             Some(([l, r], [o[0].bounds, o[1].bounds]))
         });
-        let converted = p.convert(ctx, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds], overlay);
+        let converted = p.convert(ctx, frame.id, [left, right], [frame.eyes[0].bounds, frame.eyes[1].bounds], overlay);
         release(frame.id);
         converted?;
         let t1 = Instant::now();
@@ -604,51 +782,106 @@ impl<'a> Connection<'a> {
         if sink.is_some_and(HeadsetLink::take_idr_request) {
             p.encoder.request_idr();
         }
+        let meta = FrameMeta {
+            present_ns: frame.present_ns,
+            hmd_pose: frame.hmd_pose,
+            textures: [frame.eyes[0].texture, frame.overlay.map_or(0, |o| o[0].texture)],
+            t0,
+            t1,
+        };
+        let info = |idr: bool| {
+            sink.is_some_and(|s| s.headset().is_some()).then(|| video::FrameInfo {
+                idr,
+                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
+                present_ns: frame.present_ns,
+                foveation: p.requested.foveation,
+            })
+        };
+
+        if encode::PIPELINED {
+            // This frame was converted while the previous one encoded; that encode must be
+            // finished before this one is submitted (they share the bitstream buffer).
+            let finisher = p.finisher.get_or_insert_with(|| Finisher::new(self.sender.clone()));
+            let previous = finisher.wait();
+            if let Some((_, done)) = &previous {
+                match &done.result {
+                    Ok((bytes, _)) => p.encoder.finished(*bytes, done.idr),
+                    Err(e) => {
+                        if e.lost {
+                            ctx.mark_lost();
+                        }
+                        return Err(e.message.clone());
+                    }
+                }
+            }
+            let pending = p.encoder.submit(ctx, p.converted)?;
+            // The next convert signals the other semaphore: this encode may not have consumed
+            // this one yet.
+            std::mem::swap(&mut p.converted, &mut p.converted_spare);
+            let job = FinishJob { info: info(pending.idr), pending, keep: self.dump.is_some() };
+            p.finisher.as_mut().expect("created above").start(job, meta);
+            if let Some((meta, done)) = previous {
+                let Ok((bytes, kept)) = done.result else { unreachable!("returned above") };
+                if let Some(bitstream) = &kept {
+                    self.dump_frame(&meta, bitstream, done.idr);
+                }
+                self.count_frame(&meta, bytes, done.encode, done.send_error);
+            }
+            return Ok(());
+        }
+
         let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;
         let t2 = Instant::now();
+        let info = info(idr);
+        self.dump_frame(&meta, &bitstream, idr);
+        let bytes = bitstream.len();
+        let mut send_error = false;
+        if let Some(info) = info {
+            // A failure: the sender is still busy with the previous frame.
+            send_error = self.sender.try_send((info, bitstream)).is_err();
+        }
+        self.count_frame(&meta, bytes, t2 - t1, send_error);
+        Ok(())
+    }
 
+    /// Appends a frame to `--dump-video`'s file, with its render pose beside it.
+    fn dump_frame(&mut self, meta: &FrameMeta, bitstream: &[u8], idr: bool) {
         if let Some(f) = &mut self.dump {
-            if let Err(e) = f.write_all(&bitstream) {
+            if let Err(e) = f.write_all(bitstream) {
                 log::error!("video: dump write failed: {e}");
                 self.dump = None;
             }
             // Beside the stream: each frame's render pose, for checking labels against content,
             // and the textures it was made from (left eye, SteamVR's layer over it or 0).
             if let Some(poses) = &mut self.dump_poses {
-                let p = proto::Pose::from_matrix34(&frame.hmd_pose);
+                let p = proto::Pose::from_matrix34(&meta.hmd_pose);
                 let _ = writeln!(
                     poses,
                     "{} {} {} {:?} {:?} {:x} {:x}",
                     self.stats_frames_total,
-                    frame.present_ns,
+                    meta.present_ns,
                     idr as u8,
                     p.orientation,
                     p.position,
-                    frame.eyes[0].texture,
-                    frame.overlay.map_or(0, |o| o[0].texture)
+                    meta.textures[0],
+                    meta.textures[1]
+
                 );
             }
             self.stats_frames_total += 1;
         }
-        let bytes = bitstream.len();
-        if sink.is_some_and(|s| s.headset().is_some()) {
-            let info = video::FrameInfo {
-                idr,
-                render_pose: proto::Pose::from_matrix34(&frame.hmd_pose),
-                present_ns: frame.present_ns,
-                foveation: p.requested.foveation,
-            };
-            if self.sender.try_send((info, bitstream)).is_err() {
-                self.stats.send_errors += 1; // the sender is still busy with the previous frame
-            }
-        }
+    }
+
+    /// Statistics, logged every 5 s.
+    fn count_frame(&mut self, meta: &FrameMeta, bytes: usize, encode: Duration, send_error: bool) {
         let s = &mut self.stats;
-        let since = *s.since.get_or_insert(t0);
+        let since = *s.since.get_or_insert(meta.t0);
         s.frames += 1;
         s.bytes += bytes as u64;
-        s.convert += t1 - t0;
-        s.encode += t2 - t1;
-        let elapsed = t2 - since;
+        s.convert += meta.t1 - meta.t0;
+        s.encode += encode;
+        s.send_errors += send_error as u32;
+        let elapsed = since.elapsed();
         if elapsed >= Duration::from_secs(5) {
             let n = s.frames.max(1);
             if let Some(p) = &mut self.pipeline {
@@ -667,7 +900,6 @@ impl<'a> Connection<'a> {
             );
             *s = Stats::default();
         }
-        Ok(())
     }
 
     /// Drops the GPU state without touching a lost device: its objects are leaked, as
@@ -702,15 +934,22 @@ impl<'a> Connection<'a> {
 /// test pattern, identical in the left and right halves (so per-half quality can be compared);
 /// SOURCE.yuv receives it as raw NV12 for `ffmpeg -lavfi psnr`.
 pub fn selftest(args: &[String]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     let size = args.first().ok_or("usage: --encode-selftest WxH FRAMES [OUT]")?;
     let (w, h) = size.split_once('x').ok_or("size must be WxH")?;
     let (width, height): (u32, u32) = (w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?);
     let frames: u32 = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(300);
     let mut out = args.get(2).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
     let mut source_out = args.get(3).map(std::fs::File::create).transpose().map_err(|e| e.to_string())?;
-    let rdev = std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev();
-    let ctx = Context::new(rdev)?;
+    // Linux: the first render node, where the driver allocates too. Windows: the first GPU
+    // that can encode.
+    #[cfg(target_os = "linux")]
+    let gpu = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev()
+    };
+    #[cfg(windows)]
+    let gpu = 0;
+    let ctx = Context::new(gpu)?;
     // QP_RIGHT: a quantization delta map adding that much QP to the right half, to check that
     // the implementation applies one (the halves' PSNR then differ).
     let qp_right: Option<f32> = args.get(4).and_then(|v| v.parse().ok()).filter(|v| *v != 0.0);
@@ -750,8 +989,9 @@ pub fn selftest(args: &[String]) -> Result<()> {
     let staging_ptr = check(unsafe { d.map_memory(staging_mem, 0, avk::WHOLE_SIZE, avk::MemoryMapFlags::empty()) }, "vkMapMemory")?
         as *mut u8;
     let mut pattern = vec![0u8; nv12_len];
-    let barrier = avk::ImageMemoryBarrier2::default()
-        .image(enc.src)
+    // For the image the frame is written into, set per frame (`enc.src` alternates when
+    // encodes are pipelined).
+    let barrier_template = avk::ImageMemoryBarrier2::default()
         .subresource_range(color_range())
         .old_layout(avk::ImageLayout::UNDEFINED)
         .new_layout(avk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -759,6 +999,8 @@ pub fn selftest(args: &[String]) -> Result<()> {
         .dst_access_mask(avk::AccessFlags2::TRANSFER_WRITE);
     let t0 = Instant::now();
     let mut bytes = 0usize;
+    // GPU encode time alone (the pattern is drawn on the CPU, which dominates the total).
+    let mut encode_time = Duration::ZERO;
     let result = (|| -> Result<()> {
         for i in 0..frames {
             fill_pattern(&mut pattern, cw, ch, width as usize / 2, i);
@@ -770,6 +1012,7 @@ pub fn selftest(args: &[String]) -> Result<()> {
             unsafe {
                 std::ptr::copy_nonoverlapping(pattern.as_ptr(), staging_ptr, nv12_len);
                 check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+                let barrier = barrier_template.image(enc.src);
                 d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)));
                 let plane = |aspect, offset: usize, w: usize, h: usize| avk::BufferImageCopy {
                     buffer_offset: offset as u64,
@@ -792,7 +1035,9 @@ pub fn selftest(args: &[String]) -> Result<()> {
                 check(d.queue_submit(ctx.compute_queue, &[submit], fence), "vkQueueSubmit (selftest)")?;
             }
             ctx.wait_fence(fence, "selftest prep")?;
+            let te = Instant::now();
             let (bs, _) = enc.encode(&ctx, sem).map_err(|e| format!("frame {i}: {e}"))?;
+            encode_time += te.elapsed();
             bytes += bs.len();
             if let Some(f) = &mut out {
                 f.write_all(&bs).map_err(|e| e.to_string())?;
@@ -804,7 +1049,12 @@ pub fn selftest(args: &[String]) -> Result<()> {
         Ok(())
     })();
     let secs = t0.elapsed().as_secs_f64();
-    log::info!("selftest: {frames} frames in {secs:.2} s ({:.1} fps), {:.1} MB", frames as f64 / secs, bytes as f64 / 1e6);
+    log::info!(
+        "selftest: {frames} frames in {secs:.2} s ({:.1} fps), {:.1} MB, encode {:.2} ms/frame",
+        frames as f64 / secs,
+        bytes as f64 / 1e6,
+        encode_time.as_secs_f64() * 1e3 / frames.max(1) as f64
+    );
     if ctx.is_lost() {
         std::mem::forget(enc);
         return result;
@@ -820,6 +1070,183 @@ pub fn selftest(args: &[String]) -> Result<()> {
     }
     enc.destroy(&ctx);
     result
+}
+
+/// `openlink --convert-selftest SOURCE.rgba SRC_WxH EYE_WxH OUT.gray`: runs one eye-sized
+/// picture through the converter (the downscale from SteamVR's render size to the encoded size)
+/// and writes the left eye's luma (`EYE_W` x `EYE_H`, 8-bit limited range), to compare with an
+/// ideal downscale (`ffmpeg ... -vf scale=...:flags=lanczos`) for sharpness.
+pub fn convert_selftest(args: &[String]) -> Result<()> {
+    let usage = "usage: --convert-selftest SOURCE.rgba SRC_WxH EYE_WxH OUT.gray";
+    let size = |s: Option<&String>| -> Result<(u32, u32)> {
+        let (w, h) = s.ok_or(usage)?.split_once('x').ok_or(usage)?;
+        Ok((w.parse().map_err(|_| usage)?, h.parse().map_err(|_| usage)?))
+    };
+    let source = std::fs::read(args.first().ok_or(usage)?).map_err(|e| e.to_string())?;
+    let (sw, sh) = size(args.get(1))?;
+    let (ew, eh) = size(args.get(2))?;
+    let out_path = args.get(3).ok_or(usage)?;
+    if source.len() != (sw * sh * 4) as usize {
+        return Err(format!("{} bytes is not {sw}x{sh} RGBA", source.len()));
+    }
+    #[cfg(target_os = "linux")]
+    let gpu = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/dev/dri/renderD128").map_err(|e| e.to_string())?.rdev()
+    };
+    #[cfg(windows)]
+    let gpu = 0;
+    let ctx = Context::new(gpu)?;
+    let d = &ctx.device;
+    let (cw, ch) = (2 * ew, eh + eh % 2);
+    let mut converter = convert::Converter::new(&ctx, cw, ch, ew, eh, None)?;
+    let host = avk::MemoryPropertyFlags::HOST_VISIBLE | avk::MemoryPropertyFlags::HOST_COHERENT;
+    // SAFETY: plain object creation, recording and submission on objects made here; the
+    // device is idle before anything is destroyed.
+    unsafe {
+        let buffer = |size: usize, usage| -> Result<(avk::Buffer, avk::DeviceMemory, *mut u8)> {
+            let b = check(
+                d.create_buffer(&avk::BufferCreateInfo::default().size(size as u64).usage(usage), None),
+                "vkCreateBuffer",
+            )?;
+            let m = ctx.bind_buffer_memory(b, host)?;
+            let p = check(d.map_memory(m, 0, avk::WHOLE_SIZE, avk::MemoryMapFlags::empty()), "vkMapMemory")? as *mut u8;
+            Ok((b, m, p))
+        };
+        let (up, up_mem, up_ptr) = buffer(source.len(), avk::BufferUsageFlags::TRANSFER_SRC)?;
+        std::ptr::copy_nonoverlapping(source.as_ptr(), up_ptr, source.len());
+        let (down, down_mem, down_ptr) = buffer((cw * ch) as usize, avk::BufferUsageFlags::TRANSFER_DST)?;
+        let image_info = |format, usage| {
+            avk::ImageCreateInfo::default()
+                .image_type(avk::ImageType::TYPE_2D)
+                .format(format)
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(avk::SampleCountFlags::TYPE_1)
+                .tiling(avk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .initial_layout(avk::ImageLayout::UNDEFINED)
+        };
+        let src = check(
+            d.create_image(
+                &image_info(avk::Format::R8G8B8A8_UNORM, avk::ImageUsageFlags::SAMPLED | avk::ImageUsageFlags::TRANSFER_DST)
+                    .extent(avk::Extent3D { width: sw, height: sh, depth: 1 }),
+                None,
+            ),
+            "vkCreateImage (source)",
+        )?;
+        let src_mem = ctx.bind_image_memory(src, avk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        let src_view = check(
+            d.create_image_view(
+                &avk::ImageViewCreateInfo::default()
+                    .image(src)
+                    .view_type(avk::ImageViewType::TYPE_2D)
+                    .format(avk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(color_range()),
+                None,
+            ),
+            "vkCreateImageView (source)",
+        )?;
+        let nv12 = check(
+            d.create_image(
+                &image_info(avk::Format::G8_B8R8_2PLANE_420_UNORM, avk::ImageUsageFlags::TRANSFER_DST)
+                    .extent(avk::Extent3D { width: cw, height: ch, depth: 1 }),
+                None,
+            ),
+            "vkCreateImage (nv12)",
+        )?;
+        let nv12_mem = ctx.bind_image_memory(nv12, avk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+        converter.bind_eyes(&ctx, src_view, src_view, None);
+
+        let pool = ctx.command_pool(ctx.compute_family)?;
+        let cmd = ctx.command_buffer(pool)?;
+        let fence = ctx.fence()?;
+        check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+        let barrier = |image, old, new, src_stage, src_access, dst_stage, dst_access| {
+            avk::ImageMemoryBarrier2::default()
+                .image(image)
+                .subresource_range(color_range())
+                .old_layout(old)
+                .new_layout(new)
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+        };
+        let to_dst = [
+            barrier(src, avk::ImageLayout::UNDEFINED, avk::ImageLayout::TRANSFER_DST_OPTIMAL, avk::PipelineStageFlags2::NONE, avk::AccessFlags2::NONE, avk::PipelineStageFlags2::COPY, avk::AccessFlags2::TRANSFER_WRITE),
+            barrier(nv12, avk::ImageLayout::UNDEFINED, avk::ImageLayout::TRANSFER_DST_OPTIMAL, avk::PipelineStageFlags2::NONE, avk::AccessFlags2::NONE, avk::PipelineStageFlags2::COPY, avk::AccessFlags2::TRANSFER_WRITE),
+        ];
+        d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(&to_dst));
+        d.cmd_copy_buffer_to_image(
+            cmd,
+            up,
+            src,
+            avk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[avk::BufferImageCopy {
+                image_subresource: avk::ImageSubresourceLayers {
+                    aspect_mask: avk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_extent: avk::Extent3D { width: sw, height: sh, depth: 1 },
+                ..Default::default()
+            }],
+        );
+        let to_read = [barrier(
+            src,
+            avk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            avk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            avk::PipelineStageFlags2::COPY,
+            avk::AccessFlags2::TRANSFER_WRITE,
+            avk::PipelineStageFlags2::COMPUTE_SHADER,
+            avk::AccessFlags2::SHADER_SAMPLED_READ,
+        )];
+        d.cmd_pipeline_barrier2(cmd, &avk::DependencyInfo::default().image_memory_barriers(&to_read));
+        converter.record(&ctx, cmd, [[0.0, 0.0, 1.0, 1.0]; 2], None, nv12);
+        converter.record_luma_readback(&ctx, cmd, down);
+        check(d.end_command_buffer(cmd), "vkEndCommandBuffer")?;
+        let cmds = [cmd];
+        check(d.queue_submit(ctx.compute_queue, &[avk::SubmitInfo::default().command_buffers(&cmds)], fence), "vkQueueSubmit")?;
+        ctx.wait_fence(fence, "convert selftest")?;
+
+        // The left eye, without the right one beside it.
+        let luma = std::slice::from_raw_parts(down_ptr, (cw * ch) as usize);
+        let mut out = Vec::with_capacity((ew * eh) as usize);
+        for row in luma.chunks(cw as usize).take(eh as usize) {
+            out.extend_from_slice(&row[..ew as usize]);
+        }
+        std::fs::write(out_path, &out).map_err(|e| e.to_string())?;
+        log::info!("convert selftest: {sw}x{sh} -> {ew}x{eh} luma written to {out_path}");
+
+        // GPU time of the conversion alone (both eyes), as the video thread runs it.
+        const RUNS: u32 = 50;
+        let t0 = Instant::now();
+        for _ in 0..RUNS {
+            check(d.reset_command_buffer(cmd, avk::CommandBufferResetFlags::empty()), "vkResetCommandBuffer")?;
+            check(d.begin_command_buffer(cmd, &avk::CommandBufferBeginInfo::default()), "vkBeginCommandBuffer")?;
+            converter.record(&ctx, cmd, [[0.0, 0.0, 1.0, 1.0]; 2], None, nv12);
+            check(d.end_command_buffer(cmd), "vkEndCommandBuffer")?;
+            check(d.queue_submit(ctx.compute_queue, &[avk::SubmitInfo::default().command_buffers(&cmds)], fence), "vkQueueSubmit")?;
+            ctx.wait_fence(fence, "convert selftest")?;
+        }
+        log::info!("convert selftest: {:.2} ms per frame (both eyes)", t0.elapsed().as_secs_f64() * 1e3 / RUNS as f64);
+
+        d.destroy_fence(fence, None);
+        d.destroy_command_pool(pool, None);
+        d.destroy_image_view(src_view, None);
+        d.destroy_image(src, None);
+        d.free_memory(src_mem, None);
+        d.destroy_image(nv12, None);
+        d.free_memory(nv12_mem, None);
+        for (b, m) in [(up, up_mem), (down, down_mem)] {
+            d.destroy_buffer(b, None);
+            d.free_memory(m, None);
+        }
+    }
+    converter.destroy(&ctx);
+    Ok(())
 }
 
 /// A detailed, moving NV12 test pattern whose left and right halves (each `half` pixels wide)

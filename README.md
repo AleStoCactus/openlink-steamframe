@@ -19,21 +19,21 @@ OpenLink aims for:
 ## Status
 
 Early but playable: games run well on a Linux PC with a Quest 3 over Wi-Fi, and on a Steam Frame
-over Wi-Fi or its USB wireless adapter. SteamVR renders into the driver's textures, the server
-encodes them with Vulkan Video (H.265) and streams them over UDP, and the headset app decodes them
-in hardware and shows them through OpenXR, reprojected to the current head pose. Head and
-controller tracking, buttons and haptics flow back. Game audio plays in the headset and its
-microphone appears on the PC.
+over Wi-Fi or its USB wireless adapter; the Windows version runs the same pipeline (tested with a
+Quest 3 on an AMD GPU). SteamVR renders into the driver's textures, the server encodes them with
+Vulkan Video (H.265) and streams them over UDP, and the headset app decodes them in hardware and
+shows them through OpenXR, reprojected to the current head pose. Head and controller tracking,
+buttons and haptics flow back. Game audio plays in the headset and its microphone appears on the PC.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | Area | Status | Notes |
 |---|---|---|
 | Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games, but see [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games). Optional foveated encoding: a slider sets how much of each eye around the lens center is encoded at full resolution, with resolution falling off smoothly to a quarter at the edges, so fewer pixels are encoded (about half at 50%), and, on GPUs with quantization maps (e.g. RADV), fewer bits going to a ring around the lens center that widens toward the edges; it changes live without restarting SteamVR. No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
-| Audio | 🟡 Partial | Linux: while a headset is connected, PipeWire gets an "OpenLink" output device (plays in the headset) and an "OpenLink" microphone, to pick in the sound settings. Uncompressed 48 kHz PCM with an adaptive jitter buffer; echo cancellation on the headset mic. Windows needs a virtual audio driver first |
+| Audio | 🟡 Partial | Linux: while a headset is connected, PipeWire gets an "OpenLink" output device (plays in the headset) and an "OpenLink" microphone, to pick in the sound settings. Windows (which cannot create devices without a kernel driver): what plays on the default output device is also streamed to the headset, and the headset's microphone plays into a virtual audio cable (VB-CABLE's "CABLE Input" by default, settable in the desktop app) whose other end is the microphone to pick. Uncompressed 48 kHz PCM with an adaptive jitter buffer; echo cancellation on the headset mic |
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
 | Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync, tracking and Steam Frame adapter status, and holds video, audio and connection settings, with level meters for the headset's audio. The encoded resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye) and applies live; SteamVR's 100% is that size enlarged for the lens, like a native headset's (Quest 3 at 100%: about 3174×3429, matching the 25 PPD at the center of view; on a Steam Frame, whose lens profile is not known yet, it is the encoded size), and its render resolution setting scales from there. Refresh rates are 72 to 120 Hz, plus 144, 165, 207 and 240 Hz with a Quest 3 (Horizon OS v2.7 or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not list these rates but accepts them when asked, so the app tries each at startup; the stream uses the closest rate the headset accepts. Only some settings take effect (H.265 is the only encoder; USB cable does nothing yet) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+; also tested on an RX 9070 XT). With a second GPU (an integrated one, say) the driver uses the one SteamVR's compositor renders on; `OPENLINK_RENDER_NODE=/dev/dri/renderDN` overrides it |
-| Windows version | 📋 Planned | Tracking and driver parts are written with Windows in mind, but there is no Windows video path yet |
+| Windows version | 🟡 Partial | The same pipeline as on Linux: the driver shares SteamVR's frames as D3D11 textures, the server encodes them with Vulkan Video (H.265). Verified with a Quest 3 over Wi-Fi on an AMD RX 6800 (90 fps at full resolution with nothing skipped: convert 1–1.6 ms, encode 10.3 ms, overlapped; 3.3 ms encode with foveation); not yet on NVIDIA or Intel. AMD's Windows driver ignores Vulkan's bitrate setting, so on Windows the server sets each frame's QP itself. SteamVR's own render resolution setting applies on top: check it if the picture looks softer than on Linux. Needs a GPU whose Windows driver has Vulkan Video H.265 encode, and the Vulkan SDK to build |
 | Steam Frame build | 🟡 Playable | Native arm64 Linux app (`openlink-frame`): OpenXR on the headset's SteamVR runtime, GL over EGL, hardware decode through V4L2 (Qualcomm Iris, 3–6 ms a picture). Beat Saber plays. Controllers still show up as Quest Touch controllers. See [Play on a Steam Frame](#play-on-a-steam-frame) |
 | Wi-Fi streaming | ✅ Working | See [Connection](#connection) |
 | Steam Frame adapter | 🟡 Working, rough edges | The Frame's USB wireless adapter as a direct 6 GHz link. See [Connection](#connection) |
@@ -59,7 +59,8 @@ Beyond the rows above, these are on the way:
 
 **Desktop app**
 
-- **Driver installation from the GUI**, so `scripts/install-driver.sh` is no longer needed.
+- **Driver installation from the GUI**, so `scripts/install-driver.sh` (`.ps1` on Windows) is no
+  longer needed.
 - **A clearer, more intuitive layout** overall.
 
 ## Connection
@@ -109,7 +110,9 @@ crates/openlink-quest      Quest app (OpenXR, NativeActivity)
 crates/openlink-frame      Steam Frame app (native Linux arm64: OpenXR, EGL, V4L2)
 driver/openlink            SteamVR driver manifest/resources
 scripts/install-driver.sh  build + register the driver (Linux)
-scripts/build-quest.sh     build (and --install) the Quest APK
+scripts/install-driver.ps1 build + register the driver (Windows)
+scripts/build-quest.sh     build (and --install) the Quest APK (Linux)
+scripts/build-quest.ps1    build (and -Install) the Quest APK (Windows)
 scripts/build-frame.sh     build (and --install over SSH) the Steam Frame app
 ```
 
@@ -210,10 +213,51 @@ Known on the Frame:
 While a game runs, SteamVR submits its own layer (dashboard, laser, controller models) next to the
 game's, and the server draws it over the game. On an RX 9070 XT, SteamVR drew that layer into only
 one of the three textures it rotates through, so the other two (stale, opaque) covered the game
-in two frames of three: half the frame rate with black in between. Until that is understood, the
-setting `"steamvr_layer_over_games": false` in `~/.config/openlink/settings.json` streams games
-without SteamVR's layer: games are clean, but the dashboard opened over a game does not show in
-the headset.
+in two frames of three: half the frame rate with black in between. Until that is understood,
+turning off "SteamVR layer over games" in the desktop app's Display tab (saved as
+`"steamvr_layer_over_games": false` in `~/.config/openlink/settings.json`) streams games without
+SteamVR's layer: games are clean, but the dashboard opened over a game does not show in the
+headset.
+
+## Windows
+
+Needs a GPU whose Windows driver has Vulkan Video H.265 encode (tested: AMD RX 6800, driver
+32.0.21045), Rust with the MSVC toolchain, and the Vulkan SDK (for `glslc`;
+`winget install KhronosGroup.VulkanSDK`). In PowerShell:
+
+```powershell
+cargo test --workspace
+scripts\install-driver.ps1                      # builds and registers dist\openlink with SteamVR
+cargo run --release -p openlink-server          # the desktop app
+cargo run --release -p openlink-client --bin mock-headset   # or the Quest app
+Start-Process steam://run/250820                # SteamVR
+```
+
+Allow `openlink` through Windows Firewall when asked (the headset reaches it on UDP 9757).
+`scripts\install-driver.ps1 -Remove` unregisters the driver.
+
+To build and install the Quest app from Windows, with the headset in developer mode on USB:
+
+```powershell
+# once: JDK, Android SDK + NDK (sdkmanager is in the SDK's cmdline-tools), Rust target, cargo-ndk
+winget install Microsoft.OpenJDK.17
+# sdkmanager.bat splits arguments at ';', so the packages go in a file
+Set-Content packages.txt "build-tools;35.0.1`nplatforms;android-34`nndk;30.0.16248370"
+sdkmanager --package_file=packages.txt
+rustup target add aarch64-linux-android; cargo install cargo-ndk
+
+scripts\build-quest.ps1 -Install                # builds, installs and starts the app over USB
+```
+
+It looks for the SDK in `ANDROID_HOME` or `%LOCALAPPDATA%\Android\Sdk`. An app built on another
+machine is signed with that machine's debug key and must be uninstalled first
+(`adb uninstall org.openlink.quest`), unless both use the same `~/.android/debug.keystore`.
+
+Audio differs from Linux because Windows cannot create audio devices without a kernel driver:
+game audio is whatever plays on the **default output device** (it keeps playing on the PC too),
+and the headset's microphone plays into a **virtual audio cable** such as
+[VB-CABLE](https://vb-audio.com/Cable/): install it, then pick "CABLE Output" as the microphone in
+games. The desktop app's "Microphone plays into" setting names a different cable if you use one.
 
 ## License
 

@@ -70,7 +70,7 @@ impl Client {
         }
         .parse()
         .unwrap();
-        let sock = UdpSocket::bind(bind)?;
+        let sock = openlink_protocol::net::bind_udp(bind)?;
         sock.connect(server)?;
         set_recv_buffer(&sock, 4 << 20);
         let state = Arc::new(Mutex::new(ClientState::default()));
@@ -325,7 +325,7 @@ fn interface_broadcasts() -> Vec<std::net::Ipv4Addr> {
 /// Finds a server on the LAN: broadcasts `Hello` until one answers with `Welcome`, for up to
 /// `timeout`. The server then simply sees the real client's `Hello` as a reconnect.
 pub fn discover(info: &HeadsetInfo, timeout: Duration) -> std::io::Result<Option<SocketAddr>> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let sock = openlink_protocol::net::bind_udp("0.0.0.0:0")?;
     sock.set_broadcast(true)?;
     sock.set_read_timeout(Some(Duration::from_millis(250)))?;
     let hello = proto::encode(&HeadsetMessage::Hello(info.clone()));

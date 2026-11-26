@@ -7,7 +7,7 @@
 //! restart there never takes SteamVR down.
 
 pub mod devices;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod direct_mode;
 #[cfg(target_os = "linux")]
 mod gbm;
@@ -16,7 +16,7 @@ pub mod link;
 pub mod ovr;
 pub mod render_pose;
 pub mod state;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 mod video;
 
 use devices::{controller_serial, Controller, Hmd, HMD_SERIAL};
@@ -71,9 +71,9 @@ static PROVIDER: SyncProvider = SyncProvider(Provider {
 });
 
 static LINK: Mutex<Option<link::Link>> = Mutex::new(None);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) static VSYNC: Mutex<Option<direct_mode::VsyncThread>> = Mutex::new(None);
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 static VIDEO: Mutex<Option<video::VideoLink>> = Mutex::new(None);
 
 unsafe extern "C" fn provider_init(
@@ -116,7 +116,7 @@ unsafe extern "C" fn provider_init(
                 return VRInitError_Driver_Failed;
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if devices::use_direct_mode() {
             match video::VideoLink::start() {
                 Ok(v) => *VIDEO.lock().unwrap() = Some(v),
@@ -130,7 +130,7 @@ unsafe extern "C" fn provider_init(
 unsafe extern "C" fn provider_cleanup(_this: *mut c_void) {
     guard((), || {
         log::info!("OpenLink driver shutting down");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             VSYNC.lock().unwrap().take();
             VIDEO.lock().unwrap().take();
