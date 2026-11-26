@@ -7,6 +7,7 @@
 use super::import::color_range;
 use super::vk::{check, Context, Result};
 use ash::vk;
+use openlink_protocol::foveation::Foveation;
 
 static SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rgba_to_nv12.comp.spv"));
 
@@ -16,9 +17,17 @@ struct Push {
     bounds: [[f32; 4]; 2],
     overlay_bounds: [[f32; 4]; 2],
     eye_size: [i32; 2],
-    has_overlay: i32,
-    _pad: i32,
+    /// [`Foveation::full`], [`Foveation::coded`] and [`Foveation::band`] (0 without
+    /// foveation), in pixels.
+    fov_full: [f32; 2],
+    fov_coded: [f32; 2],
+    fov_band: [f32; 2],
+    /// Per eye, [`Foveation::start`]: full x, encoded x, full y, encoded y.
+    fov_start: [[f32; 4]; 2],
 }
+
+// 128 bytes is the push constant size every Vulkan device must support.
+const _: () = assert!(std::mem::size_of::<Push>() <= 128);
 
 struct Plane {
     image: vk::Image,
@@ -41,6 +50,7 @@ pub struct Converter {
     /// Picture size of one eye inside the frame.
     pub eye_width: u32,
     pub eye_height: u32,
+    foveation: Option<Foveation>,
     fresh: bool,
 }
 
@@ -78,7 +88,15 @@ fn plane(ctx: &Context, format: vk::Format, w: u32, h: u32) -> Result<Plane> {
 impl Converter {
     /// `width`x`height` is the coded frame size; the eyes fill `2 * eye_width` x `eye_height`
     /// of it from the top left.
-    pub fn new(ctx: &Context, width: u32, height: u32, eye_width: u32, eye_height: u32) -> Result<Self> {
+    /// With `foveation`, each eye's output is the squeezed picture it describes.
+    pub fn new(
+        ctx: &Context,
+        width: u32,
+        height: u32,
+        eye_width: u32,
+        eye_height: u32,
+        foveation: Option<Foveation>,
+    ) -> Result<Self> {
         assert!(width % 2 == 0 && height % 2 == 0 && 2 * eye_width <= width && eye_height <= height);
         let d = &ctx.device;
         let bindings = [
@@ -206,6 +224,7 @@ impl Converter {
                 height,
                 eye_width,
                 eye_height,
+                foveation,
                 fresh: true,
             })
         }
@@ -304,10 +323,15 @@ impl Converter {
         });
         let push = Push {
             bounds,
-            overlay_bounds: overlay_bounds.unwrap_or(bounds),
+            // All zero tells the shader there is no overlay.
+            overlay_bounds: overlay_bounds.unwrap_or_default(),
             eye_size: [self.eye_width as i32, self.eye_height as i32],
-            has_overlay: overlay_bounds.is_some() as i32,
-            _pad: 0,
+            fov_full: self.foveation.map_or([1.0; 2], |f| f.full.map(|v| v as f32)),
+            fov_coded: self.foveation.map_or([1.0; 2], |f| f.coded.map(|v| v as f32)),
+            fov_band: self.foveation.map_or([0.0; 2], |f| f.band.map(|v| v as f32)),
+            fov_start: self.foveation.map_or([[0.0; 4]; 2], |f| {
+                f.start.map(|[[bx, cx], [by, cy]]| [bx as f32, cx as f32, by as f32, cy as f32])
+            }),
         };
         // SAFETY: recording into a command buffer in the recording state; all handles valid.
         unsafe {

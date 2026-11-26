@@ -28,16 +28,17 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | Area | Status | Notes |
 |---|---|---|
-| Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games, but see [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games). No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
+| Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games, but see [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games). Optional foveated encoding: a slider sets how much of each eye around the lens center is encoded at full resolution, with resolution falling off smoothly to a quarter at the edges, so fewer pixels are encoded (about half at 50%), and, on GPUs with quantization maps (e.g. RADV), fewer bits going to a ring around the lens center that widens toward the edges; it changes live without restarting SteamVR. No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
 | Audio | 🟡 Partial | Linux: while a headset is connected, PipeWire gets an "OpenLink" output device (plays in the headset) and an "OpenLink" microphone, to pick in the sound settings. Uncompressed 48 kHz PCM with an adaptive jitter buffer; echo cancellation on the headset mic. Windows needs a virtual audio driver first |
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
-| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync, tracking and Steam Frame adapter status, and holds video, audio and connection settings, with level meters for the headset's audio. The encoded resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye) and applies live; SteamVR renders at that size at its own 100% and its render resolution setting scales from there. Only some settings take effect (H.265 is the only encoder; USB cable does nothing yet) |
+| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync, tracking and Steam Frame adapter status, and holds video, audio and connection settings, with level meters for the headset's audio. The encoded resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye) and applies live; SteamVR's 100% is that size enlarged for the lens, like a native headset's (Quest 3 at 100%: about 3174×3429, matching the 25 PPD at the center of view; on a Steam Frame, whose lens profile is not known yet, it is the encoded size), and its render resolution setting scales from there. Refresh rates are 72 to 120 Hz, plus 144, 165, 207 and 240 Hz with a Quest 3 (Horizon OS v2.7 or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not list these rates but accepts them when asked, so the app tries each at startup; the stream uses the closest rate the headset accepts. Only some settings take effect (H.265 is the only encoder; USB cable does nothing yet) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+; also tested on an RX 9070 XT). With a second GPU (an integrated one, say) the driver uses the one SteamVR's compositor renders on; `OPENLINK_RENDER_NODE=/dev/dri/renderDN` overrides it |
 | Windows version | 📋 Planned | Tracking and driver parts are written with Windows in mind, but there is no Windows video path yet |
 | Steam Frame build | 🟡 Playable | Native arm64 Linux app (`openlink-frame`): OpenXR on the headset's SteamVR runtime, GL over EGL, hardware decode through V4L2 (Qualcomm Iris, 3–6 ms a picture). Beat Saber plays. Controllers still show up as Quest Touch controllers. See [Play on a Steam Frame](#play-on-a-steam-frame) |
 | Wi-Fi streaming | ✅ Working | See [Connection](#connection) |
 | Steam Frame adapter | 🟡 Working, rough edges | The Frame's USB wireless adapter as a direct 6 GHz link. See [Connection](#connection) |
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
+| Quest 3 Extended Refresh Rates | 🟡 Partial | Server side works, Quest app doesn't request the refresh rate correctly |
 | Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issues: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth; [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games) |
 
 ### Planned
@@ -46,12 +47,8 @@ Beyond the rows above, these are on the way:
 
 **Video and display**
 
-- **Lens-corrected 100% resolution:** SteamVR's 100% render resolution will account for the
-  headset's lens distortion, so it matches the panel's pixel density at the center of view.
 - **Automatic refresh rate and resolution detection:** the refresh rates and resolution the
   headset supports are read from it and offered as options, instead of being entered by hand.
-- **Up to 240 Hz** on Quest 3 (v2.7 and later).
-- **Foveated streaming** with controls for the size of the full-detail region.
 
 **SteamVR integration**
 

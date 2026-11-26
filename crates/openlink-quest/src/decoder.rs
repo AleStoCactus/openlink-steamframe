@@ -145,7 +145,9 @@ pub fn spawn(frames: Receiver<Frame>, client: Arc<Mutex<ClientState>>, output: A
                 };
                 if let Some(frame) = frame {
                     let Some(cfg) = client.lock().unwrap().welcome.clone() else { continue };
-                    let want = (2 * cfg.eye_width, cfg.eye_height, cfg.codec);
+                    // The coded picture: smaller than the eyes are shown at when foveated.
+                    let (eye_w, eye_h) = cfg.coded_eye_size();
+                    let want = (2 * eye_w, eye_h, cfg.codec);
                     if decoder.as_ref().is_none_or(|(_, have)| *have != want) {
                         if !frame.info.idr {
                             continue; // a new decoder must start at an IDR

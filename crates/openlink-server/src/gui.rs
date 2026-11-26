@@ -131,9 +131,19 @@ impl App {
                     ui.end_row();
                     ui.label("Video");
                     let (pw, ph) = h.info.panel_size();
+                    let (rw, rh) = h.info.render_size((h.stream.eye_width, h.stream.eye_height));
                     ui.label(format!(
-                        "{}×{} per eye encoded @ {} Hz (panel {pw}×{ph})",
-                        h.stream.eye_width, h.stream.eye_height, h.stream.refresh_rate,
+                        "{}×{} per eye{} @ {} Hz (panel {pw}×{ph}, SteamVR 100% {rw}×{rh})",
+                        h.stream.eye_width,
+                        h.stream.eye_height,
+                        match h.stream.foveation {
+                            Some(_) => {
+                                let (cw, ch) = h.stream.coded_eye_size();
+                                format!(", foveated to {cw}×{ch}")
+                            }
+                            None => " encoded".into(),
+                        },
+                        h.stream.refresh_rate,
                     ));
                     ui.end_row();
                     ui.label("Audio");
@@ -218,15 +228,18 @@ impl App {
                             .suffix("%"),
                     )
                     .on_hover_text(
-                        "Streamed resolution, relative to the headset's panel. SteamVR renders \
-                         at this size at its own 100%; change the render resolution in SteamVR's \
-                         settings. Saving a new value while a headset is connected restarts \
+                        "Streamed resolution, relative to the headset's panel. SteamVR's 100% \
+                         is this size enlarged for the headset's lens, so it matches the stream's \
+                         sharpness at the center of view (as with other headsets, it is larger \
+                         than the panel); change the render resolution in SteamVR's settings. \
+                         Saving a new value while a headset is connected restarts \
                          SteamVR, which only picks up a new size when it starts.",
                     );
                     match &headset {
                         Some(info) => {
                             let (w, h) = info.encoded_size(d.resolution_percent);
-                            ui.label(format!("{w} × {h} per eye"));
+                            let (rw, rh) = info.render_size((w, h));
+                            ui.label(format!("{w} × {h} per eye (SteamVR 100%: {rw} × {rh})"));
                         }
                         None => {
                             ui.weak("connect a headset to see the size");
@@ -235,14 +248,77 @@ impl App {
                 });
                 ui.end_row();
 
-                ui.label("Refresh rate");
-                egui::ComboBox::from_id_salt("hz")
-                    .selected_text(format!("{} Hz", d.refresh_rate))
-                    .show_ui(ui, |ui| {
-                        for hz in [72.0, 80.0, 90.0, 120.0] {
-                            ui.selectable_value(&mut d.refresh_rate, hz, format!("{hz} Hz"));
+                ui.label("Foveated encoding");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Slider::new(&mut d.foveation_percent, 20..=100)
+                            .step_by(5.0)
+                            // The suffix would also follow "off", so the formatter adds the %.
+                            .custom_formatter(|v, _| if v >= 100.0 { "off".into() } else { format!("{v:.0}%") })
+                            .custom_parser(|s| {
+                                let s = s.trim();
+                                if s.eq_ignore_ascii_case("off") {
+                                    Some(100.0)
+                                } else {
+                                    s.trim_end_matches('%').trim().parse().ok()
+                                }
+                            }),
+                    )
+                    .on_hover_text(
+                        "How much of each eye's width and height, around the center of the lens, \
+                         is encoded at full resolution. Outside it, resolution falls off smoothly \
+                         to a quarter at the very edges, where the lens blurs anyway: the encoder \
+                         has fewer pixels to code and spends the bitrate on the center. Where the \
+                         GPU supports quantization maps, the encoder also gives fewer bits to a \
+                         ring around the lens center, falling off toward the edges. Lower saves \
+                         more. 100% turns it off. Applies live, without restarting SteamVR.",
+                    );
+                    if let Some(info) = &headset {
+                        let full = info.encoded_size(d.resolution_percent);
+                        let fraction = d.foveation_percent as f32 / 100.0;
+                        match openlink_protocol::foveation::Foveation::new(fraction, &info.fov, full) {
+                            Some(f) => {
+                                let (w, h) = f.coded_eye_size();
+                                let pct = 100.0 * (w * h) as f32 / (full.0 * full.1) as f32;
+                                ui.label(format!("{w} × {h} per eye encoded ({pct:.0}% of the pixels)"));
+                            }
+                            None => {
+                                ui.weak("whole picture at full resolution");
+                            }
                         }
-                    });
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Refresh rate");
+                ui.horizontal(|ui| {
+                    let high = headset.as_ref().map_or(&[][..], |h| h.high_refresh_rates());
+                    egui::ComboBox::from_id_salt("hz")
+                        .selected_text(format!("{} Hz", d.refresh_rate))
+                        .show_ui(ui, |ui| {
+                            for &hz in [72.0, 80.0, 90.0, 120.0].iter().chain(high) {
+                                ui.selectable_value(&mut d.refresh_rate, hz, format!("{hz} Hz"));
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Quest 3 on Horizon OS v2.7 or later also runs at 144, 165 and 207 Hz, \
+                             and at 240 Hz in developer mode with display scaling on. The stream \
+                             uses the closest rate the headset currently accepts.",
+                        );
+                    // The session streams at the closest rate the headset's runtime lists; say so
+                    // when that is not the one picked (e.g. 240 Hz outside developer mode).
+                    if let Some(h) = &headset {
+                        let closest = h
+                            .refresh_rates
+                            .iter()
+                            .copied()
+                            .min_by(|a, b| (a - d.refresh_rate).abs().total_cmp(&(b - d.refresh_rate).abs()));
+                        if let Some(hz) = closest.filter(|hz| (hz - d.refresh_rate).abs() > 0.5) {
+                            ui.weak(format!("headset does not offer it now; streams at {hz} Hz"));
+                        }
+                    }
+                });
                 ui.end_row();
             });
 
@@ -292,7 +368,7 @@ impl App {
                 self.draft = self.settings.lock().unwrap().clone();
             }
             ui.weak(
-                "Resolution, bitrate and refresh rate apply to a connected headset right away; \
+                "Resolution, foveation, bitrate and refresh rate apply to a connected headset right away; \
                  the rest on its next connection.",
             );
         });

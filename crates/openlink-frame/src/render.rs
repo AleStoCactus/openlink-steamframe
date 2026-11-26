@@ -4,7 +4,9 @@
 //! the chroma plane as RG8 at half resolution, and the shader turns them back into RGB (BT.709,
 //! limited range, as the server's encoder writes). Each eye's half is drawn full-screen into
 //! that eye's swapchain image; the OpenXR compositor then reprojects it from the pose SteamVR
-//! rendered with to the current head pose.
+//! rendered with to the current head pose. A foveated picture (squeezed edges, see
+//! `openlink_protocol::foveation`) is stretched back to full size on the way, with the same
+//! warp as the Quest renderer.
 //!
 //! Planes reach GL in one of two ways: imported as dmabufs (no copy; the buffer stays lent
 //! from the decoder while it may be read), or, where import is unavailable, uploaded into the
@@ -33,14 +35,48 @@ uniform sampler2D chroma;
 uniform vec4 rect;
 // Whether to undo the sRGB encoding (the swapchain is sRGB and encodes again on write).
 uniform int linearize;
+// Foveation, mirrored from openlink_protocol::foveation::Foveation::to_coded, in pixels:
+// fov_size is the full-resolution and the encoded eye size (w, h, w, h), fov_band the band's
+// length (0: the picture is not foveated) and fov_start where it starts in this eye (full x,
+// encoded x, full y, encoded y).
+uniform vec4 fov_size;
+uniform vec2 fov_band;
+uniform vec4 fov_start;
 in vec2 uv;
 out vec4 color;
 vec3 srgb_to_linear(vec3 c) {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
 }
+// Growth of the encoded pixel size along a side e full and l encoded pixels long.
+float growth(float e, float l) {
+    return 2.0 * max(e - l, 0.0) / max(l * l, 0.25);
+}
+// Encoded pixels from the band for a point s full pixels from it.
+float squeeze(float a, float s) {
+    return 2.0 * s / (1.0 + sqrt(1.0 + 2.0 * a * s));
+}
+// One axis, in pixels: full-resolution position x -> position in the encoded eye.
+float foveate(float x, float full, float coded, float band, float b0, float c0) {
+    if (x < b0) {
+        return c0 - squeeze(growth(b0, c0), b0 - x);
+    }
+    if (x > b0 + band) {
+        return c0 + band + squeeze(growth(full - b0 - band, coded - c0 - band), x - b0 - band);
+    }
+    return c0 + x - b0;
+}
 void main() {
-    // GL framebuffers are bottom-up; the picture's first row (t = 0) is its top.
-    vec2 t = vec2(mix(rect.x, rect.z, uv.x), mix(rect.w, rect.y, uv.y));
+    // Position in the full eye image, y down (GL framebuffers are bottom-up; the picture's
+    // first row, t = 0, is its top).
+    vec2 p = vec2(uv.x, 1.0 - uv.y);
+    if (fov_band.x > 0.0) {
+        // The swapchain is the full-resolution size, so a fragment's center is a pixel center
+        // and, inside the band, lands on an encoded pixel's center.
+        vec2 x = p * fov_size.xy;
+        p = vec2(foveate(x.x, fov_size.x, fov_size.z, fov_band.x, fov_start.x, fov_start.y),
+                 foveate(x.y, fov_size.y, fov_size.w, fov_band.y, fov_start.z, fov_start.w)) / fov_size.zw;
+    }
+    vec2 t = mix(rect.xy, rect.zw, p);
     float y = (texture(luma, t).r * 255.0 - 16.0) / 219.0;
     vec2 c = (texture(chroma, t).rg * 255.0 - 128.0) / 224.0;
     vec3 rgb = clamp(vec3(
@@ -75,6 +111,9 @@ pub struct Renderer {
     fbo: glow::Framebuffer,
     rect_loc: glow::UniformLocation,
     linearize_loc: glow::UniformLocation,
+    fov_size_loc: Option<glow::UniformLocation>,
+    fov_band_loc: Option<glow::UniformLocation>,
+    fov_start_loc: Option<glow::UniformLocation>,
     /// The upload path's textures and their size.
     uploaded: [glow::Texture; 2],
     uploaded_size: (u32, u32),
@@ -107,6 +146,9 @@ impl Renderer {
             }
             let rect_loc = gl.get_uniform_location(program, "rect").ok_or("no rect uniform")?;
             let linearize_loc = gl.get_uniform_location(program, "linearize").ok_or("no linearize uniform")?;
+            let fov_size_loc = gl.get_uniform_location(program, "fov_size");
+            let fov_band_loc = gl.get_uniform_location(program, "fov_band");
+            let fov_start_loc = gl.get_uniform_location(program, "fov_start");
             gl.use_program(Some(program));
             for (name, unit) in [("luma", 0), ("chroma", 1)] {
                 if let Some(loc) = gl.get_uniform_location(program, name) {
@@ -120,6 +162,9 @@ impl Renderer {
                 program,
                 rect_loc,
                 linearize_loc,
+                fov_size_loc,
+                fov_band_loc,
+                fov_start_loc,
                 uploaded,
                 uploaded_size: (0, 0),
                 imported: HashMap::new(),
@@ -301,6 +346,18 @@ impl Renderer {
             let r = c.rects[eye];
             gl.uniform_4_f32(Some(&self.rect_loc), r[0], r[1], r[2], r[3]);
             gl.uniform_1_i32(Some(&self.linearize_loc), srgb as i32);
+            // Each picture is unwarped with the parameters it was encoded with.
+            match c.info.info.foveation {
+                Some(f) => {
+                    let ([fw, fh], [cw, ch], [bw, bh]) = (f.full, f.coded, f.band);
+                    let [[bx, cx], [by, cy]] = f.start[eye];
+                    let v = |n: u32| n as f32;
+                    gl.uniform_4_f32(self.fov_size_loc.as_ref(), v(fw), v(fh), v(cw), v(ch));
+                    gl.uniform_2_f32(self.fov_band_loc.as_ref(), v(bw), v(bh));
+                    gl.uniform_4_f32(self.fov_start_loc.as_ref(), v(bx), v(cx), v(by), v(cy));
+                }
+                None => gl.uniform_2_f32(self.fov_band_loc.as_ref(), 0.0, 0.0),
+            }
             for (unit, t) in [glow::TEXTURE0, glow::TEXTURE1].into_iter().zip(c.textures) {
                 gl.active_texture(unit);
                 gl.bind_texture(glow::TEXTURE_2D, Some(t));
@@ -416,7 +473,7 @@ mod tests {
             luma: PlaneRef { memory: 0, offset: 0, pitch },
             chroma: PlaneRef { memory: 0, offset: pitch * coded_h, pitch },
         };
-        let info = FrameInfo { idr: true, render_pose: Pose::IDENTITY, present_ns: 7 };
+        let info = FrameInfo { idr: true, render_pose: Pose::IDENTITY, present_ns: 7, foveation: None };
         let picture = Picture { info, received_ns: 0, queued_ns: 0, decoded_ns: 0 };
         let (d, released) = Decoded::for_test(picture, layout, vec![CaptureBuffer { maps: vec![map], dmabufs: None }]);
         assert_eq!(renderer.update(&egl, Some(d)).unwrap().info.present_ns, 7);

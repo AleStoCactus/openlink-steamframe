@@ -35,6 +35,11 @@ pub struct Settings {
     /// relative to it. (Replaces `resolution_scale`, a multiplier on the headset's much smaller
     /// recommended size; an old value is ignored rather than reinterpreted.)
     pub resolution_percent: u32,
+    /// Foveated encoding: percent of each eye's width and height, around the lens's center,
+    /// encoded at full resolution; outside it resolution falls off to a quarter at the edges
+    /// ([`openlink_protocol::foveation`]). 100 turns it off. Applies live, without restarting
+    /// SteamVR (its render size does not depend on it).
+    pub foveation_percent: u32,
     pub refresh_rate: f32,
     pub connection: ConnectionMode,
     /// Draw SteamVR's own layer (dashboard, laser, controllers) over a game's. Off where
@@ -54,6 +59,7 @@ impl Default for Settings {
             bitrate_mbps: 200,
             // Panel resolution (Quest 3: 2064x2208 per eye).
             resolution_percent: 100,
+            foveation_percent: 100,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
             steamvr_layer_over_games: true,

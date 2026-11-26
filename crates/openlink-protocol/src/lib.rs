@@ -17,6 +17,7 @@
 
 pub mod audio;
 pub mod clock;
+pub mod foveation;
 pub mod time;
 pub mod video;
 #[cfg(target_os = "linux")]
@@ -26,7 +27,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
+
+/// [`HeadsetInfo::high_refresh_rates`] by model name, for the headset to probe before it has a
+/// `HeadsetInfo`.
+pub fn high_refresh_rates(model: &str) -> &'static [f32] {
+    let m: String = model.to_ascii_lowercase().split_whitespace().collect();
+    if m.contains("quest3") && !m.contains("quest3s") {
+        &[144.0, 165.0, 207.0, 240.0]
+    } else {
+        &[]
+    }
+}
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -207,12 +219,81 @@ impl HeadsetInfo {
         }
     }
 
+    /// Refresh rates the model can run at beyond the common 72/80/90/120 Hz. Quest 3 on
+    /// Horizon OS v2.7 and later: up to 207 Hz normally and 240 Hz in developer mode with display scaling on. Whether
+    /// the headset really offers one right now is up to its runtime: the Quest app tries each
+    /// and lists the ones accepted in [`refresh_rates`](Self::refresh_rates), and the stream
+    /// uses the closest one listed.
+    pub fn high_refresh_rates(&self) -> &'static [f32] {
+        high_refresh_rates(&self.model)
+    }
+
     /// Per-eye size to encode at `percent` of the panel resolution: even (video formats need
     /// that) and at least 2.
     pub fn encoded_size(&self, percent: u32) -> (u32, u32) {
         let (w, h) = self.panel_size();
         let scale = |v: u32| ((((v as u64 * percent as u64 + 50) / 100) as u32) & !1).max(2);
         (scale(w), scale(h))
+    }
+
+    /// Pixels per degree at the center of the view, as Meta publishes them per model.
+    ///
+    /// The lens magnifies the middle of the panel less than its edges, so the panel's pixels
+    /// are densest (per degree) at the center. A flat render target covering the same FOV has
+    /// to be considerably larger than the panel to match that density; this is why other
+    /// headsets' 100% in SteamVR is well above their panel size (Index: 1.4x). The lens profile
+    /// is not queryable through OpenXR, so it comes from the model name like [`panel_size`].
+    ///
+    /// [`panel_size`]: Self::panel_size
+    pub fn center_ppd(&self) -> Option<f32> {
+        let m: String = self.model.to_ascii_lowercase().split_whitespace().collect();
+        if m.contains("quest3s") {
+            Some(20.0)
+        } else if m.contains("quest3") {
+            Some(25.0)
+        } else if m.contains("questpro") {
+            Some(22.0)
+        } else if m.contains("quest2") {
+            Some(20.0)
+        } else {
+            None
+        }
+    }
+
+    /// How much larger than the panel a flat (rectilinear) render target must be, per axis, to
+    /// match the panel's pixel density at the center of the view after lens distortion.
+    ///
+    /// A rectilinear image `w` pixels wide spanning tangents `[l, r]` has `w / (r - l)` pixels
+    /// per radian at its center, so the matching width is the center density times the tangent
+    /// span. Quest 3 (FOV 54/40/44/55 degrees, 25 PPD): 3174x3429 for a 2064x2208 panel, 1.54x
+    /// on both axes. Never below 1, and 1 for a headset whose lens is unknown.
+    pub fn lens_scale(&self) -> (f32, f32) {
+        let Some(ppd) = self.center_ppd() else {
+            return (1.0, 1.0);
+        };
+        let px_per_rad = ppd * 180.0 / std::f32::consts::PI;
+        // Both eyes get one render size, so the wider span of the two decides.
+        let span = |a: fn(&Fov) -> f32, b: fn(&Fov) -> f32| {
+            self.fov.iter().map(|f| a(f).tan() - b(f).tan()).fold(0.0f32, f32::max)
+        };
+        let width = span(|f| f.angle_right, |f| f.angle_left);
+        let height = span(|f| f.angle_up, |f| f.angle_down);
+        let (pw, ph) = self.panel_size();
+        let scale = |span: f32, panel: u32| {
+            let s = px_per_rad * span / panel as f32;
+            if s.is_finite() { s.clamp(1.0, 2.0) } else { 1.0 }
+        };
+        (scale(width, pw), scale(height, ph))
+    }
+
+    /// The per-eye render size SteamVR should recommend (its 100%) for a stream of `encoded`
+    /// per-eye pixels: the encoded size enlarged by [`lens_scale`](Self::lens_scale), as a
+    /// native headset's 100% is its panel size enlarged for its lens. The server downsamples
+    /// SteamVR's frames to the encoded size.
+    pub fn render_size(&self, encoded: (u32, u32)) -> (u32, u32) {
+        let (sx, sy) = self.lens_scale();
+        let scale = |v: u32, s: f32| ((v as f32 * s).round() as u32).max(1);
+        (scale(encoded.0, sx), scale(encoded.1, sy))
     }
 }
 
@@ -235,14 +316,26 @@ pub struct HapticPulse {
 pub struct StreamConfig {
     pub codec: Codec,
     pub refresh_rate: f32,
-    /// Encoded per-eye resolution.
+    /// Encoded per-eye resolution before foveation: the size the headset displays at.
     pub eye_width: u32,
     pub eye_height: u32,
+    /// Squeeze the edges of each eye before encoding (see [`foveation`]). Each frame carries the
+    /// parameters it was encoded with; this is the current setting.
+    pub foveation: Option<foveation::Foveation>,
     pub bitrate_bps: u64,
     /// The server streams game audio ([`audio::Stream::Speakers`]); the headset should play it.
     pub speakers: bool,
     /// The server wants the headset's microphone ([`audio::Stream::Microphone`]).
     pub microphone: bool,
+}
+
+impl StreamConfig {
+    /// Per-eye size of the encoded picture: smaller than `eye_width` x `eye_height` when
+    /// foveated.
+    pub fn coded_eye_size(&self) -> (u32, u32) {
+        let full = (self.eye_width, self.eye_height);
+        self.foveation.map_or(full, |f| f.coded_eye_size())
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -315,8 +408,8 @@ pub enum ServerMessage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToDriver {
-    /// The headset, with `eye_width`/`eye_height` replaced by the encoded per-eye size: that is
-    /// the render size SteamVR should recommend.
+    /// The headset, with `eye_width`/`eye_height` replaced by the render size SteamVR should
+    /// recommend: the encoded per-eye size enlarged for the lens ([`HeadsetInfo::render_size`]).
     HeadsetConnected(HeadsetInfo),
     HeadsetDisconnected,
     /// `sample.sample_time_ns` has already been converted to the PC monotonic clock
@@ -413,6 +506,52 @@ mod tests {
         assert_eq!(info("Meta Quest 3S").encoded_size(100), (1832, 1920));
         assert_eq!(info("Oculus Quest2").encoded_size(100), (1832, 1920));
         assert_eq!(info("Unknown HMD").encoded_size(100), (1680, 1760));
+    }
+
+    #[test]
+    fn quest3_offers_high_refresh_rates() {
+        let info = |model: &str| HeadsetInfo {
+            model: model.into(),
+            serial: String::new(),
+            eye_width: 1680,
+            eye_height: 1760,
+            refresh_rates: vec![90.0],
+            current_refresh_rate: 90.0,
+            ipd_m: 0.063,
+            fov: [Fov { angle_left: -0.9, angle_right: 0.8, angle_up: 0.8, angle_down: -0.9 }; 2],
+            decoders: vec![Codec::H265],
+        };
+        assert_eq!(info("Meta Quest 3").high_refresh_rates(), &[144.0, 165.0, 207.0, 240.0]);
+        assert!(info("Meta Quest 3S").high_refresh_rates().is_empty());
+        assert!(info("Meta Quest 2").high_refresh_rates().is_empty());
+    }
+
+    #[test]
+    fn render_size_corrects_for_the_lens() {
+        // A Quest 3's FOV as its runtime reports it (left eye; the right mirrors it).
+        let deg = |d: f32| d.to_radians();
+        let left = Fov { angle_left: deg(-54.0), angle_right: deg(40.0), angle_up: deg(44.0), angle_down: deg(-55.0) };
+        let right = Fov { angle_left: -left.angle_right, angle_right: -left.angle_left, ..left };
+        let info = |model: &str| HeadsetInfo {
+            model: model.into(),
+            serial: String::new(),
+            eye_width: 1680,
+            eye_height: 1760,
+            refresh_rates: vec![90.0],
+            current_refresh_rate: 90.0,
+            ipd_m: 0.063,
+            fov: [left, right],
+            decoders: vec![Codec::H265],
+        };
+        let q3 = info("Meta Quest 3");
+        let (w, h) = q3.render_size(q3.encoded_size(100));
+        assert!((3150..3200).contains(&w) && (3400..3460).contains(&h), "{w}x{h}");
+        // It scales with the encoded size, so SteamVR's 100% follows the slider.
+        let (w50, h50) = q3.render_size(q3.encoded_size(50));
+        assert!(w50.abs_diff(w / 2) <= 1 && h50.abs_diff(h / 2) <= 1);
+        // Unknown lens: render exactly what is streamed.
+        let unknown = info("Unknown HMD");
+        assert_eq!(unknown.render_size((1680, 1760)), (1680, 1760));
     }
 
     fn motion() -> Motion {
