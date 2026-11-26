@@ -42,6 +42,7 @@ Windows (PowerShell; MSVC toolchain, Vulkan SDK for `glslc`, which `build.rs` al
 
 ```powershell
 scripts\install-driver.ps1                    # build + register the driver (SteamVR must be closed); -Remove unregisters
+scripts\build-quest.ps1 [-Install]            # signed APK (SDK in ANDROID_HOME or %LOCALAPPDATA%\Android\Sdk)
 Start-Process steam://run/250820              # SteamVR
 cargo check --target x86_64-unknown-linux-gnu -p openlink-protocol -p openlink-driver -p openlink-client   # Linux type-check
 ```
@@ -90,8 +91,11 @@ Quest app (openlink-quest + openlink-client)  ──UDP 9757──  server `open
   a shared `ID3D11Fence` per frame after acquiring SteamVR's sync texture. `video_ipc` runs over
   loopback TCP 9760. The server opens the textures with D3D11 and copies each frame into
   NT-handle textures imported into Vulkan (`video/d3d.rs`). AMD's Windows driver needs the
-  session reset in the first frame's coding scope and ignores Vulkan rate control, so on
-  Windows `encode.rs` sets QP per frame (`SoftRateControl`).
+  session reset in the first frame's coding scope, ignores Vulkan rate control (so on Windows
+  `encode.rs` sets QP per frame, `SoftRateControl`) and always writes SAO slice syntax (so the
+  SPS enables SAO). Check any encoder change's output with FFmpeg
+  (`ffmpeg -err_detect +bitstream -i out.h265 -f null -`): the Quest decoder only says
+  "Unsupported input buffer".
 - **Audio**: 48 kHz s16 PCM in 5 ms datagrams both ways, with an adaptive `JitterBuffer`
   (`protocol/src/audio.rs`) on each receiver. Linux server creates PipeWire `Audio/Sink` and
   `Audio/Source` streams named "OpenLink" only while a headset is connected

@@ -19,7 +19,7 @@ OpenLink aims for:
 ## Status
 
 Early but playable: games run well on a Linux PC with a Quest 3 over Wi-Fi, and the Windows
-version runs the same pipeline (so far tested with the mock headset). SteamVR renders into
+version runs the same pipeline (tested with a Quest 3 on an AMD GPU). SteamVR renders into
 the driver's textures, the server encodes them with Vulkan Video (H.265) and streams them over UDP,
 and the Quest app decodes them in hardware and shows them through OpenXR, reprojected to the
 current head pose. Head and controller tracking, buttons and haptics flow back. Game audio plays
@@ -33,7 +33,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
 | Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video, audio and connection settings, with level meters for the headset's audio. The encoded resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye) and applies live; SteamVR's 100% is that size enlarged for the lens, like a native headset's (Quest 3 at 100%: about 3174×3429, matching the 25 PPD at the center of view), and its render resolution setting scales from there. Refresh rates are 72 to 120 Hz, plus 144, 165, 207 and 240 Hz with a Quest 3 (Horizon OS v2.7 or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not list these rates but accepts them when asked, so the app tries each at startup; the stream uses the closest rate the headset accepts. Only some settings take effect (H.265 is the only encoder) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+) |
-| Windows version | 🟡 Partial | The same pipeline as on Linux: the driver shares SteamVR's frames as D3D11 textures, the server encodes them with Vulkan Video (H.265). Verified end to end with SteamVR and the mock headset on an AMD RX 6800 (90 fps, 0.9 ms convert, 10 ms encode); not yet with a real Quest, NVIDIA or Intel. AMD's Windows driver ignores Vulkan's rate control, so on Windows the server sets each frame's QP itself. Needs a GPU whose Windows driver has Vulkan Video H.265 encode, and the Vulkan SDK to build |
+| Windows version | 🟡 Partial | The same pipeline as on Linux: the driver shares SteamVR's frames as D3D11 textures, the server encodes them with Vulkan Video (H.265). Verified with a Quest 3 over Wi-Fi on an AMD RX 6800 (90 fps, 0.9 ms convert, 10 ms encode); not yet on NVIDIA or Intel. AMD's Windows driver ignores Vulkan's rate control, so on Windows the server sets each frame's QP itself. Needs a GPU whose Windows driver has Vulkan Video H.265 encode, and the Vulkan SDK to build |
 | Steam Frame build | ❌ Not Planned | A client for Valve's Steam Frame |
 | Wi-Fi streaming | ✅ Working | See [Wi-Fi and USB cable](#wi-fi-and-usb-cable) |
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
@@ -92,7 +92,8 @@ crates/openlink-quest      Quest app (OpenXR, NativeActivity)
 driver/openlink            SteamVR driver manifest/resources
 scripts/install-driver.sh  build + register the driver (Linux)
 scripts/install-driver.ps1 build + register the driver (Windows)
-scripts/build-quest.sh     build (and --install) the Quest APK
+scripts/build-quest.sh     build (and --install) the Quest APK (Linux)
+scripts/build-quest.ps1    build (and -Install) the Quest APK (Windows)
 ```
 
 ## Try it without a headset (Linux)
@@ -158,8 +159,24 @@ Start-Process steam://run/250820                # SteamVR
 ```
 
 Allow `openlink` through Windows Firewall when asked (the headset reaches it on UDP 9757).
-`scripts\install-driver.ps1 -Remove` unregisters the driver. The Quest APK is built with
-`scripts/build-quest.sh` (on Linux or WSL).
+`scripts\install-driver.ps1 -Remove` unregisters the driver.
+
+To build and install the Quest app from Windows, with the headset in developer mode on USB:
+
+```powershell
+# once: JDK, Android SDK + NDK (sdkmanager is in the SDK's cmdline-tools), Rust target, cargo-ndk
+winget install Microsoft.OpenJDK.17
+# sdkmanager.bat splits arguments at ';', so the packages go in a file
+Set-Content packages.txt "build-tools;35.0.1`nplatforms;android-34`nndk;30.0.16248370"
+sdkmanager --package_file=packages.txt
+rustup target add aarch64-linux-android; cargo install cargo-ndk
+
+scripts\build-quest.ps1 -Install                # builds, installs and starts the app over USB
+```
+
+It looks for the SDK in `ANDROID_HOME` or `%LOCALAPPDATA%\Android\Sdk`. An app built on another
+machine is signed with that machine's debug key and must be uninstalled first
+(`adb uninstall org.openlink.quest`), unless both use the same `~/.android/debug.keystore`.
 
 Audio differs from Linux because Windows cannot create audio devices without a kernel driver:
 game audio is whatever plays on the **default output device** (it keeps playing on the PC too),

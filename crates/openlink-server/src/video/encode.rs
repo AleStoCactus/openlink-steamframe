@@ -459,6 +459,13 @@ impl Encoder {
         sps.flags.set_sps_temporal_id_nesting_flag(1);
         sps.flags.set_sps_sub_layer_ordering_info_present_flag(1);
         sps.flags.set_vui_parameters_present_flag(1);
+        // AMD's Windows driver writes SAO syntax into every slice header whatever the SPS says,
+        // so the SPS must say SAO is on or decoders misparse every slice after the SAO flags
+        // (FFmpeg: "alignment_bit_equal_to_one=0"; the Quest shows nothing). RADV follows the
+        // SPS and keeps SAO off.
+        if cfg!(windows) {
+            sps.flags.set_sample_adaptive_offset_enabled_flag(1);
+        }
         sps.chroma_format_idc = StdVideoH265ChromaFormatIdc_STD_VIDEO_H265_CHROMA_FORMAT_IDC_420;
         sps.pic_width_in_luma_samples = coded_width;
         sps.pic_height_in_luma_samples = coded_height;
