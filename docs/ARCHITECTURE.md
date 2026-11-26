@@ -92,6 +92,13 @@ linear velocity (`v + ω × r`).
 Encode must be zero-copy: the texture SteamVR hands the driver is encoded on the same GPU,
 without a round trip through system memory.
 
+**Display filtering.** The Quest app submits eye images at the encoded size (about the panel's
+at 100%), and the lens shows the center of view at about 1.5x the panel's density, so the
+Quest compositor enlarges them there. It does so bilinearly unless the layer asks otherwise
+(`XR_FB_composition_layer_settings`); Virtual Desktop and Steam Link ask for sharpening, and
+without it the picture looked soft next to theirs at the same settings. The app asks for
+quality sharpening (`debug.openlink.layer_filter` switches it live, for comparisons).
+
 **Downscaling.** SteamVR renders larger than the stream (its 100% is enlarged for the lens,
 and games supersample further), so the converter shrinks each eye. It filters with Lanczos-2
 stretched over each output pixel's footprint, so detail a supersampled render adds reaches the

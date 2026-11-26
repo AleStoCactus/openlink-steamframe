@@ -35,7 +35,9 @@ adb logcat -s OpenLink
   `openlink --convert-selftest SRC.rgba 5710x6172 2064x2208 out.gray` runs the downscale alone
   (compare with `ffmpeg ... scale=...:flags=lanczos` for sharpness).
 - Quest debug properties (`adb shell setprop …`): `debug.openlink.server <ip>` (skip LAN discovery),
-  `debug.openlink.freeze 1`, `debug.openlink.swap_eyes 1`.
+  `debug.openlink.freeze 1`, `debug.openlink.swap_eyes 1`,
+  `debug.openlink.layer_filter none|sharpen|supersample|quality-supersample` (default: quality
+  sharpening by the Quest compositor; read live).
 - Server build needs PipeWire headers and clang (pipewire crate, bindgen); the video path needs
   a GPU with Vulkan Video H.265 encode.
 
