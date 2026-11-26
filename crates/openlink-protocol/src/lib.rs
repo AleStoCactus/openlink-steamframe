@@ -8,11 +8,14 @@
 //!   lives inside `vrserver` and never touches the network itself; it only receives tracking that
 //!   the server has already converted into the PC clock domain.
 //!
+//! * **audio**, both ways on the headset socket: [`audio`] (game audio to the headset, its
+//!   microphone back).
 //! * **driver -> server video** (Linux): [`video_ipc`], a Unix socket carrying the compositor's
 //!   dmabufs and per-frame metadata.
 //!
 //! Every datagram is `[MAGIC: 4][PROTOCOL_VERSION: u16 LE][postcard payload]`.
 
+pub mod audio;
 pub mod clock;
 pub mod time;
 pub mod video;
@@ -23,7 +26,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// UDP port the server listens on for headsets.
 pub const SERVER_PORT: u16 = 9757;
@@ -205,6 +208,10 @@ pub struct StreamConfig {
     pub eye_width: u32,
     pub eye_height: u32,
     pub bitrate_bps: u64,
+    /// The server streams game audio ([`audio::Stream::Speakers`]); the headset should play it.
+    pub speakers: bool,
+    /// The server wants the headset's microphone ([`audio::Stream::Microphone`]).
+    pub microphone: bool,
 }
 
 // ------------------------------------------------------------------------------------------------

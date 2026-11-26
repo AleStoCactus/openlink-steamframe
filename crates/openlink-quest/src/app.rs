@@ -66,6 +66,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     log::info!("OpenXR runtime on {}", props.system_name);
     let _ = instance.graphics_requirements::<xr::OpenGlEs>(system).map_err(e("GLES requirements"))?;
 
+    crate::audio::request_microphone_permission(app);
+
     let egl = egl::Context::new()?;
     let mut renderer = Renderer::new(egl.gl())?;
     // SAFETY: a valid, current GLES context on this thread.
@@ -223,7 +225,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         last_hmd: None,
                         lost_hmd: (0, None),
                     };
-                    start_client(tracking, output.clone(), client.clone(), stop.clone());
+                    start_client(app.clone(), tracking, output.clone(), client.clone(), stop.clone());
                 }
             }
         }
@@ -412,8 +414,10 @@ fn eye_poses(head: &Pose, ipd: f32) -> [xr::Posef; 2] {
 }
 
 /// Connects (discovering the server unless the property names one) and streams tracking on
-/// its own thread; decoded video flows into `output`. `connected` is set once connected.
+/// its own thread; decoded video flows into `output`, audio both ways through AAudio.
+/// `connected` is set once connected.
 fn start_client(
+    app: AndroidApp,
     mut tracking: XrTracking,
     output: Arc<Mutex<Output>>,
     connected: Arc<OnceLock<Connected>>,
@@ -456,6 +460,10 @@ fn start_client(
                 }
             }
             decoder::spawn(client.video_frames().expect("video receiver"), client.state(), output);
+            match client.microphone() {
+                Ok(mic) => crate::audio::spawn(app, client.speakers(), mic, client.state(), stop.clone()),
+                Err(err) => log::error!("cannot open a socket for the microphone: {err}"),
+            }
             client.run(&mut tracking, TRACKING_HZ, &stop);
         })
         .expect("spawn tracking thread");

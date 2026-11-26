@@ -19,6 +19,10 @@
 //!   statistics and the frames' render poses are logged every few seconds.
 //! * `--poses-out PATH`: write each received frame's render pose to PATH, one line per frame
 //!   (present time ns, position xyz, orientation xyzw), to line up with the frames of `--video-out`.
+//! * Game audio is played out in real time (into nothing) and its level and jitter buffer
+//!   statistics are logged every few seconds. `--audio-out PATH` also writes it to PATH as raw
+//!   s16le stereo 48 kHz (`ffplay -f s16le -ar 48000 -ch_layout stereo PATH`).
+//! * `--mic-tone`: send a 440 Hz tone as the microphone (silence otherwise).
 
 use glam::{DQuat, DVec3};
 use openlink_client::{Client, TrackingSource};
@@ -166,6 +170,8 @@ fn main() {
     let (mut yaw_deg, mut yaw_hz) = (8.6, 0.2);
     let mut yaw_steps = false;
     let mut still_controllers = false;
+    let mut audio_out: Option<String> = None;
+    let mut mic_tone = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--rate" => rate = args.next().and_then(|v| v.parse().ok()).expect("--rate HZ"),
@@ -181,6 +187,8 @@ fn main() {
             "--yaw-deg" => yaw_deg = args.next().and_then(|v| v.parse().ok()).expect("--yaw-deg DEG"),
             "--yaw-steps" => yaw_steps = true,
             "--still-controllers" => still_controllers = true,
+            "--audio-out" => audio_out = Some(args.next().expect("--audio-out PATH")),
+            "--mic-tone" => mic_tone = true,
             "--yaw-hz" => yaw_hz = args.next().and_then(|v| v.parse().ok()).expect("--yaw-hz HZ"),
             "-h" | "--help" => {
                 println!(
@@ -212,6 +220,8 @@ fn main() {
     let frames = client.video_frames().expect("video receiver");
     let state = client.state();
     std::thread::spawn(move || video_sink(frames, state, video_out, poses_out));
+    let (speakers, mic, state) = (client.speakers(), client.microphone().expect("open socket"), client.state());
+    std::thread::spawn(move || audio_device(speakers, mic, state, audio_out, mic_tone));
     let stop = AtomicBool::new(false);
     client.run(&mut mock, rate, &stop);
 }
@@ -256,6 +266,66 @@ fn video_sink(
                 p.orientation,
             );
             (since, count, bytes, idrs) = (std::time::Instant::now(), 0, 0, 0);
+        }
+    }
+}
+
+/// Stands in for the headset's audio: plays game audio out in real time (logging what it
+/// hears) and records a tone or silence as the microphone, 5 ms at a time.
+fn audio_device(
+    speakers: std::sync::Arc<std::sync::Mutex<openlink_protocol::audio::JitterBuffer>>,
+    mut mic: openlink_client::MicSender,
+    state: std::sync::Arc<std::sync::Mutex<openlink_client::ClientState>>,
+    out: Option<String>,
+    tone: bool,
+) {
+    use openlink_protocol::audio::{SAMPLE_RATE, SPEAKER_CHANNELS};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    const BLOCK: usize = 240;
+    let mut file = out.map(|p| std::fs::File::create(&p).unwrap_or_else(|e| panic!("{p}: {e}")));
+    let mut buf = vec![0i16; BLOCK * SPEAKER_CHANNELS];
+    let (mut phase, mut peak, mut sum_sq, mut n) = (0f64, 0i16, 0f64, 0u64);
+    let period = Duration::from_secs_f64(BLOCK as f64 / SAMPLE_RATE as f64);
+    let (mut next, mut since) = (Instant::now(), Instant::now());
+    loop {
+        let cfg = state.lock().unwrap().welcome.clone();
+        speakers.lock().unwrap().pop(&mut buf);
+        if let Some(f) = &mut file {
+            let bytes: Vec<u8> = buf.iter().flat_map(|s| s.to_le_bytes()).collect();
+            f.write_all(&bytes).expect("write audio");
+        }
+        for &s in &buf {
+            peak = peak.max(s.saturating_abs());
+            sum_sq += (s as f64).powi(2);
+        }
+        n += buf.len() as u64;
+        if cfg.as_ref().is_some_and(|c| c.microphone) {
+            mic.send((0..BLOCK).map(|_| {
+                phase = (phase + TAU * 440.0 / SAMPLE_RATE as f64) % TAU;
+                if tone { (phase.sin() * 8000.0) as i16 } else { 0 }
+            }));
+        }
+        if since.elapsed() >= Duration::from_secs(5) {
+            if cfg.is_some_and(|c| c.speakers) {
+                let st = speakers.lock().unwrap().stats;
+                let rms = (sum_sq / n.max(1) as f64).sqrt();
+                log::info!(
+                    "audio: rms {:.1} dBFS, peak {:.1} dBFS; buffered {:.1} ms; {} packets, {} lost, {} late, {} underruns, {} dropped / {} repeated frames",
+                    20.0 * (rms / 32768.0).max(1e-9).log10(),
+                    20.0 * (peak as f64 / 32768.0).max(1e-9).log10(),
+                    speakers.lock().unwrap().level() as f64 * 1e3 / SAMPLE_RATE as f64,
+                    st.packets, st.lost, st.late, st.underruns, st.dropped_frames, st.repeated_frames,
+                );
+            }
+            (peak, sum_sq, n, since) = (0, 0.0, 0, Instant::now());
+        }
+        next += period;
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        } else {
+            next = now;
         }
     }
 }

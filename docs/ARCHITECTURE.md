@@ -28,7 +28,7 @@ The aim is a headset that behaves like a native SteamVR HMD:
 | `openlink-protocol` | Message types, datagram framing, PC monotonic clock, headset↔PC clock sync |
 | `openlink-tracking` | Pose math and the prediction policy (headset sample → `DriverPose_t`) |
 | `openlink-driver` | SteamVR driver in pure Rust (OpenVR C++ vtables written by hand, layout-tested) |
-| `openlink-server` | Desktop app `openlink`: session, relay, settings, GUI; later the encoder |
+| `openlink-server` | Desktop app `openlink`: session, relay, settings, GUI, encoder, audio devices |
 | `openlink-client` | Headset client core + `mock-headset` for testing the PC side without a headset |
 
 The driver is deliberately thin. It runs inside `vrserver`, so a bug there takes SteamVR down,
@@ -92,6 +92,29 @@ without a round trip through system memory.
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
 
+## Audio
+
+Both directions share the headset socket (`openlink_protocol::audio`): game audio stereo
+server → headset, the microphone mono headset → server. Uncompressed s16 at 48 kHz in 5 ms
+datagrams (1.5 and 0.8 Mbit/s, small next to the video), so neither side needs a codec. A
+sequence number per stream lets the receiver fill a lost packet with silence and keep timing.
+
+Each receiver has a `JitterBuffer`. It watches the lowest level it reaches over 2 s (the margin
+it actually had against jitter) and steers that towards 10 ms by dropping or repeating single
+frames, one per callback at most. That also follows the drift between the PC's and the
+headset's audio clocks, which would otherwise slowly empty or overfill it. A big excess (a
+burst, or a reader that paused) is dropped in one go.
+
+| Side | Linux | Windows | Quest |
+|---|---|---|---|
+| Devices | PipeWire streams with `media.class` `Audio/Sink` and `Audio/Source` ("OpenLink"), created while a headset is connected | Planned: a bundled virtual audio driver (user mode cannot create endpoints), WASAPI on top; interim WASAPI loopback | n/a |
+| I/O | process callbacks feed `audio::Bridge` | same `Bridge` | AAudio low-latency streams; mic with the voice-communication preset (echo cancellation) |
+
+The devices follow the headset: they appear when it connects and the server's settings enable
+them, and vanish when it leaves, so the desktop falls back to the previous device. The desktop
+remembers the choice by node name. The headset opens its streams when `Welcome` asks for them,
+and reopens them if Android closes them (headphones plugged in).
+
 ## Wired connection
 
 Over USB the headset is simply another IP route. Its USB NCM network interface (or
@@ -130,5 +153,5 @@ preferred wired path.
 3. **Video on Windows.** Direct mode capture, NVENC/AMF, UDP video transport, decode and
    reprojection on the headset.
 4. **Video on Linux.** Capture spike, then VA-API/NVENC/Vulkan Video.
-5. **Quality.** FEC and adaptive bitrate, foveated encoding, audio both ways, USB NCM discovery,
+5. **Quality.** FEC and adaptive bitrate, foveated encoding, audio on Windows, USB NCM discovery,
    Quest Pro face/eye tracking, hand tracking with skeletal input.

@@ -30,6 +30,10 @@ pub struct Settings {
     pub resolution_scale: f32,
     pub refresh_rate: f32,
     pub connection: ConnectionMode,
+    /// Offer an "OpenLink" output device whose sound plays in the headset.
+    pub speakers: bool,
+    /// Offer an "OpenLink" microphone fed by the headset's.
+    pub microphone: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +47,8 @@ impl Default for Settings {
             resolution_scale: 1.2,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
+            speakers: true,
+            microphone: true,
         }
     }
 }

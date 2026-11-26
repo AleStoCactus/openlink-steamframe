@@ -1,8 +1,9 @@
-//! OpenLink for Meta Quest: an OpenXR app that streams tracking and input to the PC and
-//! shows the video SteamVR renders.
+//! OpenLink for Meta Quest: an OpenXR app that streams tracking, input and the microphone to
+//! the PC, and shows the video SteamVR renders and plays its audio.
 #![cfg(target_os = "android")]
 
 mod app;
+mod audio;
 mod decoder;
 mod egl;
 mod render;

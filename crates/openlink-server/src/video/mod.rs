@@ -23,7 +23,7 @@ mod import;
 mod vk;
 
 use crate::config::Settings;
-use crate::session::{Status, VideoSink};
+use crate::session::{Status, HeadsetLink};
 use ash::vk as avk;
 use import::{color_range, Imported};
 use openlink_protocol::video_ipc::{self as vipc, Channel, DriverVideoMsg, Listener, ServerVideoMsg};
@@ -48,7 +48,7 @@ struct Shared {
     status: Arc<Mutex<Status>>,
     settings: Arc<Mutex<Settings>>,
     dump: Option<PathBuf>,
-    sink: Option<Arc<VideoSink>>,
+    sink: Option<Arc<HeadsetLink>>,
 }
 
 impl VideoService {
@@ -57,7 +57,7 @@ impl VideoService {
     pub fn start(
         status: Arc<Mutex<Status>>,
         settings: Arc<Mutex<Settings>>,
-        sink: Option<VideoSink>,
+        sink: Option<HeadsetLink>,
         dump: Option<PathBuf>,
     ) -> std::io::Result<Self> {
         let listener = Listener::bind()?;
@@ -103,7 +103,7 @@ const PACING_BPS: f64 = 1.2e9;
 
 /// Sends frames to the headset from its own thread, paced: Wi-Fi access points drop from a
 /// few hundred back-to-back datagrams once their queue fills. Ends when the sender is dropped.
-fn spawn_sender(sink: Option<Arc<VideoSink>>) -> std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)> {
+fn spawn_sender(sink: Option<Arc<HeadsetLink>>) -> std::sync::mpsc::SyncSender<(video::FrameInfo, Vec<u8>)> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<(video::FrameInfo, Vec<u8>)>(1);
     std::thread::Builder::new()
         .name("video-send".into())
@@ -566,7 +566,7 @@ impl<'a> Connection<'a> {
         converted?;
         let t1 = Instant::now();
         let sink = self.shared.sink.as_deref();
-        if sink.is_some_and(VideoSink::take_idr_request) {
+        if sink.is_some_and(HeadsetLink::take_idr_request) {
             p.encoder.request_idr();
         }
         let (bitstream, idr) = p.encoder.encode(ctx, p.converted)?;

@@ -86,9 +86,19 @@ impl App {
                         h.info.eye_width, h.info.eye_height, h.info.current_refresh_rate
                     ));
                     ui.end_row();
+                    ui.label("Audio");
+                    let a = &st.audio;
+                    let text = match (a.speakers, a.microphone) {
+                        (true, true) => "OpenLink output and microphone ready",
+                        (true, false) => "OpenLink output ready",
+                        (false, true) => "OpenLink microphone ready",
+                        (false, false) => "off",
+                    };
+                    dot(ui, a.speakers || a.microphone, text);
+                    ui.end_row();
                 }
             });
-        if let Some(e) = &st.last_error {
+        for e in [&st.last_error, &st.audio.error].into_iter().flatten() {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
     }
@@ -159,6 +169,13 @@ impl App {
                     });
                 ui.end_row();
             });
+
+        ui.add_space(12.0);
+        ui.heading("Audio");
+        ui.checkbox(&mut d.speakers, "Headset speakers")
+            .on_hover_text("Adds an \"OpenLink\" output device; what plays on it is heard in the headset");
+        ui.checkbox(&mut d.microphone, "Headset microphone")
+            .on_hover_text("Adds an \"OpenLink\" input device carrying the headset's microphone");
 
         ui.add_space(12.0);
         ui.heading("Connection");

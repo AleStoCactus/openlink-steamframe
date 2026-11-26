@@ -21,13 +21,14 @@ OpenLink aims for:
 Early but playable: games run well on a Linux PC with a Quest 3 over Wi-Fi. SteamVR renders into
 the driver's textures, the server encodes them with Vulkan Video (H.265) and streams them over UDP,
 and the Quest app decodes them in hardware and shows them through OpenXR, reprojected to the
-current head pose. Head and controller tracking, buttons and haptics flow back.
+current head pose. Head and controller tracking, buttons and haptics flow back. Game audio plays
+in the headset and its microphone appears on the PC.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | Area | Status | Notes |
 |---|---|---|
 | Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games. No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
-| Audio | 📋 Planned | No game audio or microphone yet |
+| Audio | 🟡 Partial | Linux: while a headset is connected, PipeWire gets an "OpenLink" output device (plays in the headset) and an "OpenLink" microphone, to pick in the sound settings. Uncompressed 48 kHz PCM with an adaptive jitter buffer; echo cancellation on the headset mic. Windows needs a virtual audio driver first |
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
 | Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video and connection settings. Only some settings take effect (H.265 is the only encoder) |
 | Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+) |
@@ -79,6 +80,10 @@ cargo run --release -p openlink-client --bin mock-headset
 # now start SteamVR: an OpenLink HMD and two Touch controllers appear, swinging
 ```
 
+While the mock headset runs, the PC has "OpenLink" audio devices: what plays on the output is
+logged by the mock (`--audio-out PATH` saves it), and `--mic-tone` feeds a 440 Hz tone into the
+microphone.
+
 Start SteamVR from Steam (or `steam steam://run/250820`), not by running `vrstartup.sh` directly. Without
 Steam's runtime launcher service, `vrcompositor` cannot start.
 
@@ -86,8 +91,8 @@ Steam's runtime launcher service, `vrcompositor` cannot start.
 
 ## Play on a Quest (Linux)
 
-Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+), and the Quest in developer mode
-on the same LAN as the PC.
+Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+), PipeWire (building needs its
+headers and clang), and the Quest in developer mode on the same LAN as the PC.
 
 ```sh
 # once: Android toolchain (Arch) and the Rust target
@@ -100,6 +105,12 @@ scripts/build-quest.sh --install                # builds, installs and starts th
 cargo run --release -p openlink-server          # the desktop app
 steam steam://run/250820                        # SteamVR
 ```
+
+The app asks for the microphone permission on first start (or
+`adb shell pm grant org.openlink.quest android.permission.RECORD_AUDIO`). To hear the game in the
+headset and use its microphone, pick the "OpenLink" output and input devices in the PC's sound
+settings; the choice is remembered for the next connection. Both can be turned off in the desktop
+app.
 
 The app finds the server by LAN broadcast. To point it at a specific PC instead:
 `adb shell setprop debug.openlink.server 192.168.1.10`. Logs: `adb logcat -s OpenLink`.
