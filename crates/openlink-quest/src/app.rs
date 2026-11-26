@@ -47,6 +47,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     exts.khr_convert_timespec_time = available.khr_convert_timespec_time;
     exts.fb_display_refresh_rate = available.fb_display_refresh_rate;
     exts.ext_performance_settings = available.ext_performance_settings;
+    exts.fb_composition_layer_settings = available.fb_composition_layer_settings;
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -140,6 +141,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     // Debug: `adb shell setprop debug.openlink.swap_eyes 1` shows each eye the other's picture.
     let swap_eyes = system_property("debug.openlink.swap_eyes").as_deref() == Some("1");
     let (mut frozen, mut freeze_checked) = (false, std::time::Instant::now());
+    let mut layer_flags = layer_filter();
+    log::info!("compositor layer filter: {layer_flags:?} (available: {})", exts.fb_composition_layer_settings);
     if swap_eyes {
         log::warn!("debug: eyes swapped");
     }
@@ -277,6 +280,11 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 log::warn!("debug: picture {}", if now { "frozen" } else { "live" });
             }
             frozen = now;
+            let filter = layer_filter();
+            if filter != layer_flags {
+                log::info!("compositor layer filter: {filter:?}");
+                layer_flags = filter;
+            }
         }
         let latest = if frozen { None } else { output.lock().unwrap().next() };
         if let Some((_, p)) = &latest {
@@ -347,6 +355,21 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             })
             .collect();
         let layer = xr::CompositionLayerProjection::new().space(&stage).views(&views);
+        // How the runtime's compositor filters the layer onto the display (see `layer_filter`).
+        let settings = xr::sys::CompositionLayerSettingsFB {
+            ty: xr::sys::CompositionLayerSettingsFB::TYPE,
+            next: std::ptr::null(),
+            layer_flags,
+        };
+        let layer = if exts.fb_composition_layer_settings && layer_flags != xr::sys::CompositionLayerSettingsFlagsFB::EMPTY {
+            let mut raw = layer.into_raw();
+            raw.next = (&raw const settings).cast();
+            // SAFETY: the same layer with `settings` chained; it and the views it points to
+            // outlive the xrEndFrame call below.
+            unsafe { xr::CompositionLayerProjection::from_raw(raw) }
+        } else {
+            layer
+        };
         stream
             .end(state.predicted_display_time, xr::EnvironmentBlendMode::OPAQUE, &[&layer])
             .map_err(e("xrEndFrame"))?;
@@ -496,6 +519,23 @@ fn system_property(name: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// How the Quest compositor filters our eye images onto the display
+/// (`XR_FB_composition_layer_settings`). They are encoded at about the panel's size, and the lens
+/// shows the center of view at about 1.5x the panel's density, so the compositor enlarges them
+/// there: plain bilinear looks soft next to Virtual Desktop and Steam Link, which both turn on its
+/// sharpening. Quality sharpening by default; `adb shell setprop debug.openlink.layer_filter`
+/// `none`, `sharpen` (normal), `supersample` or `quality-supersample` to compare, live.
+fn layer_filter() -> xr::sys::CompositionLayerSettingsFlagsFB {
+    use xr::sys::CompositionLayerSettingsFlagsFB as F;
+    match system_property("debug.openlink.layer_filter").as_deref() {
+        Some("none") => F::EMPTY,
+        Some("sharpen") => F::NORMAL_SHARPENING,
+        Some("supersample") => F::NORMAL_SUPER_SAMPLING,
+        Some("quality-supersample") => F::QUALITY_SUPER_SAMPLING,
+        _ => F::QUALITY_SHARPENING,
+    }
 }
 
 fn server_from_property() -> Option<SocketAddr> {
