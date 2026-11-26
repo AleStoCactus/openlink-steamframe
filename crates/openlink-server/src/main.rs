@@ -62,7 +62,7 @@ fn main() {
     };
 
     let _audio = session.as_ref().and_then(|s| s.link().ok()).and_then(|link| {
-        audio::AudioService::start(link).map_err(|e| log::error!("cannot start audio: {e}")).ok()
+        audio::AudioService::start(link, settings.clone()).map_err(|e| log::error!("cannot start audio: {e}")).ok()
     });
 
     if headless {

@@ -28,7 +28,7 @@ pub struct Link {
 
 impl Link {
     pub fn start() -> std::io::Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, proto::DRIVER_PORT))?;
+        let socket = openlink_protocol::net::bind_udp((Ipv4Addr::LOCALHOST, proto::DRIVER_PORT))?;
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         let server = SocketAddr::from((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT));
         let stop = Arc::new(AtomicBool::new(false));

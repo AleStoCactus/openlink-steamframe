@@ -5,6 +5,10 @@
 //! implementation offers it, with a VBV of about one and a half frames so a frame's size stays
 //! close to the average.
 //!
+//! On Windows the encoder runs at a constant QP chosen per frame by [`SoftRateControl`]
+//! instead: AMD's Windows driver accepts CBR and VBR but encodes at its default QP whatever
+//! the bitrate (measured: identical streams at 20 and 200 Mbit/s).
+//!
 //! The implementation writes the slice NAL units; VPS/SPS/PPS come from
 //! `vkGetEncodedVideoSessionParametersKHR` and are prepended to every IDR.
 
@@ -21,6 +25,58 @@ const BITSTREAM_SIZE: u64 = 16 << 20;
 /// without encoding (its feedback query never becomes available). RADV is happy either way, and
 /// keeps the separate reset it was developed with.
 const RESET_WITH_FIRST_FRAME: bool = cfg!(windows);
+/// Rate control by choosing each frame's QP ourselves ([`SoftRateControl`]) rather than
+/// asking the implementation for CBR, which AMD's Windows driver ignores.
+const SOFTWARE_RATE_CONTROL: bool = cfg!(windows);
+
+/// Rate control from the outside: constant QP per frame, adjusted after each frame by how far
+/// its size and a VBV-like budget are from the target.
+struct SoftRateControl {
+    /// Bytes per frame at the target bitrate.
+    target: f64,
+    /// Bytes the stream may run ahead of the target (the VBV).
+    budget: f64,
+    /// Bytes sent beyond the target so far, drained at the target rate (never negative).
+    excess: f64,
+    qp: f64,
+    min_qp: f64,
+    max_qp: f64,
+}
+
+impl SoftRateControl {
+    fn new(bitrate_bps: u64, fps: f32, vbv_ms: u32, min_qp: i32, max_qp: i32) -> Self {
+        let target = bitrate_bps as f64 / 8.0 / fps.max(1.0) as f64;
+        Self {
+            target,
+            budget: (bitrate_bps as f64 / 8.0 * vbv_ms as f64 / 1000.0).max(target),
+            excess: 0.0,
+            // A typical starting point; the first frames correct it.
+            qp: 28.0f64.clamp(min_qp as f64, max_qp as f64),
+            // Below ~18 the bits buy nothing visible; leave the bitrate unused instead.
+            min_qp: (min_qp as f64).max(18.0),
+            max_qp: max_qp as f64,
+        }
+    }
+
+    fn qp(&self) -> i32 {
+        self.qp.round() as i32
+    }
+
+    /// A frame of `bytes` was encoded at [`Self::qp`]; choose the next QP. Every 6 QP halves
+    /// the size, so the frame's distance from the target is `6 * log2(bytes / target)` QP.
+    /// Half of that is applied (scene changes would otherwise make it oscillate), plus a push
+    /// from the excess so the average holds. IDRs are excluded from the size term: they are
+    /// meant to be large, and only their excess has to be paid back.
+    fn update(&mut self, bytes: usize, idr: bool) {
+        let bytes = bytes.max(1) as f64;
+        self.excess = (self.excess + bytes - self.target).max(0.0);
+        let size_term = if idr { 0.0 } else { 0.5 * 6.0 * (bytes / self.target).log2() };
+        let excess_term = 3.0 * (self.excess / self.budget).min(2.0);
+        // Down slowly (a frame smaller than the target is often just a still moment), up fast.
+        let step = (size_term + excess_term).clamp(-1.0, 4.0);
+        self.qp = (self.qp + step).clamp(self.min_qp, self.max_qp);
+    }
+}
 /// `log2_max_pic_order_cnt_lsb_minus4` at its maximum: POC LSBs wrap every 65536 frames.
 /// (At 4, POC passed its 8-bit LSB range after 256 frames and the encode hung the GPU.)
 const LOG2_MAX_POC_LSB_MINUS4: u8 = 12;
@@ -240,6 +296,8 @@ pub struct Encoder {
     rc_h265: vk::VideoEncodeH265RateControlInfoKHR<'static>,
     vbv_ms: u32,
     constant_qp: i32,
+    /// Windows: the QP of each frame, chosen here (see [`SOFTWARE_RATE_CONTROL`]).
+    soft_rc: Option<SoftRateControl>,
     pub layout: Layout,
     /// Frames since the last IDR.
     frame_in_gop: u32,
@@ -561,7 +619,7 @@ impl Encoder {
             vk::VideoEncodeRateControlModeFlagsKHR::DISABLED,
         ]
         .into_iter()
-        .find(|m| modes.contains(*m))
+        .find(|m| modes.contains(*m) && (!SOFTWARE_RATE_CONTROL || *m == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED))
         .unwrap_or(vk::VideoEncodeRateControlModeFlagsKHR::DEFAULT);
         let bitrate = cfg.bitrate_bps.min(caps.encode.max_bitrate.max(1));
         let fps_milli = (cfg.fps * 1000.0).round() as u32;
@@ -586,11 +644,16 @@ impl Encoder {
             .sub_layer_count(1);
         let vbv_ms = ((1500.0 / cfg.fps).ceil() as u32).max(1);
         log::info!(
-            "H.265 encoder: {}x{} (coded {coded_width}x{coded_height}) @ {} fps, {:.0} Mbit/s, rate control {rc_mode:?}, VBV {vbv_ms} ms",
+            "H.265 encoder: {}x{} (coded {coded_width}x{coded_height}) @ {} fps, {:.0} Mbit/s, rate control {}, VBV {vbv_ms} ms",
             cfg.width,
             cfg.height,
             cfg.fps,
-            bitrate as f64 / 1e6
+            bitrate as f64 / 1e6,
+            if SOFTWARE_RATE_CONTROL && rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
+                "by QP per frame".to_string()
+            } else {
+                format!("{rc_mode:?}")
+            }
         );
 
         let mut enc = Self {
@@ -618,6 +681,8 @@ impl Encoder {
             rc_h265,
             vbv_ms,
             constant_qp: 26.clamp(caps.h265.min_qp, caps.h265.max_qp),
+            soft_rc: (SOFTWARE_RATE_CONTROL && rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED)
+                .then(|| SoftRateControl::new(bitrate, cfg.fps, vbv_ms, caps.h265.min_qp, caps.h265.max_qp)),
             layout: Layout { coded_width, coded_height },
             frame_in_gop: 0,
             idr_requested: true,
@@ -764,7 +829,7 @@ impl Encoder {
         slice.MaxNumMergeCand = 5;
         let mut nalu = vk::VideoEncodeH265NaluSliceSegmentInfoKHR::default().std_slice_segment_header(&slice);
         if self.rc_mode == vk::VideoEncodeRateControlModeFlagsKHR::DISABLED {
-            nalu.constant_qp = self.constant_qp;
+            nalu.constant_qp = self.soft_rc.as_ref().map_or(self.constant_qp, SoftRateControl::qp);
         }
         let nalus = [nalu];
         let h265_pic = vk::VideoEncodeH265PictureInfoKHR::default()
@@ -894,6 +959,9 @@ impl Encoder {
                 out.extend_from_slice(&self.headers);
             }
             out.extend_from_slice(std::slice::from_raw_parts(self.bitstream_ptr.add(offset as usize), size as usize));
+            if let Some(rc) = &mut self.soft_rc {
+                rc.update(out.len(), idr);
+            }
             self.frame_in_gop += 1;
             Ok((out, idr))
         }

@@ -123,11 +123,14 @@ impl App {
                     ui.end_row();
                     ui.label("Audio");
                     let a = &st.audio;
-                    let text = match (a.speakers, a.microphone) {
-                        (true, true) => "OpenLink output and microphone ready",
-                        (true, false) => "OpenLink output ready",
-                        (false, true) => "OpenLink microphone ready",
-                        (false, false) => "off",
+                    let text = match (a.speakers, a.microphone, cfg!(windows)) {
+                        (true, true, false) => "OpenLink output and microphone ready",
+                        (true, false, false) => "OpenLink output ready",
+                        (false, true, false) => "OpenLink microphone ready",
+                        (true, true, true) => "speakers and microphone streaming",
+                        (true, false, true) => "speakers streaming",
+                        (false, true, true) => "microphone streaming",
+                        (false, false, _) => "off",
                     };
                     dot(ui, a.speakers || a.microphone, text);
                     ui.end_row();
@@ -303,18 +306,22 @@ impl App {
             .num_columns(2)
             .spacing([24.0, 6.0])
             .show(ui, |ui| {
-                ui.checkbox(&mut d.speakers, "Headset speakers").on_hover_text(
-                    "Adds an \"OpenLink\" output device; what plays on it is heard in the headset",
-                );
+                ui.checkbox(&mut d.speakers, "Headset speakers").on_hover_text(crate::audio::SPEAKERS_HINT);
                 meter(ui, self.meters.speakers, audio.speakers)
                     .on_hover_text("Sound being sent to the headset");
                 ui.end_row();
-                ui.checkbox(&mut d.microphone, "Headset microphone").on_hover_text(
-                    "Adds an \"OpenLink\" input device carrying the headset's microphone",
-                );
+                ui.checkbox(&mut d.microphone, "Headset microphone").on_hover_text(crate::audio::MICROPHONE_HINT);
                 meter(ui, self.meters.microphone, audio.microphone)
                     .on_hover_text("Sound arriving from the headset's microphone");
                 ui.end_row();
+                if cfg!(windows) {
+                    ui.label("Microphone plays into").on_hover_text(
+                        "An output device, by (part of) its name: a virtual audio cable such as \
+                         VB-CABLE's \"CABLE Input\". Choose its other end as the microphone in games.",
+                    );
+                    ui.text_edit_singleline(&mut d.microphone_device);
+                    ui.end_row();
+                }
             });
 
         ui.add_space(12.0);

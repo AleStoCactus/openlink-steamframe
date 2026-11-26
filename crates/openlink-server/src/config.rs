@@ -43,6 +43,10 @@ pub struct Settings {
     pub speakers: bool,
     /// Offer an "OpenLink" microphone fed by the headset's.
     pub microphone: bool,
+    /// Windows: the output device the headset's microphone plays into, by (part of) its name:
+    /// a virtual audio cable, whose other end applications record from. Windows cannot create
+    /// an "OpenLink" microphone without a kernel driver.
+    pub microphone_device: String,
 }
 
 impl Default for Settings {
@@ -58,6 +62,8 @@ impl Default for Settings {
             connection: ConnectionMode::WiFi,
             speakers: true,
             microphone: true,
+            // VB-CABLE, the common free virtual cable.
+            microphone_device: "CABLE Input".into(),
         }
     }
 }

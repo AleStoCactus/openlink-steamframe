@@ -7,7 +7,8 @@ The aim is a headset that behaves like a native SteamVR HMD:
   controller prediction.
 - **Image quality and latency** at Virtual Desktop's level: zero-copy hardware encode with
   H.264, HEVC and AV1 on NVIDIA, AMD and Intel.
-- **Windows and Linux** as equal targets.
+- **Windows and Linux** as equal targets: everything but texture sharing, sync, the
+  driver link transport and audio devices is shared code.
 - **Open source** (GPL-3.0). A new codebase, not derived from ALVR.
 
 ## Components
@@ -75,19 +76,44 @@ identical for Quest 2, Touch Plus and Touch Pro). The driver converts with
 `world_from_raw = world_from_grip · inverse(raw_from_grip)`. The lever arm is included in the
 linear velocity (`v + ω × r`).
 
-## Video pipeline (next milestone)
+## Video pipeline
 
 | Stage | Windows | Linux |
 |---|---|---|
-| Frame capture | `IVRDriverDirectModeComponent` → shared D3D11 textures | Open question (see below) |
-| Colour convert | compute shader to NV12/P010 on the GPU | same (Vulkan) |
-| Encode | NVENC, AMF, QSV via their SDKs; Vulkan Video | NVENC, VA-API, Vulkan Video |
-| Transport | UDP, slice-level packetisation, FEC, adaptive bitrate | same |
-| Decode | `AMediaCodec` in low-latency mode on the Quest | n/a |
-| Display | OpenXR swapchain plus reprojection with the render pose | n/a |
+| Frame capture | `IVRDriverDirectModeComponent` → D3D11 textures with legacy shared handles, created by the driver | `IVRDriverDirectModeComponent` → GBM dmabufs (compositor) or SteamVR-allocated images shared as dmabufs (applications) |
+| Driver → server | loopback TCP (`video_ipc`); handles inside the messages; a shared `ID3D11Fence` per frame | abstract-namespace `SOCK_SEQPACKET`; fds as `SCM_RIGHTS`; implicit dmabuf fences |
+| Import | D3D11 opens the textures and copies each frame into NT-handle textures Vulkan imports | Vulkan imports the dmabufs directly |
+| Colour convert | compute shader to NV12 (Vulkan) | same |
+| Encode | Vulkan Video H.265, QP per frame chosen by the server; NVENC/AMF planned | Vulkan Video H.265, CBR; VA-API/NVENC planned |
+| Transport | UDP, slice-level packetisation; FEC and adaptive bitrate planned | same |
+| Decode | `AMediaCodec` in low-latency mode on the Quest | same |
+| Display | OpenXR swapchain plus reprojection with the render pose | same |
 
 Encode must be zero-copy: the texture SteamVR hands the driver is encoded on the same GPU,
 without a round trip through system memory.
+
+**Windows capture.** The driver creates every swap texture (the compositor's and each
+application's) as a D3D11 texture with `D3D11_RESOURCE_MISC_SHARED`, on the adapter it names in
+`Prop_GraphicsAdapterLuid_Uint64` so SteamVR renders on the same GPU. On Windows a
+`SharedTextureHandle_t` is that texture's legacy shared handle, which is global, so the server
+opens the same textures by the handles the driver announces. Vulkan implementations do not
+reliably import legacy handles, so the server's D3D11 device copies each frame into textures of
+its own with NT handles, which Vulkan imports as `D3D11_TEXTURE` memory (measured on an RX 6800:
+0.9 ms for copy and convert together, two 2628x2736 eyes). D3D11 has no implicit fences: in `Present`
+the driver acquires the keyed mutex of SteamVR's sync texture (the compositor holds it until its
+work is submitted) and signals a shared `ID3D11Fence` to the frame's id; the server duplicates
+that fence out of vrserver (`DuplicateHandle`, so vrserver must not run elevated), its copy
+waits for the value on the GPU, and Vulkan waits for the copy's own fence imported as a timeline
+semaphore. Windows has no `SOCK_SEQPACKET`, so the link is loopback TCP with length-prefixed
+messages and a writer thread whose bounded queue gives `try_send` the same never-block
+behaviour.
+
+**AMD's Windows Vulkan Video driver** (RX 6800, driver 32.0.21045) differs from RADV in two ways
+the encoder works around, both `cfg(windows)`: a session reset submitted on its own leaves every
+later encode completing without output (the feedback query never becomes available), so the
+reset goes into the first frame's coding scope; and CBR and VBR are accepted but ignored (byte-
+identical streams at 20 and 200 Mbit/s), so the encoder runs at a constant QP that the server
+sets per frame from each frame's size and a VBV-like budget (`SoftRateControl`).
 
 AV1 encode is a hardware feature: RTX 40+, RX 7000+, Arc / Core Ultra. On older GPUs (e.g. an
 RX 6800) the GUI offers H.264/HEVC only. No software can change that.
@@ -136,8 +162,8 @@ burst, or a reader that paused) is dropped in one go.
 
 | Side | Linux | Windows | Quest |
 |---|---|---|---|
-| Devices | PipeWire streams with `media.class` `Audio/Sink` and `Audio/Source` ("OpenLink"), created while a headset is connected | Planned: a bundled virtual audio driver (user mode cannot create endpoints), WASAPI on top; interim WASAPI loopback | n/a |
-| I/O | process callbacks feed `audio::Bridge` | same `Bridge` | AAudio low-latency streams; mic with the voice-communication preset (echo cancellation) |
+| Devices | PipeWire streams with `media.class` `Audio/Sink` and `Audio/Source` ("OpenLink"), created while a headset is connected | User mode cannot create endpoints: WASAPI loopback capture of the default output device (followed when it changes), and the microphone rendered into a virtual audio cable found by name ("CABLE Input" by default). A bundled virtual audio driver is the plan | n/a |
+| I/O | process callbacks feed `audio::Bridge` | a 2 ms polling loop (with `timeBeginPeriod(1)` while streaming) feeds the same `Bridge`; WASAPI converts to 48 kHz s16 | AAudio low-latency streams; mic with the voice-communication preset (echo cancellation) |
 
 The devices follow the headset: they appear when it connects and the server's settings enable
 them, and vanish when it leaves, so the desktop falls back to the previous device. The desktop
@@ -200,8 +226,10 @@ preferred wired path.
    HMD and Touch controllers, server relay, GUI, mock headset.
 2. **Tracking on a real Quest.** OpenXR client app that samples at 500 Hz, plus input and haptics.
    Settle the angular velocity question. Compare swing feel against Steam Link.
-3. **Video on Windows.** Direct mode capture, NVENC/AMF, UDP video transport, decode and
-   reprojection on the headset.
-4. **Video on Linux.** Capture spike, then VA-API/NVENC/Vulkan Video.
-5. **Quality.** FEC and adaptive bitrate, foveated encoding (done), audio on Windows, USB NCM discovery,
+3. **Video on Linux (done).** Direct mode capture as dmabufs, Vulkan Video H.265, UDP video
+   transport, decode and reprojection on the headset.
+4. **Windows (done, Vulkan Video).** The same pipeline over D3D11 shared textures, WASAPI
+   audio. Next: testing on a real Quest and on NVIDIA/Intel, NVENC/AMF as alternatives, a
+   virtual audio driver.
+5. **Quality.** FEC and adaptive bitrate, foveated encoding (done), USB NCM discovery,
    Quest Pro face/eye tracking, hand tracking with skeletal input.

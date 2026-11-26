@@ -172,9 +172,9 @@ impl Session {
         status: Arc<Mutex<Status>>,
         settings: Arc<Mutex<Settings>>,
     ) -> std::io::Result<Self> {
-        let headset_sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, proto::SERVER_PORT))?;
+        let headset_sock = openlink_protocol::net::bind_udp((Ipv4Addr::UNSPECIFIED, proto::SERVER_PORT))?;
         headset_sock.set_read_timeout(Some(Duration::from_millis(10)))?;
-        let driver_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT))?;
+        let driver_sock = openlink_protocol::net::bind_udp((Ipv4Addr::LOCALHOST, proto::SERVER_DRIVER_PORT))?;
         let video_sock = headset_sock.try_clone()?;
         set_send_buffer(&video_sock, 8 << 20);
         driver_sock.set_read_timeout(Some(Duration::from_millis(100)))?;

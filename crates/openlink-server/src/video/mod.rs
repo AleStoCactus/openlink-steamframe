@@ -312,6 +312,7 @@ impl Pipeline {
         }
         let mut waits = Vec::new();
         // Timeline semaphore values for `waits` (Windows), or empty (binary semaphores).
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut wait_values = Vec::new();
         #[cfg(target_os = "linux")]
         self.wait_for_compositor(ctx, &unique, &mut waits);
@@ -553,7 +554,8 @@ impl<'a> Connection<'a> {
     /// Windows: opens the driver's frame fence on the D3D11 device, once both exist.
     fn open_sync_fence(&mut self) {
         #[cfg(windows)]
-        if let (Some(ctx), Some(handle)) = (&self.ctx, self.sync_fence.take()) {
+        if let Some(ctx) = &self.ctx {
+            let Some(handle) = self.sync_fence.take() else { return };
             match ctx.d3d.set_driver_fence(self.driver_pid, handle) {
                 Ok(()) => log::info!("video: frame fence shared with the driver"),
                 Err(e) => log::error!("video: {e}; frames may be read before the compositor finishes them"),

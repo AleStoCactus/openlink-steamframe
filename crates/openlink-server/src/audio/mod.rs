@@ -10,14 +10,19 @@
 //! remembers the choice by device name, so picking OpenLink once sticks across connections.
 //!
 //! The platform half (creating the devices, moving samples in and out of them) lives in a
-//! backend: PipeWire on Linux, Windows still to come (see [`windows`]). Everything else
-//! (packetizing, the microphone's jitter buffer) is shared in [`Bridge`].
+//! backend: PipeWire on Linux, WASAPI on Windows. Everything else (packetizing, the
+//! microphone's jitter buffer) is shared in [`Bridge`].
+//!
+//! Windows cannot create devices from user mode, so there the speakers are the default output
+//! device (captured in loopback) and the microphone plays into a virtual audio cable; see
+//! [`windows`].
 
 #[cfg(target_os = "linux")]
 mod pipewire;
 #[cfg(windows)]
 mod windows;
 
+use crate::config::Settings;
 use crate::session::HeadsetLink;
 use openlink_protocol::audio::{self, Packetizer};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +30,22 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// Shown in the system's device lists.
+#[cfg(target_os = "linux")]
 pub const DEVICE_DESCRIPTION: &str = "OpenLink";
+
+/// What the speakers setting does, for the GUI.
+pub const SPEAKERS_HINT: &str = if cfg!(windows) {
+    "What plays on the default output device is also heard in the headset"
+} else {
+    "Adds an \"OpenLink\" output device; what plays on it is heard in the headset"
+};
+/// What the microphone setting does, for the GUI.
+pub const MICROPHONE_HINT: &str = if cfg!(windows) {
+    "Plays the headset's microphone into a virtual audio cable (the device below); applications \
+     record from the cable's other end"
+} else {
+    "Adds an \"OpenLink\" input device carrying the headset's microphone"
+};
 
 /// Which devices should exist right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -39,9 +59,17 @@ pub struct Wanted {
 pub struct Bridge {
     link: HeadsetLink,
     speakers: Mutex<Packetizer>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    settings: Arc<Mutex<Settings>>,
 }
 
 impl Bridge {
+    /// Windows: the output device (a virtual cable) the headset's microphone plays into.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn microphone_device(&self) -> String {
+        self.settings.lock().unwrap().microphone_device.clone()
+    }
+
     /// Devices follow the connected headset and what it was told to stream.
     pub fn wanted(&self) -> Wanted {
         self.link
@@ -91,8 +119,9 @@ pub struct AudioService {
 }
 
 impl AudioService {
-    pub fn start(link: HeadsetLink) -> std::io::Result<Self> {
-        let bridge = Arc::new(Bridge { link, speakers: Mutex::new(Packetizer::new(audio::Stream::Speakers)) });
+    pub fn start(link: HeadsetLink, settings: Arc<Mutex<Settings>>) -> std::io::Result<Self> {
+        let bridge =
+            Arc::new(Bridge { link, speakers: Mutex::new(Packetizer::new(audio::Stream::Speakers)), settings });
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();

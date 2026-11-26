@@ -18,6 +18,7 @@
 pub mod audio;
 pub mod clock;
 pub mod foveation;
+pub mod net;
 pub mod time;
 pub mod video;
 pub mod video_ipc;
