@@ -48,6 +48,11 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     exts.fb_display_refresh_rate = available.fb_display_refresh_rate;
     exts.ext_performance_settings = available.ext_performance_settings;
     exts.fb_composition_layer_settings = available.fb_composition_layer_settings;
+    exts.ext_interaction_profile_battery_state_display = available.ext_interaction_profile_battery_state_display;
+    log::info!(
+        "controller battery: {}",
+        if available.ext_interaction_profile_battery_state_display { "reported" } else { "not available from this runtime" }
+    );
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -245,6 +250,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         info,
                         last_hmd: None,
                         lost_hmd: (0, None),
+                        app: app.clone(),
                     };
                     start_client(app.clone(), tracking, output.clone(), client.clone(), stop.clone());
                 }

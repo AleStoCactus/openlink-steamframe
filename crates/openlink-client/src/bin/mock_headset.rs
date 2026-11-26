@@ -27,7 +27,7 @@
 use glam::{DQuat, DVec3};
 use openlink_client::{Client, TrackingSource};
 use openlink_protocol::{
-    buttons, Codec, ControllerInput, ControllerState, Fov, HapticPulse, HeadsetInfo, Motion,
+    buttons, Batteries, BatteryState, Codec, ControllerInput, ControllerState, Fov, HapticPulse, HeadsetInfo, Motion,
     MotionFlags, Pose, TrackingSample,
 };
 use std::f64::consts::{PI, TAU};
@@ -145,6 +145,16 @@ impl TrackingSource for Mock {
                 Some(self.controller(t, 1.0)),
             ],
         }
+    }
+
+    /// Headset charging and filling up over ten minutes, left controller draining, right
+    /// controller without a reading (as on a runtime that cannot report controllers).
+    fn battery(&mut self) -> Option<Batteries> {
+        let t = (openlink_protocol::time::monotonic_ns() - self.start_ns) as f32 * 1e-9;
+        Some(Batteries {
+            hmd: Some(BatteryState { level: (0.2 + t / 600.0).min(1.0), charging: true }),
+            controllers: [Some(BatteryState { level: (0.9 - t / 600.0).max(0.0), charging: false }), None],
+        })
     }
 
     fn haptics(&mut self, p: HapticPulse) {

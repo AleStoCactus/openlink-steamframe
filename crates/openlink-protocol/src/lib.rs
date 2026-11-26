@@ -27,7 +27,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// [`HeadsetInfo::high_refresh_rates`] by model name, for the headset to probe before it has a
 /// `HeadsetInfo`.
@@ -304,6 +304,24 @@ pub enum Codec {
     Av1,
 }
 
+/// One device's battery.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BatteryState {
+    /// Charge, 0.0 to 1.0.
+    pub level: f32,
+    pub charging: bool,
+}
+
+/// The headset's and controllers' batteries. `None` where the headset cannot tell: the
+/// controllers' charge only reaches apps through an OpenXR extension not every runtime has,
+/// and a controller that is off has no reading at all.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct Batteries {
+    pub hmd: Option<BatteryState>,
+    /// Left, right.
+    pub controllers: [Option<BatteryState>; 2],
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HapticPulse {
     pub hand: Hand,
@@ -355,12 +373,8 @@ pub enum HeadsetMessage {
         t1: i64,
         t2: i64,
     },
-    Battery {
-        hmd: f32,
-        left: f32,
-        right: f32,
-        charging: bool,
-    },
+    /// Sent every few seconds, so a lost datagram only delays the next reading.
+    Battery(Batteries),
     /// Video frames were lost; the server should send an IDR. `frame` is the first number the
     /// headset knows it missed.
     VideoLoss {
@@ -415,12 +429,7 @@ pub enum ToDriver {
     /// `sample.sample_time_ns` has already been converted to the PC monotonic clock
     /// ([`time::monotonic_ns`]).
     Tracking(TrackingSample),
-    Battery {
-        hmd: f32,
-        left: f32,
-        right: f32,
-        charging: bool,
-    },
+    Battery(Batteries),
     /// Measured time from `Present` to photons on the headset. SteamVR predicts poses this far
     /// past vsync, so what the user sees matches where things are when they see it.
     PhotonLatency {

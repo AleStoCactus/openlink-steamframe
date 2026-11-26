@@ -3,7 +3,7 @@
 
 use openlink_client::TrackingSource;
 use openlink_protocol::{
-    buttons, ControllerInput, ControllerState, HapticPulse, HeadsetInfo, Motion, MotionFlags, Pose,
+    buttons, Batteries, ControllerInput, ControllerState, HapticPulse, HeadsetInfo, Motion, MotionFlags, Pose,
     TrackingSample,
 };
 use openxr as xr;
@@ -109,6 +109,8 @@ pub struct XrTracking {
     pub last_hmd: Option<Motion>,
     /// Head samples OpenXR could not locate since the last log, and when that was.
     pub lost_hmd: (u32, Option<std::time::Instant>),
+    /// For reading the headset battery through JNI.
+    pub app: android_activity::AndroidApp,
 }
 
 impl XrTracking {
@@ -225,6 +227,12 @@ impl TrackingSource for XrTracking {
             hmd,
             controllers: [self.controller(0, t), self.controller(1, t)],
         }
+    }
+
+    fn battery(&mut self) -> Option<Batteries> {
+        let controllers =
+            [0, 1].map(|hand| crate::battery::controller(&self.instance, &self.session, self.actions.hands[hand]));
+        Some(Batteries { hmd: crate::battery::headset(&self.app), controllers })
     }
 
     fn haptics(&mut self, p: HapticPulse) {

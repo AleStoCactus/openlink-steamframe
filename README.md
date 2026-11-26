@@ -46,7 +46,7 @@ headset-side rows only differ where the PC side does.
 | Quest GUI | 📋 Planned | 📋 Planned |
 | AMD GPU support | ✅ Done (RX 6800) | ✅ Done (RADV, RX 6000+) |
 | NVIDIA GPU support | ❔ Untested | ❔ Untested |
-| Battery status in SteamVR | 📋 Planned | 📋 Planned |
+| Battery status in SteamVR | 🟡 Headset works; Quest controllers' charge is not available to apps | 🟡 Headset works; Quest controllers' charge is not available to apps |
 | Correct headset model in SteamVR and games | 📋 Planned | 📋 Planned |
 | Quest app requests the correct refresh rate | 🟡 Server side works; the Quest app does not request the rate correctly | 🟡 Server side works; the Quest app does not request the rate correctly |
 | Statistics screen | 📋 Planned | 📋 Planned |
@@ -78,7 +78,12 @@ What the rows mean:
   verified on both systems; NVIDIA and Intel are not tested yet.
 - **Headset model:** SteamVR shows a generic OpenLink HMD instead of the real headset (e.g.
   Quest 3), which some games use to pick controller models and bindings.
-- **Battery status:** the headset's and both controllers' charge in the SteamVR dashboard.
+- **Battery status:** the headset's and both controllers' charge in the SteamVR dashboard (and
+  the desktop app), sent every 5 s. The headset's comes from Android's `BatteryManager`; the
+  controllers' only from runtimes with `XR_EXT_interaction_profile_battery_state_display`, and
+  without it they show no battery rather than a wrong one. Meta's runtime does not offer that
+  extension, and the system service that knows the controllers' charge refuses other apps, so
+  on a Quest only the headset's battery shows until Meta adds it.
 - **Refresh rate:** 72 to 120 Hz, plus 144, 165, 207 and 240 Hz on a Quest 3 (Horizon OS v2.7
   or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not
   list the higher rates but accepts them when asked; the stream uses the closest rate the

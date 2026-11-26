@@ -5,7 +5,7 @@
 
 use crate::devices::{self, to_ovr_pose};
 use crate::host::host;
-use crate::ovr::{k_unTrackedDeviceIndexInvalid, DriverPose_t};
+use crate::ovr::{k_unTrackedDeviceIndexInvalid, prop, DriverPose_t};
 use crate::state::{display_cache, shared, DisplayConfig};
 use openlink_protocol::{self as proto, time::monotonic_ns, FromDriver, Hand, ToDriver};
 use openlink_tracking::{controller_raw_from_grip, to_driver_pose, ControllerModel};
@@ -225,8 +225,26 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>) {
                 }
             }
         }
-        ToDriver::Battery { .. } => {
-            // TODO: Prop_DeviceBatteryPercentage_Float per device.
+        ToDriver::Battery(b) => {
+            let ids = [
+                s.hmd_id.load(Ordering::Acquire),
+                s.controllers[0].id.load(Ordering::Acquire),
+                s.controllers[1].id.load(Ordering::Acquire),
+            ];
+            let h = host();
+            for (id, state) in ids.into_iter().zip([b.hmd, b.controllers[0], b.controllers[1]]) {
+                if id == k_unTrackedDeviceIndexInvalid {
+                    continue;
+                }
+                let c = h.container(id);
+                // A device without a reading says so, rather than showing an empty battery.
+                h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, state.is_some());
+                if let Some(state) = state {
+                    // OpenVR's "percentage" is 0..1, like ours.
+                    h.set_f32(c, prop::DeviceBatteryPercentage_Float, state.level.clamp(0.0, 1.0));
+                    h.set_bool(c, prop::DeviceIsCharging_Bool, state.charging);
+                }
+            }
         }
     }
 }
