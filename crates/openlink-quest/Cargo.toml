@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [target.'cfg(target_os = "android")'.dependencies]
 openlink-protocol.workspace = true
 openlink-client = { path = "../openlink-client" }
+openlink-xr = { path = "../openlink-xr" }
 log.workspace = true
 glam.workspace = true
 android-activity = { version = "0.6", features = ["native-activity"] }

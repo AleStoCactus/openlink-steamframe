@@ -1255,6 +1255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
 dependencies = [
  "libc",
+ "libloading 0.8.9",
  "pkg-config",
 ]
 
@@ -1838,6 +1839,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "openlink-frame"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "glam",
+ "glow 0.18.0",
+ "khronos-egl",
+ "libc",
+ "log",
+ "openlink-client",
+ "openlink-protocol",
+ "openlink-xr",
+ "openxr",
+]
+
+[[package]]
 name = "openlink-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1863,6 +1880,7 @@ dependencies = [
  "ndk-sys",
  "openlink-client",
  "openlink-protocol",
+ "openlink-xr",
  "openxr",
 ]
 
@@ -1887,6 +1905,18 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "openlink-protocol",
+]
+
+[[package]]
+name = "openlink-xr"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "libc",
+ "log",
+ "openlink-client",
+ "openlink-protocol",
+ "openxr",
 ]
 
 [[package]]

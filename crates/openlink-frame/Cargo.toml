@@ -1,0 +1,22 @@
+[package]
+name = "openlink-frame"
+description = "OpenLink headset app for Valve's Steam Frame (native Linux arm64: OpenXR on SteamVR, GL over EGL, V4L2 decode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openlink-frame"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openlink-protocol.workspace = true
+openlink-client = { path = "../openlink-client" }
+openlink-xr = { path = "../openlink-xr" }
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+openxr = { version = "0.22", features = ["loaded"] }
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.18"
+libc = "0.2"
