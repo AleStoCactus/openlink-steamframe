@@ -282,9 +282,10 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
         CodecPreference::Auto => None,
         CodecPreference::Fixed(c) => Some(c),
     };
-    // Until encoders are probed, assume H.264/HEVC are available everywhere.
-    let codec = crate::encoder::negotiate(&[Codec::H264, Codec::H265], &info.decoders, pref)
-        .unwrap_or(Codec::H264);
+    // A headset without an HEVC decoder gets HEVC anyway: it is the only codec we encode, and
+    // its decoder then reports the failure.
+    let codec = crate::encoder::negotiate(crate::encoder::CODECS, &info.decoders, pref)
+        .unwrap_or(Codec::H265);
     let (eye_width, eye_height) = info.encoded_size(settings.resolution_percent.clamp(25, 200));
     // The configured rate if the headset has it, else its closest one.
     let refresh_rate = info

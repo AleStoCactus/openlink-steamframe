@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecPreference {
-    /// Best codec both the GPU encoder and the headset decoder support (AV1 > HEVC > H.264).
+    /// Best codec both the server and the headset decoder support (AV1 > HEVC > H.264).
     Auto,
     Fixed(Codec),
 }
@@ -27,7 +27,6 @@ pub enum ConnectionMode {
 #[serde(default)]
 pub struct Settings {
     pub codec: CodecPreference,
-    pub encoder: crate::encoder::BackendPreference,
     pub bitrate_mbps: u32,
     /// Encoded (streamed) per-eye resolution, in percent of the headset's panel resolution
     /// ([`openlink_protocol::HeadsetInfo::encoded_size`]). SteamVR is told that size as its
@@ -59,7 +58,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             codec: CodecPreference::Auto,
-            encoder: crate::encoder::BackendPreference::Auto,
             bitrate_mbps: 200,
             // Panel resolution (Quest 3: 2064x2208 per eye).
             resolution_percent: 100,
@@ -87,6 +85,16 @@ impl Settings {
                 serde_json::from_str(&s)
                     .map_err(|e| log::warn!("ignoring bad settings file: {e}"))
                     .ok()
+            })
+            .map(|mut s: Self| {
+                // A codec this build cannot encode (an older version offered them all) shows as
+                // Auto rather than as a selected, disabled entry.
+                if let CodecPreference::Fixed(c) = s.codec {
+                    if !crate::encoder::CODECS.contains(&c) {
+                        s.codec = CodecPreference::Auto;
+                    }
+                }
+                s
             })
             .unwrap_or_default()
     }

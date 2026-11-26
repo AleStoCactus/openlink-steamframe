@@ -21,7 +21,7 @@ The aim is a headset that behaves like a native SteamVR HMD:
  │  tracking thread  ───────┼─────────►│  session: clock sync, relay ───┼───────►│  (driver_openlink.so/.dll    │
  │  (500 Hz, sample @ now)  │          │                                │loopback│   inside vrserver)           │
  │  clock-ping responder ◄──┼─────────►│  GUI (egui), settings          │◄───────┼─ heartbeats, haptics         │
- │  decoder + reprojection ◄┼──video───┤  encoder (NVENC/AMF/VAAPI/…)  ◄┼─frames──┤  HMD + 2× oculus_touch       │
+ │  decoder + reprojection ◄┼──video───┤  encoder (Vulkan Video HEVC)  ◄┼─frames──┤  HMD + 2× oculus_touch       │
  └──────────────────────────┘          └────────────────────────────────┘        └──────────────────────────────┘
 ```
 
