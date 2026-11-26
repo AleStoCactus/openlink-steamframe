@@ -5,7 +5,8 @@
 #   scripts/build-frame.sh [--debug] [--install HOST]
 #
 # On the headset itself (an arm64 machine) this is a plain cargo build. Anywhere else it
-# cross-compiles: it needs the Rust target aarch64-unknown-linux-gnu and an aarch64 GCC
+# cross-compiles: it needs the Rust target aarch64-unknown-linux-gnu (rustup adds it; with a
+# distribution's Rust, install its package, e.g. Arch: rust-aarch64-gnu) and an aarch64 GCC
 # (aarch64-linux-gnu-gcc; Arch: aarch64-linux-gnu-gcc, Debian/Ubuntu: gcc-aarch64-linux-gnu).
 # The binary links only glibc; EGL and the OpenXR loader are loaded at run time from the
 # headset's SteamOS and SteamVR.
@@ -33,9 +34,20 @@ if [ "$(uname -m)" = aarch64 ]; then
 else
     LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-aarch64-linux-gnu-gcc}"
     command -v "$LINKER" >/dev/null || { echo "need $LINKER to cross-compile for the Steam Frame" >&2; exit 1; }
-    rustup target list --installed 2>/dev/null | grep -qx "$TARGET" || rustup target add "$TARGET"
+    if command -v rustup >/dev/null; then
+        rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
+    elif [ ! -d "$(rustc --print sysroot)/lib/rustlib/$TARGET" ]; then
+        # A distribution's Rust without rustup ships targets as packages.
+        echo "Rust has no $TARGET target (Arch: pacman -S rust-aarch64-gnu)" >&2; exit 1
+    fi
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$LINKER" cargo build --target "$TARGET" "${CARGO_FLAGS[@]}"
     BIN="target/$TARGET/$PROFILE/openlink-frame"
+    # The cross toolchain's glibc can be newer than the headset's; the binary then fails with
+    # "GLIBC_2.xx not found". Show what it needs (compare with `ldd --version` on the headset).
+    if command -v readelf >/dev/null; then
+        NEEDS="$(readelf -V "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+        echo "openlink-frame needs glibc ${NEEDS#GLIBC_} or newer"
+    fi
 fi
 
 OUT="$ROOT/target/frame"

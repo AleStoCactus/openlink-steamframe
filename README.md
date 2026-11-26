@@ -18,36 +18,54 @@ OpenLink aims for:
 
 ## Status
 
-Early but playable: games run well on a Linux PC with a Quest 3 over Wi-Fi. SteamVR renders into
-the driver's textures, the server encodes them with Vulkan Video (H.265) and streams them over UDP,
-and the Quest app decodes them in hardware and shows them through OpenXR, reprojected to the
-current head pose. Head and controller tracking, buttons and haptics flow back.
+Early but playable: games run well on a Linux PC with a Quest 3 over Wi-Fi, and on a Steam Frame
+over Wi-Fi or its USB wireless adapter. SteamVR renders into the driver's textures, the server
+encodes them with Vulkan Video (H.265) and streams them over UDP, and the headset app decodes them
+in hardware and shows them through OpenXR, reprojected to the current head pose. Head and
+controller tracking, buttons and haptics flow back.
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 | Area | Status | Notes |
 |---|---|---|
-| Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games. No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
+| Video | ✅ Working | H.265 via Vulkan Video, zero-copy from SteamVR, frame pacing locked to the headset's display. SteamVR's laser and overlays are drawn over games, but see [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games). No forward error correction or adaptive bitrate yet; H.264 and AV1 are planned |
 | Audio | 📋 Planned | No game audio or microphone yet |
 | Quest UI | 📋 Planned | The app connects on its own (LAN discovery) but shows nothing in the headset before the stream starts: no status, pairing or settings screen |
-| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync and tracking status, and holds video and connection settings. Only some settings take effect (H.265 is the only encoder) |
-| Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+) |
+| Desktop UI | 🟡 Partial | `openlink` window shows driver, headset, clock-sync, tracking and Steam Frame adapter status, and holds video and connection settings. Only some settings take effect (H.265 is the only encoder; USB cable does nothing yet) |
+| Linux version | ✅ Working | The development platform. Needs a GPU with Vulkan Video H.265 encode (e.g. RADV on RX 6000+; also tested on an RX 9070 XT). With a second GPU (an integrated one, say) the driver uses the one SteamVR's compositor renders on; `OPENLINK_RENDER_NODE=/dev/dri/renderDN` overrides it |
 | Windows version | 📋 Planned | Tracking and driver parts are written with Windows in mind, but there is no Windows video path yet |
-| Steam Frame build | 🟡 Written, untested on hardware | Native arm64 Linux app (`openlink-frame`): OpenXR on the headset's SteamVR runtime, GL over EGL, hardware decode through V4L2 (Qualcomm Iris), zero-copy via dmabuf where the driver allows it. Checked against Monado and the real server, not yet on a Frame. See [Play on a Steam Frame](#play-on-a-steam-frame-untested) |
-| Wi-Fi streaming | ✅ Working | See [Wi-Fi and USB cable](#wi-fi-and-usb-cable) |
+| Steam Frame build | 🟡 Playable | Native arm64 Linux app (`openlink-frame`): OpenXR on the headset's SteamVR runtime, GL over EGL, hardware decode through V4L2 (Qualcomm Iris, 3–6 ms a picture). Beat Saber plays. Controllers still show up as Quest Touch controllers. See [Play on a Steam Frame](#play-on-a-steam-frame) |
+| Wi-Fi streaming | ✅ Working | See [Connection](#connection) |
+| Steam Frame adapter | 🟡 Working, rough edges | The Frame's USB wireless adapter as a direct 6 GHz link. See [Connection](#connection) |
 | USB cable mode | 📋 Planned | The setting exists in the desktop app but does nothing yet |
-| Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issue: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth |
+| Full native SteamVR functionality | 🟡 Partial | Games, tracking, controllers, haptics, dashboard and overlays work. Known issues: SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters with head motion, while games are smooth; [SteamVR's layer over games](#known-issue-steamvrs-layer-over-games) |
 
-## Wi-Fi and USB cable
+## Connection
 
-**Wi-Fi (working).** The default and the only mode in use today. The headset finds the PC by LAN
-broadcast; to point it at a specific PC instead, run
-`adb shell setprop debug.openlink.server 192.168.1.10`. For a clean stream:
+**Wi-Fi (working).** The default. The headset finds the PC by broadcasting on every network it is
+on; to point it at a specific PC instead, run `adb shell setprop debug.openlink.server
+192.168.1.10` (Quest) or pass `--server 192.168.1.10` (Steam Frame). For a clean stream:
 
 - Connect the PC to the router by Ethernet and the headset over 5 GHz or 6 GHz Wi-Fi, ideally in
   the same room as the access point.
-- Start around 150–200 Mbps and raise the bitrate (desktop app, applies on the next connection)
-  while the stream stays free of stutter and artifacts. There is no adaptive bitrate or error
-  correction yet, so a link that drops packets shows it as glitches.
+- Start around 150–200 Mbps on a Quest, 100 Mbps on a Steam Frame, and raise the bitrate (desktop
+  app, applies on the next connection) while the stream stays free of stutter and artifacts. There
+  is no adaptive bitrate or error correction yet, so a link that drops packets shows it as
+  glitches, and one that drops part of every keyframe shows nothing at all.
+- On a Steam Frame, 200 Mbps over home Wi-Fi showed only black, most likely because Linux caps the
+  app's UDP receive buffer at `net.core.rmem_max` (about 200 KB by default), less than one frame
+  at that bitrate. The app
+  logs a warning when its buffer is capped; `sudo sysctl -w net.core.rmem_max=8388608` on the
+  headset lifts the cap until the next reboot.
+
+**Steam Frame adapter (working, rough edges).** The Steam Frame comes with a USB wireless adapter
+(Valve 28de:2432, a Realtek 6 GHz card) that joins the headset's own access point: a direct link
+beside the home network (measured on one setup: 1.7 Gbit/s link rate at 160 MHz, 2.7 ms ping
+against 3.5 ms, with less jitter, over home Wi-Fi). Pick "Steam Frame adapter" under Connection in
+the desktop app. OpenLink then brings up the NetworkManager profile Steam made when it paired the
+headset (a hidden SSID `frame_…`; pair the headset with Steam once if it is missing), shows the
+link in the status, and takes the headset only on that network. The headset's access point must be
+on (it is while the Frame's PC link is active). Without NetworkManager, join the access point by
+hand and start the Frame app with `--server` and the PC's address on that network.
 
 **USB cable (planned).** The desktop app already has a "USB cable" setting, but nothing acts on
 it yet. The plan: over USB the headset appears as another network interface on the PC (USB NCM),
@@ -107,10 +125,11 @@ steam steam://run/250820                        # SteamVR
 The app finds the server by LAN broadcast. To point it at a specific PC instead:
 `adb shell setprop debug.openlink.server 192.168.1.10`. Logs: `adb logcat -s OpenLink`.
 
-`openlink --dump-video out.h265` also writes the stream to a file; `openlink --encode-selftest
-4128x2208 600 out.h265` exercises the encoder without SteamVR.
+`openlink --dump-video out.h265` also writes the stream to a file, and beside it `out.poses`: per
+frame its render pose and the textures it was made from. `openlink --encode-selftest 4128x2208 600
+out.h265` exercises the encoder without SteamVR.
 
-## Play on a Steam Frame (untested)
+## Play on a Steam Frame
 
 The Frame runs SteamOS on arm64, so its client is a native Linux program, not an APK. It renders
 through SteamVR's OpenXR runtime on the headset (desktop GL over EGL, `XR_MNDX_egl_enable`) and
@@ -118,16 +137,20 @@ decodes with the Frame's hardware decoder (`/dev/video-dec0`, V4L2). The PC side
 the same driver and `openlink` server as for a Quest. The Frame's controllers reach the PC as
 Touch controllers (SteamVR on the headset maps them), so games' Touch bindings apply.
 
-This build has not run on a Frame yet. It has been checked against Monado and the real server,
-and its tests also pass on arm64, but the headset's decoder and SteamVR runtime are untested.
-Please report the log (`~/.local/state/openlink/frame.log`) of a first try.
+It has been played on a Frame (SteamVR/OpenXR 2.19.5 on the headset), over home Wi-Fi and over the
+Frame's adapter. The decoder is Qualcomm Iris at `/dev/video-dec0` (H.264, HEVC, VP9, AV1). The
+log is `~/.local/state/openlink/frame.log`; please attach it to bug reports.
 
 ```sh
 # on the PC: cross-build for arm64 (or run the same script on the headset itself)
 sudo pacman -S --needed aarch64-linux-gnu-gcc    # Debian/Ubuntu: gcc-aarch64-linux-gnu
-rustup target add aarch64-unknown-linux-gnu
+rustup target add aarch64-unknown-linux-gnu      # Arch's Rust without rustup: sudo pacman -S rust-aarch64-gnu
 scripts/build-frame.sh --install 192.168.1.20    # the headset's address; needs sshd on it
 ```
+
+A cross-built binary needs at least the glibc of the cross toolchain, which the script prints
+(`openlink-frame needs glibc 2.43 or newer`); compare it with `ldd --version` on the headset. If
+the headset's is older the app does not start (`GLIBC_2.xx not found`); build on the headset then.
 
 On the headset (Developer Mode; `sudo systemctl enable --now sshd`, and set a password with
 `passwd`), add `~/Applications/openlink/openlink-frame.sh` to Steam as a non-Steam game and start
@@ -137,7 +160,27 @@ it, or start it over SSH while SteamVR runs there. It finds the PC by LAN broadc
 Useful switches: `OPENLINK_V4L2_DECODER=/dev/videoN` (another decoder node),
 `OPENLINK_OPENXR_LOADER=/path/libopenxr_loader.so`, `OPENLINK_EGL_SURFACELESS=1`, `--swap-eyes`.
 Without a decoder the app still runs, with tracking and input only, which is enough to test the
-controllers.
+controllers; `OPENLINK_V4L2_DECODER=/nonexistent` forces that.
+
+Known on the Frame:
+
+- The controllers show up in SteamVR as Quest Touch controllers, with Quest models. SteamVR on the
+  PC already ships a `frame_controller` driver (models, input profile, bindings); using it needs
+  the Frame controller profile on the headset and a matching device in the driver.
+- SteamVR's runtime on the Frame has listed only 144 Hz while running the display at 72 Hz, and
+  refused the switch. The app now also reports the rate the display runs at, so the PC paces and
+  encodes at the real rate.
+- Present-to-photon is about 36–40 ms, most of it between decoding and the display.
+
+## Known issue: SteamVR's layer over games
+
+While a game runs, SteamVR submits its own layer (dashboard, laser, controller models) next to the
+game's, and the server draws it over the game. On an RX 9070 XT, SteamVR drew that layer into only
+one of the three textures it rotates through, so the other two (stale, opaque) covered the game
+in two frames of three: half the frame rate with black in between. Until that is understood, the
+setting `"steamvr_layer_over_games": false` in `~/.config/openlink/settings.json` streams games
+without SteamVR's layer: games are clean, but the dashboard opened over a game does not show in
+the headset.
 
 ## License
 

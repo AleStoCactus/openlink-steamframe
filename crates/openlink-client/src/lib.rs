@@ -222,10 +222,62 @@ fn set_recv_buffer(sock: &UdpSocket, bytes: i32) {
         };
         if r != 0 {
             log::warn!("cannot enlarge the UDP receive buffer: {}", std::io::Error::last_os_error());
+            return;
+        }
+        // Linux silently caps the request at net.core.rmem_max (and reports double the
+        // usable size); a small buffer drops parts of large frames at high bitrates.
+        let mut got: i32 = 0;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        // SAFETY: valid socket, output buffer and length.
+        let r = unsafe {
+            libc::getsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, (&raw mut got).cast(), &mut len)
+        };
+        if r == 0 && got / 2 < bytes {
+            log::warn!(
+                "UDP receive buffer is {} KB, not the {} KB asked for: large frames may lose packets at high bitrates (raise net.core.rmem_max)",
+                got / 2 / 1024,
+                bytes / 1024
+            );
         }
     }
     #[cfg(not(unix))]
     let _ = (sock, bytes);
+}
+
+/// The broadcast address of every IPv4 network this device is on (loopback excluded).
+fn interface_broadcasts() -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    // SAFETY: getifaddrs/freeifaddrs pair; the list is only read in between.
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut cur = list;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            let flags = ifa.ifa_flags;
+            if ifa.ifa_addr.is_null()
+                || ifa.ifa_netmask.is_null()
+                || (*ifa.ifa_addr).sa_family as i32 != libc::AF_INET
+                || flags & libc::IFF_UP as u32 == 0
+                || flags & libc::IFF_BROADCAST as u32 == 0
+                || flags & libc::IFF_LOOPBACK as u32 != 0
+            {
+                continue;
+            }
+            let addr = u32::from_be((*(ifa.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr);
+            let mask = u32::from_be((*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr);
+            let b = std::net::Ipv4Addr::from(addr | !mask);
+            if !out.contains(&b) {
+                out.push(b);
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    out
 }
 
 /// Finds a server on the LAN: broadcasts `Hello` until one answers with `Welcome`, for up to
@@ -235,11 +287,19 @@ pub fn discover(info: &HeadsetInfo, timeout: Duration) -> std::io::Result<Option
     sock.set_broadcast(true)?;
     sock.set_read_timeout(Some(Duration::from_millis(250)))?;
     let hello = proto::encode(&HeadsetMessage::Hello(info.clone()));
-    let target = SocketAddr::from(([255, 255, 255, 255], proto::SERVER_PORT));
     let start = Instant::now();
     let mut buf = [0u8; 2048];
     while start.elapsed() < timeout {
-        sock.send_to(&hello, target)?;
+        // 255.255.255.255 leaves by the default route only; each network's own broadcast
+        // address also reaches a PC on another one (the Steam Frame's adapter joins the
+        // headset's access point, beside the home network).
+        let mut targets = vec![std::net::Ipv4Addr::BROADCAST];
+        targets.extend(interface_broadcasts().into_iter().filter(|b| *b != std::net::Ipv4Addr::BROADCAST));
+        for ip in targets {
+            if let Err(e) = sock.send_to(&hello, SocketAddr::from((ip, proto::SERVER_PORT))) {
+                log::debug!("discovery to {ip}: {e}");
+            }
+        }
         let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             match sock.recv_from(&mut buf) {

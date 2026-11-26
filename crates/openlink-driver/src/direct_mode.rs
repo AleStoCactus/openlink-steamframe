@@ -22,7 +22,7 @@ use crate::video;
 use openlink_protocol::time::monotonic_ns;
 use openlink_protocol::video_ipc::{self as vipc, DmabufPlane, DmabufTexture};
 use std::collections::VecDeque;
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -255,9 +255,41 @@ fn drm_format_for(vk_format: u32) -> Option<u32> {
     })
 }
 
-fn render_node() -> CString {
-    let path = std::env::var("OPENLINK_RENDER_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
-    CString::new(path).unwrap_or_else(|_| c"/dev/dri/renderD128".into())
+/// The render node of the GPU SteamVR's compositor runs on: `OPENLINK_RENDER_NODE` if set,
+/// else the first node made by the vendor of the compositor's modifiers, else renderD128.
+/// With an integrated GPU beside a discrete one, renderD128 is often the integrated one,
+/// which can neither share buffers with the compositor nor encode.
+fn render_node(compositor_modifiers: &[u64]) -> CString {
+    const FALLBACK: &CStr = c"/dev/dri/renderD128";
+    if let Ok(path) = std::env::var("OPENLINK_RENDER_NODE") {
+        return CString::new(path).unwrap_or_else(|_| FALLBACK.into());
+    }
+    let Some(vendor) = pci_vendor_of(compositor_modifiers) else { return FALLBACK.into() };
+    let mut nodes: Vec<u32> = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.strip_prefix("renderD")?.parse().ok())
+        .collect();
+    nodes.sort_unstable();
+    nodes
+        .into_iter()
+        .find(|n| {
+            std::fs::read_to_string(format!("/sys/class/drm/renderD{n}/device/vendor"))
+                .is_ok_and(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16) == Ok(vendor))
+        })
+        .and_then(|n| CString::new(format!("/dev/dri/renderD{n}")).ok())
+        .unwrap_or_else(|| FALLBACK.into())
+}
+
+/// PCI vendor of the GPU that makes these modifiers, from the vendor byte of the first
+/// vendor-specific one (`fourcc_mod_code`). `None` if all are generic, such as LINEAR.
+fn pci_vendor_of(modifiers: &[u64]) -> Option<u32> {
+    modifiers.iter().find_map(|&m| match m >> 56 {
+        0x01 => Some(0x8086), // DRM_FORMAT_MOD_VENDOR_INTEL
+        0x02 => Some(0x1002), // DRM_FORMAT_MOD_VENDOR_AMD
+        0x03 => Some(0x10de), // DRM_FORMAT_MOD_VENDOR_NVIDIA
+        _ => None,
+    })
 }
 
 /// Allocates `desc` as dmabufs and imports them into SteamVR. `None` (with a log line) when
@@ -270,8 +302,11 @@ fn create_dmabuf_textures(
     allow_compression: bool,
 ) -> Option<(u32, Vec<Texture>)> {
     let h = host();
+    let drm_format = drm_format_for(desc.nFormat);
+    // The compositor's modifiers also tell which GPU it renders on.
+    let compositor_modifiers = drm_format.map(|f| h.dmabuf_modifiers(f)).unwrap_or_default();
     if matches!(c.gbm, Gbm::Untried) {
-        let node = render_node();
+        let node = render_node(&compositor_modifiers);
         c.gbm = match gbm::Device::open(&node) {
             Ok(d) => {
                 log::info!("allocating compositor textures with GBM on {}", node.to_string_lossy());
@@ -288,14 +323,14 @@ fn create_dmabuf_textures(
         log::warn!("multisampled swap textures ({}x) cannot be streamed", desc.nSampleCount);
         return None;
     }
-    let Some(drm_format) = drm_format_for(desc.nFormat) else {
+    let Some(drm_format) = drm_format else {
         log::warn!("no DRM format for VkFormat {}; this set cannot be streamed", desc.nFormat);
         return None;
     };
-    let mut modifiers = h.dmabuf_modifiers(drm_format);
-    if !allow_compression {
-        modifiers.retain(|&m| !amd_dcc(m));
-    }
+    let mut modifiers = compositor_modifiers;
+    // On GFX12 (RDNA4) the server reads what the compositor cleared as the texture's old
+    // content: SteamVR's layer over a game came out opaque black in two frames of three.
+    modifiers.retain(|&m| !amd_dcc(m) || (allow_compression && !amd_gfx12(m)));
     if modifiers.is_empty() {
         log::warn!("compositor reports no dmabuf modifiers for format {drm_format:#x}");
         return None;
@@ -371,6 +406,12 @@ fn create_steamvr_textures(desc: &SwapTextureSetDesc_t) -> Option<Vec<Texture>> 
 /// `AMD_FMT_MOD` modifier, vendor 0x02 in the top byte).
 fn amd_dcc(modifier: u64) -> bool {
     modifier >> 56 == 0x02 && modifier & (1 << 13) != 0
+}
+
+/// Whether an AMD format modifier is for GFX12 (RDNA4) or newer: `AMD_FMT_MOD_TILE_VERSION`
+/// (the low byte) 5 or more.
+fn amd_gfx12(modifier: u64) -> bool {
+    modifier >> 56 == 0x02 && modifier & 0xff >= 5
 }
 
 /// Whether `pid` is SteamVR's compositor (`vrcompositor`).
@@ -712,5 +753,33 @@ impl Drop for VsyncThread {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{amd_dcc, amd_gfx12, pci_vendor_of};
+
+    #[test]
+    fn gfx12_dcc_is_recognised() {
+        // What RADV offered for the compositor on an RX 9070 XT: GFX12, 64K_2D, DCC.
+        const GFX12_DCC: u64 = 0x0200_0000_0008_2305;
+        assert!(amd_dcc(GFX12_DCC) && amd_gfx12(GFX12_DCC));
+        // GFX10.3 (RDNA2) with DCC keeps it.
+        const GFX10_RBPLUS_DCC: u64 = 0x0200_0000_0000_2003 | (0x18 << 8);
+        assert!(amd_dcc(GFX10_RBPLUS_DCC) && !amd_gfx12(GFX10_RBPLUS_DCC));
+        assert!(!amd_gfx12(0));
+    }
+
+    #[test]
+    fn modifier_vendor_names_the_gpu() {
+        const LINEAR: u64 = 0;
+        const I915_X_TILED: u64 = 0x0100_0000_0000_0001;
+        const AMD_GFX12: u64 = 0x0200_0000_1866_bf04;
+        // LINEAR says nothing; the first vendor-specific modifier decides.
+        assert_eq!(pci_vendor_of(&[LINEAR, AMD_GFX12]), Some(0x1002));
+        assert_eq!(pci_vendor_of(&[I915_X_TILED, LINEAR]), Some(0x8086));
+        assert_eq!(pci_vendor_of(&[LINEAR]), None);
+        assert_eq!(pci_vendor_of(&[]), None);
     }
 }

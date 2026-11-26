@@ -236,7 +236,12 @@ pub fn run(options: Options) -> Result<(), String> {
                     // Without XR_FB_display_refresh_rate the rate is whatever the display runs.
                     let measured = 1e9 / state.predicted_display_period.as_nanos().max(1) as f32;
                     let current = if exts.fb_display_refresh_rate { current_rate(&session, true) } else { measured.round() };
-                    let rates = if refresh_rates.is_empty() { vec![current] } else { refresh_rates.clone() };
+                    // The display's own rate belongs in the list: SteamVR's runtime on the Frame
+                    // has listed only 144 Hz while running at 72, and refused the switch.
+                    let mut rates = refresh_rates.clone();
+                    if !rates.iter().any(|r| (r - current).abs() < 0.5) {
+                        rates.push(current);
+                    }
                     let info = HeadsetInfo {
                         model: model_name(&props.system_name),
                         serial: format!("OpenLink-{:x}", props.system_id.into_raw()),

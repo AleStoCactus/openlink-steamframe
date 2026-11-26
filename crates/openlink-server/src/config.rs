@@ -18,6 +18,9 @@ pub enum ConnectionMode {
     /// USB cable. The headset's USB NCM interface (or `adb forward` as a fallback) is just
     /// another IP route, so the session code is the same; only discovery differs.
     Usb,
+    /// The Steam Frame's USB wireless adapter: a direct 6 GHz link to the headset's own access
+    /// point. The server joins it and answers headsets only there.
+    SteamFrameAdapter,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +33,9 @@ pub struct Settings {
     pub resolution_scale: f32,
     pub refresh_rate: f32,
     pub connection: ConnectionMode,
+    /// Draw SteamVR's own layer (dashboard, laser, controllers) over a game's. Off where
+    /// SteamVR leaves textures of that layer undrawn: they then cover the game, black.
+    pub steamvr_layer_over_games: bool,
 }
 
 impl Default for Settings {
@@ -43,6 +49,7 @@ impl Default for Settings {
             resolution_scale: 1.2,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
+            steamvr_layer_over_games: true,
         }
     }
 }

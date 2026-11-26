@@ -4,6 +4,7 @@
 //! `openlink --headless` runs the session without a window (for servers or debugging).
 //! `openlink --dump-video PATH` (Linux) also writes every encoded frame to PATH as raw H.265.
 
+mod adapter;
 mod config;
 mod encoder;
 mod gui;
@@ -30,6 +31,7 @@ fn main() {
     }
     let settings = Arc::new(Mutex::new(Settings::load()));
     let status = Arc::new(Mutex::new(Status::default()));
+    adapter::spawn_monitor(status.clone(), settings.clone());
 
     let session = match Session::start(status.clone(), settings.clone()) {
         Ok(s) => Some(s),

@@ -106,21 +106,38 @@ and shares its tracking code through `openlink-xr`. What differs is the platform
 |---|---|---|
 | OpenXR runtime | Meta's, via the Khronos loader in the APK | SteamVR's arm64 runtime; its loader at `/opt/steamvr/bin/linuxarm64/libopenxr_loader.so` is tried first |
 | Graphics | GLES 3.2, `XrGraphicsBindingOpenGLESAndroidKHR` | desktop GL (Mesa: Zink on Turnip) over EGL, `XR_KHR_opengl_enable` + `XR_MNDX_egl_enable`. The `openxr` crate has no EGL binding for desktop GL, so `xr_egl.rs` implements its `Graphics` trait |
-| Decode | `AMediaCodec` into an `AImageReader` | V4L2 stateful mem2mem decoder (Qualcomm Iris, `/dev/video-dec0`), NV12 out. Turnip has no Vulkan Video |
+| Decode | `AMediaCodec` into an `AImageReader` | V4L2 stateful mem2mem decoder (Qualcomm Iris, `/dev/video-dec0`: H.264, HEVC, VP9, AV1), NV12 out, 3–6 ms a picture. Turnip has no Vulkan Video |
 | Picture to GL | `AHardwareBuffer` as an external texture | capture buffers exported (`VIDIOC_EXPBUF`) and imported as two dmabuf `EGLImage`s (R8 luma, GR88 chroma), YUV to RGB in the shader. Uploaded from the mapped buffer if export or import fails |
 | Controllers | Touch profile | the same Touch bindings; SteamVR maps them onto the Frame controllers, so the PC keeps seeing Touch |
 
-Not yet verified on hardware:
+Seen on hardware (SteamVR/OpenXR 2.19.5 on the headset, a game played over home Wi-Fi and over the
+Frame's adapter):
 
-- Whether Iris exports its NV12 buffers. One report says it cannot. Then each picture (about 13 MB)
-  is copied from what may be uncached memory, which is likely to be a bottleneck.
-- The chroma plane offset. Qualcomm aligns luma rows to 32 without saying so in the format, and
-  `decoder::layout` assumes it.
+- OpenXR loads through SteamVR's loader, and EGL comes up as Mesa OpenGL 4.3 core, surfaceless,
+  with dmabuf import. The runtime also loads Valve's `fdm_injection` layer (fragment density map
+  injection), which picks up the eye swapchains.
+- The chroma plane offset is right: colours come out correct, so Qualcomm's luma rows aligned to
+  32, which `decoder::layout` assumes, match.
+- The runtime has listed only 144 Hz (`XR_FB_display_refresh_rate`) while the display ran at
+  72 Hz, and refused the switch to 144. The server picked 144, so the PC encoded for 144 fps while
+  the headset showed 72. The app now adds the display's current rate to the list it reports.
+- Linux caps the UDP receive buffer at `net.core.rmem_max` (about 200 KB by default) without an
+  error, so the 4 MB the client asks for is not granted. At 200 Mbps (about 350 KB a frame) the
+  headset most likely lost part of every keyframe and showed nothing; 100 Mbps works. The client
+  now logs when its buffer is capped.
+- A binary cross-built against a newer glibc than the headset's does not start; the build script
+  prints the glibc version the binary needs.
+
+Still open:
+
+- Whether Iris exports its NV12 buffers (`VIDIOC_EXPBUF`), or every picture (about 13 MB) is
+  copied from what may be uncached memory. The log says which (`cannot export picture buffers`).
 - The decoder's low-latency controls.
+- Present-to-photon is about 36–40 ms, most of it between decoding and the display.
 
-Next steps once it runs: the Frame controller profile (`XR_VALVE_frame_controller_interaction`)
-with a matching SteamVR device on the PC, eye tracking for foveated encoding, and SteamOS
-packaging.
+Next steps: the Frame controller profile (`XR_VALVE_frame_controller_interaction`) with a matching
+SteamVR device on the PC (SteamVR on the PC already ships a `frame_controller` driver with render
+models, input profile and bindings), eye tracking for foveated encoding, and SteamOS packaging.
 
 ## Wired connection
 
@@ -128,6 +145,25 @@ Over USB the headset is simply another IP route. Its USB NCM network interface (
 `adb forward`/`reverse` as a fallback, TCP only) appears as a network interface on the PC, so the
 session code is identical. Only discovery differs. ADB forwarding cannot carry UDP, so NCM is the
 preferred wired path.
+
+## Steam Frame adapter
+
+The Steam Frame's USB wireless adapter (Valve 28de:2432, a Realtek RTL8852CU, `rtw89_8852cu`) is
+not wired either, but it is a link of its own. The headset is the access point (a hidden SSID
+`frame_…`, WPA3, 6 GHz, 160 MHz; on one setup the headset was `10.35.78.1` and handed out
+addresses by DHCP), and the adapter on the PC joins it as a client. Steam creates the
+NetworkManager profile when it pairs the headset and joins the access point for Steam Link; Steam's
+log (`remote_connections.txt`) shows it. The link is just another IP network, so the session code
+is unchanged:
+
+- `openlink-server/src/adapter.rs` finds the adapter by its USB ids in sysfs, reads its address,
+  and, in the "Steam Frame adapter" connection mode, brings up the profile whose SSID starts
+  with `frame_` (`nmcli connection up`) when the adapter is plugged in but not joined.
+- In that mode the session answers a headset's `Hello` only from the adapter's network (unless the
+  adapter has no address): the headset also reaches the PC over the home network, which would
+  otherwise answer first.
+- The headset's discovery broadcasts to `255.255.255.255` and to the broadcast address of every
+  network it is on, since the limited broadcast leaves by the default route only.
 
 ## Open questions
 
@@ -150,6 +186,26 @@ preferred wired path.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.
+- **Which GPU, with more than one.** Resolved. The driver allocated the compositor's textures with
+  GBM on `/dev/dri/renderD128` and told the server to encode on that node. On a PC with an
+  integrated GPU that node is the integrated one (here an Intel UHD 770 beside an RX 9070 XT):
+  the compositor refused its buffers (`ImportDmabuf refused modifier 0x0`) and the server found
+  no H.265 encoder there, so nothing was streamed. The driver now picks the node whose PCI vendor
+  made the compositor's dmabuf modifiers (their top byte names the vendor: Intel, AMD or NVIDIA);
+  `OPENLINK_RENDER_NODE` still overrides it.
+- **SteamVR's own layer over a game.** Open. While a game runs, SteamVR submits its layer
+  (dashboard, laser, controller models) next to the game's, from a set of three textures the
+  driver rotates through with `GetNextSwapTextureSetIndex`. On an RX 9070 XT, `--dump-video`
+  (whose `.poses` file names each frame's textures) showed that only one of the three ever changed:
+  the other two kept a stale, opaque picture from before the game started, so two frames in three
+  came out black or showed the SteamVR void. SteamVR does follow the indices the driver returns
+  when it submits, but pinning one index (returning the same one every frame) made it worse: the
+  headset showed only the SteamVR void, so SteamVR does not simply draw into the texture it is
+  given. Dropping DCC from those textures on GFX12, the first suspect,
+  changed nothing (the driver still drops it; harmless). Workaround: the server setting
+  `steamvr_layer_over_games: false` streams the game's layer alone. A fix could draw from the
+  texture of the set written last, told apart by its dmabuf write fence (while ignoring the
+  server's own read fences).
 
 ## Roadmap
 
@@ -162,3 +218,6 @@ preferred wired path.
 4. **Video on Linux.** Capture spike, then VA-API/NVENC/Vulkan Video.
 5. **Quality.** FEC and adaptive bitrate, foveated encoding, audio both ways, USB NCM discovery,
    Quest Pro face/eye tracking, hand tracking with skeletal input.
+6. **Steam Frame (playable).** Native arm64 client, V4L2 decode, the Frame's adapter as a direct
+   link. Next: Frame controllers as themselves, SteamVR's layer over games, eye-tracked foveated
+   encoding, SteamOS packaging.

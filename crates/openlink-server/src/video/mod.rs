@@ -557,7 +557,8 @@ impl<'a> Connection<'a> {
 
         let t0 = Instant::now();
         // The overlay is drawn only if both its textures are known.
-        let overlay = frame.overlay.and_then(|o| {
+        let overlay_on = self.shared.settings.lock().unwrap().steamvr_layer_over_games;
+        let overlay = frame.overlay.filter(|_| overlay_on).and_then(|o| {
             let (l, r) = (self.imports.get(&o[0].texture)?, self.imports.get(&o[1].texture)?);
             Some(([l, r], [o[0].bounds, o[1].bounds]))
         });
@@ -577,13 +578,20 @@ impl<'a> Connection<'a> {
                 log::error!("video: dump write failed: {e}");
                 self.dump = None;
             }
-            // Beside the stream: each frame's render pose, for checking labels against content.
+            // Beside the stream: each frame's render pose, for checking labels against content,
+            // and the textures it was made from (left eye, SteamVR's layer over it or 0).
             if let Some(poses) = &mut self.dump_poses {
                 let p = proto::Pose::from_matrix34(&frame.hmd_pose);
                 let _ = writeln!(
                     poses,
-                    "{} {} {} {:?} {:?}",
-                    self.stats_frames_total, frame.present_ns, idr as u8, p.orientation, p.position
+                    "{} {} {} {:?} {:?} {:x} {:x}",
+                    self.stats_frames_total,
+                    frame.present_ns,
+                    idr as u8,
+                    p.orientation,
+                    p.position,
+                    frame.eyes[0].texture,
+                    frame.overlay.map_or(0, |o| o[0].texture)
                 );
             }
             self.stats_frames_total += 1;

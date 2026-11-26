@@ -6,7 +6,7 @@
 //! * **driver**: receives heartbeats and haptics from the SteamVR driver and routes haptics to
 //!   the headset.
 
-use crate::config::Settings;
+use crate::config::{ConnectionMode, Settings};
 use openlink_protocol::{
     self as proto,
     clock::{ClockSample, ClockSync},
@@ -28,6 +28,8 @@ const CLOCK_PING_STEADY: Duration = Duration::from_millis(250);
 pub struct Status {
     pub driver_connected: bool,
     pub headset: Option<HeadsetStatus>,
+    /// The Steam Frame's USB wireless adapter, when plugged in.
+    pub adapter: Option<crate::adapter::AdapterStatus>,
     pub last_error: Option<String>,
 }
 
@@ -210,6 +212,8 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
     let mut invalid_hmd = 0u32;
     // Controller samples, with angular velocity flagged valid, peak |w| and |v| (diagnostics).
     let mut ctrl_stats = (0u32, 0u32, 0f32, 0f32);
+    // The last headset address turned away for not using the Steam Frame adapter (logged once).
+    let mut ignored_hello: Option<SocketAddr> = None;
 
     while !shared.stop.load(Ordering::Acquire) {
         let current = *shared.headset_addr.lock().unwrap();
@@ -259,6 +263,20 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
         };
 
         if let HeadsetMessage::Hello(info) = &msg {
+            // Over the Steam Frame's adapter, take the headset only on the adapter's network: it
+            // also reaches us over the home network, which would otherwise answer first.
+            if current != Some(from) && shared.settings.lock().unwrap().connection == ConnectionMode::SteamFrameAdapter {
+                let adapter = shared.status.lock().unwrap().adapter.clone();
+                if let Some(a) = adapter.filter(|a| a.ipv4.is_some()) {
+                    if !a.reaches(from.ip()) {
+                        if ignored_hello != Some(from) {
+                            log::info!("headset {from} not on the Steam Frame adapter's network ({}); waiting for it there", a.interface);
+                            ignored_hello = Some(from);
+                        }
+                        continue;
+                    }
+                }
+            }
             if current != Some(from) {
                 log::info!("headset {} connected from {from}", info.model);
                 clock = ClockSync::default();

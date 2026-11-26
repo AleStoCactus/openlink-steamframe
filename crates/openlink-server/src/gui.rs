@@ -65,6 +65,31 @@ impl App {
                 }
                 ui.end_row();
 
+                if let Some(a) = &st.adapter {
+                    ui.label("Steam Frame adapter");
+                    match a.ipv4 {
+                        Some((ip, prefix)) => {
+                            let mut text = format!("{} {ip}/{prefix}", a.interface);
+                            if let Some(ssid) = &a.ssid {
+                                text += &format!(", {ssid}");
+                            }
+                            if let Some(tx) = a.tx_mbps {
+                                text += &format!(", {tx:.0} Mbit/s");
+                            }
+                            if let Some(dbm) = a.signal_dbm {
+                                text += &format!(", {dbm} dBm");
+                            }
+                            dot(ui, true, &text)
+                        }
+                        None => dot(
+                            ui,
+                            false,
+                            a.problem.as_deref().unwrap_or("plugged in, not connected to the headset"),
+                        ),
+                    }
+                    ui.end_row();
+                }
+
                 if let Some(h) = &st.headset {
                     ui.label("Clock sync");
                     ui.label(match (h.clock_offset_ns, h.min_rtt_ns) {
@@ -165,7 +190,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.radio_value(&mut d.connection, ConnectionMode::WiFi, "Wi-Fi");
             ui.radio_value(&mut d.connection, ConnectionMode::Usb, "USB cable");
+            ui.radio_value(&mut d.connection, ConnectionMode::SteamFrameAdapter, "Steam Frame adapter");
         });
+        if d.connection == ConnectionMode::SteamFrameAdapter {
+            ui.weak("Direct 6 GHz link through the Steam Frame's USB wireless adapter. OpenLink joins the headset's network with the profile Steam made when pairing it.");
+        }
 
         ui.add_space(12.0);
         let dirty = *self.settings.lock().unwrap() != self.draft;
