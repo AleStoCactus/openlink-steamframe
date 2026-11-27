@@ -9,7 +9,7 @@ use crate::decoder::{self, Output};
 use crate::egl;
 use crate::render::Renderer;
 use crate::tracking::{Actions, XrTracking};
-use android_activity::{AndroidApp, MainEvent, PollEvent};
+use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 use glam::{Quat, Vec3};
 use openlink_client::{Client, ClientState, FrameReporter};
 use openlink_protocol::{Fov, HeadsetInfo, Pose};
@@ -166,6 +166,14 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 quit = true;
             }
         });
+        // Android delivers key presses (the volume buttons among them) to the app first and
+        // waits for each to be finished. The controllers come through OpenXR, so none is ours:
+        // handing them back unhandled lets the system change the volume and show its overlay.
+        // Left unread, the volume keys did nothing and Android reported the app as not
+        // responding after 5 s ("Input dispatching timed out ... Waited 5000ms for KeyEvent").
+        if let Ok(mut input) = app.input_events_iter() {
+            while input.next(|_| InputStatus::Unhandled) {}
+        }
 
         // OpenXR lifecycle.
         while let Some(event) = instance.poll_event(&mut event_storage).map_err(e("poll event"))? {
