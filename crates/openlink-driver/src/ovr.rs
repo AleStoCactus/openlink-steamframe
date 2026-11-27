@@ -46,6 +46,7 @@ pub const VRScalarType_Absolute: i32 = 0;
 pub const VRScalarUnits_NormalizedOneSided: i32 = 0;
 pub const VRScalarUnits_NormalizedTwoSided: i32 = 1;
 
+pub const VREvent_SteamVRSectionSettingChanged: u32 = 857;
 pub const VREvent_Input_HapticVibration: u32 = 1700;
 
 // Property type tags.
@@ -77,6 +78,9 @@ pub mod prop {
     pub const IsOnDesktop_Bool: i32 = 2007;
     pub const DriverDirectModeSendsVsyncEvents_Bool: i32 = 2043;
     pub const GraphicsAdapterLuid_Uint64: i32 = 2045;
+    pub const DisplayAvailableFrameRates_Float_Array: i32 = 2080;
+    pub const DisplaySupportsMultipleFramerates_Bool: i32 = 2081;
+    pub const DisplaySupportsRuntimeFramerateChange_Bool: i32 = 2084;
     pub const ControllerRoleHint_Int32: i32 = 3007;
     pub const ControllerType_String: i32 = 7000;
     pub const NamedIconPathDeviceOff_String: i32 = 5001;
@@ -96,6 +100,7 @@ pub const IVRServerDriverHost_Version: &[u8] = b"IVRServerDriverHost_006\0";
 pub const IVRProperties_Version: &[u8] = b"IVRProperties_001\0";
 pub const IVRDriverInput_Version: &[u8] = b"IVRDriverInput_004\0";
 pub const IVRDriverLog_Version: &[u8] = b"IVRDriverLog_001\0";
+pub const IVRSettings_Version: &[u8] = b"IVRSettings_003\0";
 pub const IVRDriverDirectModeComponent_Version: &[u8] = b"IVRDriverDirectModeComponent_009\0";
 pub const IVRIPCResourceManagerClient_Version: &[u8] = b"IVRIPCResourceManagerClient_003\0";
 
@@ -444,6 +449,36 @@ pub struct IVRProperties_Vtbl {
         device: TrackedDeviceIndex_t,
     ) -> PropertyContainerHandle_t,
 }
+
+/// `IVRSettings_003`. Only the getters and `SetFloat` are called.
+#[repr(C)]
+pub struct IVRSettings_Vtbl {
+    pub GetSettingsErrorNameFromEnum: *const c_void,
+    pub SetBool: *const c_void,
+    pub SetInt32: *const c_void,
+    pub SetFloat: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        section: *const c_char,
+        key: *const c_char,
+        value: f32,
+        err: *mut EVRSettingsError,
+    ),
+    pub SetString: *const c_void,
+    pub GetBool: *const c_void,
+    pub GetInt32: *const c_void,
+    pub GetFloat: unsafe extern "C" fn(
+        this: *mut Iface<Self>,
+        section: *const c_char,
+        key: *const c_char,
+        err: *mut EVRSettingsError,
+    ) -> f32,
+    pub GetString: *const c_void,
+    pub RemoveSection: *const c_void,
+    pub RemoveKeyInSection: *const c_void,
+}
+
+pub type EVRSettingsError = i32;
+pub const VRSettingsError_None: EVRSettingsError = 0;
 
 #[repr(C)]
 pub struct IVRDriverInput_Vtbl {

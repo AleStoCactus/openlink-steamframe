@@ -147,7 +147,16 @@ fn handle(msg: ToDriver, last_tracking: &mut Option<Instant>, presence: &mut [Pr
                 host().request_restart("OpenLink: restarting SteamVR for the headset's display");
             }
             devices::apply_display(&d);
-            *s.display.lock().unwrap() = d;
+            let (rate, old_rate) = (d.refresh_rate, std::mem::replace(&mut *s.display.lock().unwrap(), d).refresh_rate);
+            if (rate - old_rate).abs() >= 0.5 {
+                log::info!("display now {rate} Hz (was {old_rate} Hz)");
+                // The measured period is the old rate's: pace to the nominal one until the
+                // headset measures the new one.
+                s.vsync_period_ns.store(0, Ordering::Release);
+            }
+            // After the display is updated, so the settings event this causes finds the rate
+            // already applied (see `preferred_refresh_rate_changed`).
+            devices::set_preferred_refresh_rate(rate);
             // The controllers the headset ships with, until it says which it has.
             let model = ControllerModel::from_headset_model(&info.model);
             devices::apply_controller_model(Hand::Left, model);

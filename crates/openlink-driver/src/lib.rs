@@ -147,8 +147,11 @@ unsafe extern "C" fn provider_interface_versions(_this: *mut c_void) -> *const *
 unsafe extern "C" fn provider_run_frame(_this: *mut c_void) {
     guard((), || {
         while let Some(ev) = host().poll_event() {
-            if ev.event_type() == VREvent_Input_HapticVibration {
+            let kind = ev.event_type();
+            if kind == VREvent_Input_HapticVibration {
                 forward_haptic(&ev.haptic());
+            } else if kind == VREvent_SteamVRSectionSettingChanged {
+                preferred_refresh_rate_changed();
             }
         }
     })
@@ -161,6 +164,26 @@ unsafe extern "C" fn provider_block_standby(_this: *mut c_void) -> bool {
 }
 
 unsafe extern "C" fn provider_noop(_this: *mut c_void) {}
+
+/// SteamVR's video settings list the headset's rates (`DisplayAvailableFrameRates`); picking one
+/// saves `steamvr/preferredRefreshRate` and sends `VREvent_SteamVRSectionSettingChanged`.
+/// SteamVR cannot switch a streamed display itself (it answers its own change with
+/// `VREvent_Compositor_DisplayModeNotSupported`), so the server is asked to stream at the new
+/// rate. It saves it as its own setting, and the headset, the encoder and SteamVR's display
+/// follow it like a rate picked in the desktop app. The same event comes for every other
+/// `steamvr` setting, and for our own write of the rate (`link`): those leave the rate as it
+/// is and are ignored.
+fn preferred_refresh_rate_changed() {
+    let Some(hz) = devices::preferred_refresh_rate() else { return };
+    let current = state::shared().display.lock().unwrap().refresh_rate;
+    if (hz - current).abs() < 0.5 {
+        return;
+    }
+    log::info!("SteamVR's refresh rate set to {hz} Hz (streaming at {current} Hz); asking the server");
+    if let Some(link) = LINK.lock().unwrap().as_ref() {
+        link.send(&FromDriver::RefreshRate { hz });
+    }
+}
 
 fn forward_haptic(v: &VREvent_HapticVibration_t) {
     let s = shared();

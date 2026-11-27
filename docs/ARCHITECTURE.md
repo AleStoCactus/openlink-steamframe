@@ -201,6 +201,15 @@ logs it and encodes at uniform quality. The parameters ride in every frame's
 changes the coded size, so the server rebuilds its encoder (the first frame is an IDR) and the
 headset its decoder, but SteamVR's render size does not depend on it, so SteamVR keeps running.
 
+**Wi-Fi power-save.** The Quest app holds a `WIFI_MODE_FULL_LOW_LATENCY` Wi-Fi lock
+(`quest/src/wifi.rs`). Without one the headset's radio may sleep between beacons, and the
+router then holds its packets and releases them in clumps: on a strong link (-36 dBm,
+2.4 Gbit/s on 5 GHz) a Quest 3 showed only 46-72 of 90 pictures a second, even at 20 Mbit/s.
+Several frames arrived at once, overflowed the 4-frame queue to the decoder (each overflow
+waits for an IDR), and audio dropped out with them. With the lock: 89.4-90 pictures a second,
+no overflows, no audio underruns. Whether power-save is on had depended on what else on the
+headset held a lock, so streaming looked fine one day and broken the next.
+
 ## Audio
 
 Both directions share the headset socket (`openlink_protocol::audio`): game audio stereo
@@ -267,9 +276,27 @@ preferred wired path.
   comes from Meta's published PPD per model (`HeadsetInfo::render_size`; Quest 3: 25 PPD, 1.54x,
   about 3174x3429 at 100%; an unknown headset gets 1x). The converter downsamples SteamVR's
   frames to the encoded size, and SteamVR's render resolution setting scales from there. The
-  server re-checks the settings every 500 ms while a headset is connected and, when the stream
+  server re-checks the settings every 100 ms while a headset is connected and, when the stream
   changes, sends the headset a new `Welcome` (it rebuilds its swapchains and decoder) and the
   driver a new `HeadsetConnected`, so saving a new resolution restarts SteamVR.
+- **Refresh rate at runtime.** Unlike the render size, the rate changes live. The HMD lists the
+  headset's rates in `DisplayAvailableFrameRates` (with `DisplaySupportsMultipleFramerates` and
+  `DisplaySupportsRuntimeFramerateChange`), which puts a refresh rate picker in SteamVR's video
+  settings. Picking one saves `steamvr/preferredRefreshRate` and sends the driver
+  `VREvent_SteamVRSectionSettingChanged`; SteamVR then sends
+  `VREvent_Compositor_DisplayModeNotSupported` and (on Linux) asks for a restart, because it
+  cannot switch a streamed display itself. The restart is not needed: the driver forwards the
+  rate to the server (`FromDriver::RefreshRate`), which saves it as its own setting, and the
+  usual settings path (polled every 100 ms) re-welcomes the headset and updates the encoder
+  and the driver's `DisplayFrequency`. The driver then writes the rate back to
+  `preferredRefreshRate`, so a rate picked in the desktop app shows in SteamVR too; the
+  settings event that write causes finds the rate already applied and is ignored. The vsync
+  pacer drops its measured period on a change and paces at the nominal rate until the headset
+  measures the new one. On the Quest, `xrRequestDisplayRefreshRateFB` returns success but is
+  ignored before the session is focused, so the app asks again every second until the display
+  reports the rate; and `debug.oculus.refreshRate` (set over adb or by Singularity), when
+  nonzero, overrides every app's request, takes effect live, and only lets go once cleared and
+  the app restarted.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.

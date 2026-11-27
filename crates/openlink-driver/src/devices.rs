@@ -116,6 +116,7 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.set_string(c, prop::RenderModelName_String, "generic_hmd");
         set_icons(c, &HMD_ICONS);
         h.set_f32(c, prop::DisplayFrequency_Float, d.refresh_rate);
+        set_frame_rates(c, &d.refresh_rates);
         h.set_f32(c, prop::UserIpdMeters_Float, d.ipd_m);
         h.set_f32(c, prop::SecondsFromVsyncToPhotons_Float, 0.0);
         h.set_u64(c, prop::CurrentUniverseId_Uint64, 0x4F4C_4E4B); // "OLNK"
@@ -286,6 +287,31 @@ pub fn set_photon_latency(seconds: f32) {
     shared().photon_latency_us.store((seconds.clamp(0.0, 0.2) * 1e6) as u32, Ordering::Release);
 }
 
+/// Offers the headset's rates in SteamVR's video settings, as a native headset's are. Which
+/// one is picked comes back as `steamvr/preferredRefreshRate` (see `preferred_refresh_rate`).
+fn set_frame_rates(c: PropertyContainerHandle_t, rates: &[f32]) {
+    let h = host();
+    h.set_f32_array(c, prop::DisplayAvailableFrameRates_Float_Array, rates);
+    h.set_bool(c, prop::DisplaySupportsMultipleFramerates_Bool, rates.len() > 1);
+    h.set_bool(c, prop::DisplaySupportsRuntimeFramerateChange_Bool, true);
+}
+
+const STEAMVR_SECTION: &CStr = c"steamvr";
+const PREFERRED_REFRESH_RATE: &CStr = c"preferredRefreshRate";
+
+/// The rate picked in SteamVR's video settings, if any.
+pub fn preferred_refresh_rate() -> Option<f32> {
+    host().setting_f32(STEAMVR_SECTION, PREFERRED_REFRESH_RATE).filter(|hz| *hz > 0.0)
+}
+
+/// Shows `hz` as the picked rate in SteamVR's video settings, so they match a rate chosen in
+/// the desktop app (or the closest one the headset could do).
+pub fn set_preferred_refresh_rate(hz: f32) {
+    if preferred_refresh_rate().is_none_or(|p| (p - hz).abs() >= 0.5) {
+        host().set_setting_f32(STEAMVR_SECTION, PREFERRED_REFRESH_RATE, hz);
+    }
+}
+
 /// Push new display parameters (from the headset's Hello) to SteamVR at runtime.
 pub fn apply_display(d: &DisplayConfig) {
     let id = shared().hmd_id.load(Ordering::Acquire);
@@ -296,6 +322,7 @@ pub fn apply_display(d: &DisplayConfig) {
     let c = h.container(id);
     h.set_string(c, prop::ModelNumber_String, hmd_model_number(&d.model));
     h.set_f32(c, prop::DisplayFrequency_Float, d.refresh_rate);
+    set_frame_rates(c, &d.refresh_rates);
     h.set_f32(c, prop::UserIpdMeters_Float, d.ipd_m);
     h.set_render_target_size(id, d.eye_width, d.eye_height);
     h.set_projection(id, d.projection(0), d.projection(1));

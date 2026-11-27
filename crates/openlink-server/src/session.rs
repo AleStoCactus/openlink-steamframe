@@ -25,10 +25,12 @@ const HEADSET_TIMEOUT: Duration = Duration::from_secs(2);
 const DRIVER_TIMEOUT: Duration = Duration::from_secs(2);
 const CLOCK_PING_WARMUP: Duration = Duration::from_millis(20);
 const CLOCK_PING_STEADY: Duration = Duration::from_millis(250);
-/// How often a connected headset's stream configuration is re-sent: picks up saved settings
-/// within this time, and repeats the `Welcome` in case one was lost (the headset only asks
-/// with `Hello` until its first one arrives).
+/// How often a connected headset's `Welcome` is repeated, in case one was lost (the headset
+/// only asks with `Hello` until its first one arrives).
 const WELCOME_REPEAT: Duration = Duration::from_millis(500);
+/// How often the saved settings are checked for a change to a connected headset's stream, so
+/// a refresh rate picked in the desktop app or SteamVR applies at once.
+const SETTINGS_POLL: Duration = Duration::from_millis(100);
 /// Reserve the microphone buffer keeps against Wi-Fi jitter, on top of what the jitter needs.
 const MIC_MARGIN_MS: u32 = 10;
 
@@ -376,6 +378,7 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
     // The connected headset's `Hello`, to work its stream out again when settings change.
     let mut hello: Option<HeadsetInfo> = None;
     let mut last_welcome = Instant::now();
+    let mut last_settings_poll = Instant::now();
     let mut clock = ClockSync::default();
     let mut last_rx = Instant::now();
     let mut last_ping = Instant::now();
@@ -406,8 +409,8 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                 );
                 last_ping = Instant::now();
             }
-            if let Some(info) = hello.as_ref().filter(|_| last_welcome.elapsed() >= WELCOME_REPEAT) {
-                last_welcome = Instant::now();
+            if let Some(info) = hello.as_ref().filter(|_| last_settings_poll.elapsed() >= SETTINGS_POLL) {
+                last_settings_poll = Instant::now();
                 let cfg = stream_config(&shared.settings.lock().unwrap(), info);
                 let have = shared.stream.lock().unwrap().clone();
                 if have.as_ref() != Some(&cfg) {
@@ -415,8 +418,10 @@ fn headset_loop(shared: &Shared, sock: UdpSocket, driver_sock: UdpSocket) {
                     // The headset needs a fresh decoder, which starts at an IDR.
                     shared.idr_requested.store(true, Ordering::Release);
                     welcome(shared, &sock, &driver_sock, addr, info, cfg);
-                } else if let Some(cfg) = have {
+                    last_welcome = Instant::now();
+                } else if let Some(cfg) = have.filter(|_| last_welcome.elapsed() >= WELCOME_REPEAT) {
                     let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg)), addr);
+                    last_welcome = Instant::now();
                 }
             }
         }
@@ -675,6 +680,17 @@ fn driver_loop(shared: &Shared, sock: UdpSocket, headset_sock: UdpSocket) {
                     }
                 }
                 last_heartbeat = Some(Instant::now());
+            }
+            Ok(FromDriver::RefreshRate { hz }) => {
+                // Saved like a rate picked in the window; the headset loop applies it.
+                let mut settings = shared.settings.lock().unwrap();
+                if (settings.refresh_rate - hz).abs() >= 0.5 {
+                    log::info!("refresh rate set to {hz} Hz in SteamVR");
+                    settings.refresh_rate = hz;
+                    if let Err(e) = settings.save() {
+                        log::error!("could not save settings: {e}");
+                    }
+                }
             }
             Ok(FromDriver::Haptics(h)) => {
                 if let Some(addr) = *shared.headset_addr.lock().unwrap() {

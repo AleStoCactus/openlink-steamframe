@@ -14,6 +14,8 @@ pub struct DisplayConfig {
     pub eye_width: u32,
     pub eye_height: u32,
     pub refresh_rate: f32,
+    /// Rates the headset can run at, offered in SteamVR's video settings.
+    pub refresh_rates: Vec<f32>,
     pub ipd_m: f32,
     pub fov: [Fov; 2],
 }
@@ -38,6 +40,7 @@ impl Default for DisplayConfig {
             eye_width: 2064,
             eye_height: 2208,
             refresh_rate: 90.0,
+            refresh_rates: vec![72.0, 80.0, 90.0, 120.0],
             ipd_m: 0.063,
             fov: [left, right],
         }
@@ -51,6 +54,7 @@ impl DisplayConfig {
             eye_width: info.eye_width,
             eye_height: info.eye_height,
             refresh_rate: info.current_refresh_rate,
+            refresh_rates: info.refresh_rates.clone(),
             ipd_m: info.ipd_m,
             fov: info.fov,
         }
