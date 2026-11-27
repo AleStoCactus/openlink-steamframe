@@ -267,9 +267,27 @@ preferred wired path.
   comes from Meta's published PPD per model (`HeadsetInfo::render_size`; Quest 3: 25 PPD, 1.54x,
   about 3174x3429 at 100%; an unknown headset gets 1x). The converter downsamples SteamVR's
   frames to the encoded size, and SteamVR's render resolution setting scales from there. The
-  server re-checks the settings every 500 ms while a headset is connected and, when the stream
+  server re-checks the settings every 100 ms while a headset is connected and, when the stream
   changes, sends the headset a new `Welcome` (it rebuilds its swapchains and decoder) and the
   driver a new `HeadsetConnected`, so saving a new resolution restarts SteamVR.
+- **Refresh rate at runtime.** Unlike the render size, the rate changes live. The HMD lists the
+  headset's rates in `DisplayAvailableFrameRates` (with `DisplaySupportsMultipleFramerates` and
+  `DisplaySupportsRuntimeFramerateChange`), which puts a refresh rate picker in SteamVR's video
+  settings. Picking one saves `steamvr/preferredRefreshRate` and sends the driver
+  `VREvent_SteamVRSectionSettingChanged`; SteamVR then sends
+  `VREvent_Compositor_DisplayModeNotSupported` and (on Linux) asks for a restart, because it
+  cannot switch a streamed display itself. The restart is not needed: the driver forwards the
+  rate to the server (`FromDriver::RefreshRate`), which saves it as its own setting, and the
+  usual settings path (polled every 100 ms) re-welcomes the headset and updates the encoder
+  and the driver's `DisplayFrequency`. The driver then writes the rate back to
+  `preferredRefreshRate`, so a rate picked in the desktop app shows in SteamVR too; the
+  settings event that write causes finds the rate already applied and is ignored. The vsync
+  pacer drops its measured period on a change and paces at the nominal rate until the headset
+  measures the new one. On the Quest, `xrRequestDisplayRefreshRateFB` returns success but is
+  ignored before the session is focused, so the app asks again every second until the display
+  reports the rate; and `debug.oculus.refreshRate` (set over adb or by Singularity), when
+  nonzero, overrides every app's request, takes effect live, and only lets go once cleared and
+  the app restarted.
 - **Quest client toolchain.** The plan is `openxr` + `ndk` crates with `cargo-apk`/`xbuild`. The
   `TrackingSource` trait in `openlink-client` is the seam: the OpenXR implementation slots in
   where `mock-headset` is today.

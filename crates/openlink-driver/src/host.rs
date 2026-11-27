@@ -12,6 +12,7 @@ pub struct Host {
     props: *mut Iface<IVRProperties_Vtbl>,
     input: *mut Iface<IVRDriverInput_Vtbl>,
     log: *mut Iface<IVRDriverLog_Vtbl>,
+    settings: *mut Iface<IVRSettings_Vtbl>,
     #[cfg(target_os = "linux")]
     ctx: *mut Iface<IVRDriverContext_Vtbl>,
     /// Linux only. Fetched on first use: vrserver serves it through the compositor, which it
@@ -65,6 +66,7 @@ impl Host {
             props: get(ctx, IVRProperties_Version)?,
             input: get(ctx, IVRDriverInput_Version)?,
             log: get(ctx, IVRDriverLog_Version)?,
+            settings: get(ctx, IVRSettings_Version)?,
             #[cfg(target_os = "linux")]
             ctx,
             #[cfg(target_os = "linux")]
@@ -271,6 +273,27 @@ impl Host {
     }
     pub fn set_bool(&self, c: PropertyContainerHandle_t, prop: i32, v: bool) {
         self.write_prop(c, prop, k_unBoolPropertyTag, &mut [v as u8]);
+    }
+    /// An array property is its elements back to back, tagged with the element type.
+    pub fn set_f32_array(&self, c: PropertyContainerHandle_t, prop: i32, v: &[f32]) {
+        let mut b: Vec<u8> = v.iter().flat_map(|x| x.to_ne_bytes()).collect();
+        self.write_prop(c, prop, k_unFloatPropertyTag, &mut b);
+    }
+
+    /// A float from SteamVR's settings, or `None` when it is not set.
+    pub fn setting_f32(&self, section: &CStr, key: &CStr) -> Option<f32> {
+        let mut err = VRSettingsError_None;
+        // SAFETY: valid interface, NUL-terminated strings, valid out pointer.
+        let v = unsafe { call!(self.settings, GetFloat, section.as_ptr(), key.as_ptr(), &mut err) };
+        (err == VRSettingsError_None).then_some(v)
+    }
+    pub fn set_setting_f32(&self, section: &CStr, key: &CStr, v: f32) {
+        let mut err = VRSettingsError_None;
+        // SAFETY: as above.
+        unsafe { call!(self.settings, SetFloat, section.as_ptr(), key.as_ptr(), v, &mut err) };
+        if err != VRSettingsError_None {
+            self.log(&format!("setting {section:?}/{key:?} write failed: {err}"));
+        }
     }
 
     pub fn create_bool(

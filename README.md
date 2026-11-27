@@ -48,7 +48,7 @@ headset-side rows only differ where the PC side does.
 | NVIDIA GPU support | ❔ Untested | ❔ Untested |
 | Battery status in SteamVR | 🟡 Headset works; Quest controllers' charge is not available to apps | 🟡 Headset works; Quest controllers' charge is not available to apps |
 | Correct headset model in SteamVR and games | ✅ Done | ✅ Done |
-| Quest app requests the correct refresh rate | 🟡 Server side works; the Quest app does not request the rate correctly | 🟡 Server side works; the Quest app does not request the rate correctly |
+| Refresh rate picked live in SteamVR or the desktop app | ❔ Untested | ✅ Done |
 | Statistics screen | 📋 Planned | 📋 Planned |
 
 What the rows mean:
@@ -89,7 +89,11 @@ What the rows mean:
 - **Refresh rate:** 72 to 120 Hz, plus 144, 165, 207 and 240 Hz on a Quest 3 (Horizon OS v2.7
   or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not
   list the higher rates but accepts them when asked; the stream uses the closest rate the
-  headset accepts.
+  headset accepts. The rates are offered in SteamVR's video settings like a native headset's,
+  and picking one there or in the desktop app switches the headset, the encoder and SteamVR
+  at once; the two settings follow each other. A rate forced on the headset
+  (`debug.oculus.refreshRate`, set by tools such as Singularity) overrides every app's request,
+  so the headset stays at it until it is set back to 0 and OpenLink restarted.
 - **Statistics screen:** latency, bitrate, frame loss and encode/decode times in the desktop app.
 
 Known issue (Linux Only): SteamVR's own scene (the SteamVR void, or the dashboard open over a game) jitters

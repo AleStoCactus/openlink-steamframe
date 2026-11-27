@@ -27,7 +27,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const MAGIC: [u8; 4] = *b"OLNK";
 /// Bumped on any incompatible change to a message below.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// [`HeadsetInfo::high_refresh_rates`] by model name, for the headset to probe before it has a
 /// `HeadsetInfo`.
@@ -535,6 +535,11 @@ pub enum FromDriver {
     /// Sent periodically so the server knows the driver is alive and where to send.
     Heartbeat,
     Haptics(HapticPulse),
+    /// The refresh rate was changed in SteamVR's video settings: stream at `hz` from now on,
+    /// as if it had been picked in the desktop app.
+    RefreshRate {
+        hz: f32,
+    },
 }
 
 // ------------------------------------------------------------------------------------------------

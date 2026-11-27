@@ -139,6 +139,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let client: Arc<OnceLock<Connected>> = Arc::new(OnceLock::new());
     let mut last_present_ns = None;
     let mut applied_rate: Option<f32> = None;
+    // When the rate was last asked for, to ask again while the display has not followed.
+    let mut rate_requested_at = std::time::Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let mut ipd = 0.063f32;
     let mut fov = [xr::Fovf::default(); 2];
@@ -183,6 +185,9 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => quit = true,
                         _ => {}
                     }
+                }
+                DisplayRefreshRateChangedFB(r) => {
+                    log::info!("display switched from {} to {} Hz", r.from_display_refresh_rate(), r.to_display_refresh_rate());
                 }
                 InstanceLossPending(_) => quit = true,
                 _ => {}
@@ -270,9 +275,24 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             }
         }
         if let Some(cfg) = welcome {
-            if exts.fb_display_refresh_rate && applied_rate != Some(cfg.refresh_rate) {
+            let retry = applied_rate == Some(cfg.refresh_rate)
+                && rate_requested_at.elapsed() >= Duration::from_secs(1)
+                && (current_rate(&session, exts.fb_display_refresh_rate) - cfg.refresh_rate).abs() >= 0.5;
+            if retry {
+                log::warn!(
+                    "display still at {} Hz, not the requested {} Hz; asking again",
+                    current_rate(&session, true),
+                    cfg.refresh_rate
+                );
+            }
+            if exts.fb_display_refresh_rate && (applied_rate != Some(cfg.refresh_rate) || retry) {
+                rate_requested_at = std::time::Instant::now();
                 match session.request_display_refresh_rate(cfg.refresh_rate) {
-                    Ok(()) => log::info!("display refresh rate {} Hz", cfg.refresh_rate),
+                    Ok(()) => {
+                        log::info!("display refresh rate {} Hz", cfg.refresh_rate);
+                        // Measure the new rate's period from scratch, not across the switch.
+                        period_window = None;
+                    }
                     Err(err) => log::warn!("cannot switch to {} Hz: {err}", cfg.refresh_rate),
                 }
                 applied_rate = Some(cfg.refresh_rate);

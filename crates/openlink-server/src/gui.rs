@@ -151,6 +151,10 @@ impl App {
             (st.audio.clone(), st.headset.as_ref().map(|h| h.info.clone()))
         };
         self.meters.update(audio.levels.take());
+        // The refresh rate is saved as soon as it is picked, here or in SteamVR, so the draft
+        // always shows the saved one.
+        let saved_rate = self.settings.lock().unwrap().refresh_rate;
+        self.draft.refresh_rate = saved_rate;
         let d = &mut self.draft;
         ui.heading("Video");
         egui::Grid::new("video")
@@ -278,10 +282,16 @@ impl App {
                         })
                         .response
                         .on_hover_text(
-                            "Quest 3 on Horizon OS v2.7 or later also runs at 144, 165 and 207 Hz, \
-                             and at 240 Hz in developer mode with display scaling on. The stream \
-                             uses the closest rate the headset currently accepts.",
+                            "Applies at once, like the refresh rate in SteamVR's video settings, \
+                             which follow it. Quest 3 on Horizon OS v2.7 or later also runs at 144, \
+                             165 and 207 Hz, and at 240 Hz in developer mode with display scaling \
+                             on. The stream uses the closest rate the headset currently accepts.",
                         );
+                    if d.refresh_rate != saved_rate {
+                        let mut settings = self.settings.lock().unwrap();
+                        settings.refresh_rate = d.refresh_rate;
+                        self.save_error = settings.save().err().map(|e| format!("could not save settings: {e}"));
+                    }
                     // The session streams at the closest rate the headset's runtime lists; say so
                     // when that is not the one picked (e.g. 240 Hz outside developer mode).
                     if let Some(h) = &headset {
@@ -344,8 +354,8 @@ impl App {
                 self.draft = self.settings.lock().unwrap().clone();
             }
             ui.weak(
-                "Resolution, foveation, bitrate and refresh rate apply to a connected headset right away; \
-                 the rest on its next connection.",
+                "Resolution, foveation and bitrate apply to a connected headset right away; \
+                 the rest on its next connection. The refresh rate applies as soon as it is picked.",
             );
         });
         if let Some(e) = &self.save_error {
