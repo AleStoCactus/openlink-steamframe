@@ -4,16 +4,20 @@ PC VR streaming for standalone headsets that behaves like a native SteamVR heads
 
 ## Why
 
-Streaming SteamVR to a standalone headset today means compromises. Steam Link is closed source
-and does not work reliably on Linux, Virtual Desktop is Windows-only, and ALVR and similar
-streamers predict controllers on the headset, so fast swings overshoot and snap back.
+Streaming SteamVR to a standalone headset today means compromises.
+Oculus (Meta Quest) Link has the worst encoding performance your GPU will ever see.
+Steam Link is closed source and pretty broken, with issues that have existed since forever.
+Virtual Desktop is Windows-only and predicts controllers on the headset, which is bad for Beat Saber.
+ALVR works situationally and it's just a pain to deal with.
+
 OpenLink aims for:
 
-- **Tracking that feels like Link or Lighthouse:** the headset samples poses at "now" and SteamVR
-  does the predicting, as it does for Index controllers. No floppy sabers.
+- **Cross-platform:** Windows and Linux are equal targets
+- **SteamVR predictions:** the headset samples poses at "now" and SteamVR
+  does the predicting, as it does for Index controllers. No floppy sabers!
 - **A real SteamVR headset:** the driver sits in SteamVR's direct mode, so games, the dashboard
-  and overlays behave as on a wired headset.
-- **Zero-copy hardware encoding** on every GPU vendor, with **Linux and Windows** as equal targets.
+  and overlays behave as on a native SteamVR headset.
+- **Super high performance zero-copy hardware encoding** on every GPU vendor.
 - **Open source** (GPL-3.0): a new codebase, not derived from ALVR.
 
 ## Status
