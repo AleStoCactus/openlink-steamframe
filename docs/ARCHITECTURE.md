@@ -201,6 +201,15 @@ logs it and encodes at uniform quality. The parameters ride in every frame's
 changes the coded size, so the server rebuilds its encoder (the first frame is an IDR) and the
 headset its decoder, but SteamVR's render size does not depend on it, so SteamVR keeps running.
 
+**Wi-Fi power-save.** The Quest app holds a `WIFI_MODE_FULL_LOW_LATENCY` Wi-Fi lock
+(`quest/src/wifi.rs`). Without one the headset's radio may sleep between beacons, and the
+router then holds its packets and releases them in clumps: on a strong link (-36 dBm,
+2.4 Gbit/s on 5 GHz) a Quest 3 showed only 46-72 of 90 pictures a second, even at 20 Mbit/s.
+Several frames arrived at once, overflowed the 4-frame queue to the decoder (each overflow
+waits for an IDR), and audio dropped out with them. With the lock: 89.4-90 pictures a second,
+no overflows, no audio underruns. Whether power-save is on had depended on what else on the
+headset held a lock, so streaming looked fine one day and broken the next.
+
 ## Audio
 
 Both directions share the headset socket (`openlink_protocol::audio`): game audio stereo

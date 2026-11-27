@@ -76,6 +76,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let _ = instance.graphics_requirements::<xr::OpenGlEs>(system).map_err(e("GLES requirements"))?;
 
     crate::audio::request_microphone_permission(app);
+    crate::wifi::hold_low_latency_lock(app);
 
     let egl = egl::Context::new()?;
     let mut renderer = Renderer::new(egl.gl())?;

@@ -5,6 +5,7 @@
 mod app;
 mod audio;
 mod battery;
+mod wifi;
 mod decoder;
 mod egl;
 mod render;
