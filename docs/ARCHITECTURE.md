@@ -130,20 +130,18 @@ panel-sized) drew halos around text (`debug.openlink.layer_filter` switches it l
 comparisons).
 
 **Downscaling.** Outside the foveation band, and wherever SteamVR or a game supersamples, the
-converter shrinks each eye. It filters with Lanczos-2
-stretched over each output pixel's footprint, so detail a supersampled render adds reaches the
-stream instead of being averaged away. The first converter averaged four bilinear taps over
-the footprint; against FFmpeg's Lanczos on a zone plate it was 26 dB off at both 1.5x and
-2.8x (high frequencies faded to grey; even a 1:1 copy was blurred), and the stream looked
-clearly softer than other streamers at the same settings. Now: 33 dB at 1.5x, 36 dB at 2.8x,
-exact at 1:1 (`openlink --convert-selftest`). Cost on an RX 6800, both eyes: 0.8 ms at 1:1,
-1.4 ms from SteamVR's 100% (3174x3430), 3.9 ms from a 1.8x supersampled eye (5710x6172), against
-0.4-0.9 ms before; above 2 texels per output pixel each bilinear read covers a pair of texels
-on both axes, which is what makes that affordable. Where a pixel maps 1:1 onto a texel centre
-(the whole foveation band when SteamVR renders at its 100%, which is exactly the stream's
-full-resolution size: `HeadsetInfo::render_size` rounds to even sizes for this) the other taps'
-weights are 0 and the texel is read alone: 3172x3428 per eye 1:1 took 2.35 ms with the full
-kernel and 0.95 ms with this (14 of 10.9 million bytes off by 1, float rounding).
+converter shrinks each eye. Each output pixel averages four bilinear taps spread over its
+footprint (a tent filter about 2 source texels wide); where the source is no larger than the
+output it takes one bilinear tap, and where a pixel maps 1:1 onto a texel centre (the whole
+foveation band when SteamVR renders at its 100%, which is exactly the stream's full-resolution
+size: `HeadsetInfo::render_size` rounds to even sizes for this) it reads that texel alone, so the
+center is an exact copy. Lanczos-2 stretched over the footprint was used for a while: closer to
+an ideal downscale on a zone plate (33-36 dB against FFmpeg's Lanczos, where four taps are 26 dB
+off), but it made no visible difference in the headset, where sharpness was limited by the
+stream's resolution at the center (above), and it cost latency on every frame. Both eyes of a
+Quest 3 picture rendered 1.5x supersampled (4758x5142 per eye, as Beat Saber at 1.5x renders),
+RX 6800: Lanczos 2.8 ms, four taps 0.75 ms; 1:1 (3172x3428), 0.6 ms
+(`openlink --convert-selftest`).
 
 **Windows capture.** The driver creates every swap texture (the compositor's and each
 application's) as a D3D11 texture with `D3D11_RESOURCE_MISC_SHARED`, on the adapter it names in

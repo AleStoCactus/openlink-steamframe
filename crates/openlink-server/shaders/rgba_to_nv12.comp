@@ -1,8 +1,7 @@
 #version 450
 // Both eyes of a compositor frame -> one side-by-side NV12 frame (BT.709, limited range).
 // One invocation per luma sample; a 16x16 group covers 8x8 chroma samples, averaged through
-// shared memory. (One invocation per 2x2 block ran its texture reads one pixel after another:
-// with a filter of dozens of reads per pixel, a quarter of the parallelism.)
+// shared memory.
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -63,106 +62,34 @@ float unfoveate(float g, float full, float coded, float band, float b0, float c0
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
-// Taps per axis at most: a footprint of up to 3 source texels per output pixel gets the full
-// kernel (a 1.8x supersampled Quest 3 eye into the panel size is 2.8); beyond that (the far
-// edges of a foveated picture, or more supersampling) it is narrower than the footprint.
-const int MAX_TAPS = 12;
-
-// Lanczos-2. A Catmull-Rom cubic was tried as a cheaper kernel: no faster (the texture reads
-// dominate, not the sines) and slightly softer.
-float lanczos2(float x) {
-    x = abs(x);
-    if (x < 1e-4) return 1.0;
-    if (x >= 2.0) return 0.0;
-    float a = 3.14159265 * x;
-    return 2.0 * sin(a) * sin(0.5 * a) / (a * a);
-}
-
-const int MAX_PAIRS = MAX_TAPS / 2;
-
-// Lanczos-2 weights of texels lo + 2k and lo + 2k + 1 along one axis, folded into one bilinear
-// tap each: where in the pair to sample (0..1, texel units past the first) and the pair's total
-// weight. Exact when both weights have the same sign; a pair across the kernel's zero crossing
-// (both weights small there) is sampled at its larger weight.
-void pair_weights(float center, float scale, int lo, int pairs, out float offset[MAX_PAIRS], out float weight[MAX_PAIRS]) {
-    for (int k = 0; k < pairs; k++) {
-        float w0 = lanczos2((float(lo + 2 * k) - center) / scale);
-        float w1 = lanczos2((float(lo + 2 * k + 1) - center) / scale);
-        float w = w0 + w1;
-        weight[k] = w;
-        offset[k] = (w0 * w1 > 0.0) ? w1 / w : (abs(w1) > abs(w0) ? 1.0 : 0.0);
-    }
-}
-
-// Below this many source texels per output pixel the kernel changes sign within a texel or
-// two, so paired taps would mostly straddle zero crossings: read texels directly (few anyway).
-// On a zone plate at 1.5x, pairs cost 4 dB against FFmpeg's Lanczos; at 2.8x nothing.
-const float PAIR_FROM = 2.0;
-
 // The colour at `uv` of a texture, filtered for an output pixel `footprint` (in UV) wide and
-// high: Lanczos-2 scaled to the footprint (never narrower than one texel), on texel centres.
-// Separable. With a large footprint each bilinear fetch covers a pair of texels on both axes:
-// a quarter of the reads, which is what makes this affordable (a 1.8x supersampled Quest 3 eye
-// into the panel size: 3.9 ms for both eyes on an RX 6800, against 11.7 reading every texel).
+// high. Lanczos-2 stretched over the footprint was used for a while: closer to an ideal
+// downscale on a zone plate (33-36 dB against FFmpeg's Lanczos, where this is 26 dB), but it
+// cost 2.8 ms for both eyes of a 1.5x supersampled Quest 3 picture against 0.75 ms here, latency
+// on every frame, and in the headset it made no visible difference: what limited sharpness was
+// the stream's resolution at the center of view (`HeadsetInfo::encoded_size`), not the filter.
 vec3 resample(sampler2D tex, vec2 uv, vec2 footprint) {
     vec2 size = vec2(textureSize(tex, 0));
+    vec2 texels = footprint * size;
+    // 1:1 on a texel centre: that texel, exactly. This is the whole foveation band when SteamVR
+    // renders at its 100%, which is exactly the full-resolution stream size
+    // (HeadsetInfo::render_size, even on purpose).
     vec2 center = uv * size - 0.5;
-    // 1:1 on a texel centre: every other tap's weight is 0, so read that texel alone. This is
-    // the whole foveation band when SteamVR renders at its 100%, which is exactly the
-    // full-resolution stream size (HeadsetInfo::render_size, even on purpose): the centre of
-    // view, a third of the picture or more, for one read per pixel instead of 16.
     vec2 snapped = floor(center + 0.5);
-    if (all(lessThan(footprint * size, vec2(1.001))) && all(lessThan(abs(center - snapped), vec2(1e-3)))) {
-        ivec2 last = ivec2(size) - 1;
-        return texelFetch(tex, clamp(ivec2(snapped), ivec2(0), last), 0).rgb;
+    if (all(lessThan(texels, vec2(1.001))) && all(lessThan(abs(center - snapped), vec2(1e-3)))) {
+        return texelFetch(tex, clamp(ivec2(snapped), ivec2(0), ivec2(size) - 1), 0).rgb;
     }
-    vec2 scale = clamp(footprint * size, vec2(1.0), vec2(float(MAX_TAPS) / 4.0));
-    ivec2 lo = ivec2(floor(center - 2.0 * scale)) + 1;
-    ivec2 hi = ivec2(floor(center + 2.0 * scale));
-    vec3 sum = vec3(0.0);
-    float wsum = 0.0;
-    if (min(scale.x, scale.y) < PAIR_FROM) {
-        int nx = min(hi.x - lo.x + 1, MAX_TAPS);
-        int ny = min(hi.y - lo.y + 1, MAX_TAPS);
-        float wx[MAX_TAPS];
-        float wsum_x = 0.0;
-        for (int i = 0; i < nx; i++) {
-            wx[i] = lanczos2((float(lo.x + i) - center.x) / scale.x);
-            wsum_x += wx[i];
-        }
-        ivec2 last = ivec2(size) - 1;
-        for (int j = 0; j < ny; j++) {
-            float wy = lanczos2((float(lo.y + j) - center.y) / scale.y);
-            int y = clamp(lo.y + j, 0, last.y);
-            vec3 row = vec3(0.0);
-            for (int i = 0; i < nx; i++) {
-                row += wx[i] * texelFetch(tex, ivec2(clamp(lo.x + i, 0, last.x), y), 0).rgb;
-            }
-            sum += wy * row;
-            wsum += wy * wsum_x;
-        }
-    } else {
-        int px = min((hi.x - lo.x + 2) / 2, MAX_PAIRS);
-        int py = min((hi.y - lo.y + 2) / 2, MAX_PAIRS);
-        float ox[MAX_PAIRS], wx[MAX_PAIRS], oy[MAX_PAIRS], wy[MAX_PAIRS];
-        pair_weights(center.x, scale.x, lo.x, px, ox, wx);
-        pair_weights(center.y, scale.y, lo.y, py, oy, wy);
-        float wsum_x = 0.0;
-        for (int i = 0; i < px; i++) wsum_x += wx[i];
-        for (int j = 0; j < py; j++) {
-            // The pair's first texel centre is lo + 0.5; the bilinear tap sits `offset` further.
-            float v = (float(lo.y + 2 * j) + 0.5 + oy[j]) / size.y;
-            vec3 row = vec3(0.0);
-            for (int i = 0; i < px; i++) {
-                float u = (float(lo.x + 2 * i) + 0.5 + ox[i]) / size.x;
-                row += wx[i] * textureLod(tex, vec2(u, v), 0.0).rgb;
-            }
-            sum += wy[j] * row;
-            wsum += wy[j] * wsum_x;
-        }
+    // No larger than the output (or barely): one bilinear tap. Four taps here would blur, as
+    // they did a 1:1 copy before the case above existed.
+    if (all(lessThan(texels, vec2(1.25)))) {
+        return textureLod(tex, uv, 0.0).rgb;
     }
-    // The negative lobes can overshoot at hard edges.
-    return clamp(sum / wsum, 0.0, 1.0);
+    // Larger (SteamVR or a game supersamples, and foveation squeezes the edges further): one tap
+    // per output pixel would alias (shimmering edges, crawling grid lines), so average four taps
+    // spread over the pixel's footprint, a tent filter about 2 source texels wide.
+    vec2 q = 0.25 * footprint;
+    return 0.25 * (textureLod(tex, uv + vec2(-q.x, -q.y), 0.0).rgb + textureLod(tex, uv + vec2(q.x, -q.y), 0.0).rgb
+                 + textureLod(tex, uv + vec2(-q.x, q.y), 0.0).rgb + textureLod(tex, uv + vec2(q.x, q.y), 0.0).rgb);
 }
 
 vec3 sample_frame(ivec2 p) {
@@ -184,12 +111,6 @@ vec3 sample_frame(ivec2 p) {
     }
     vec4 b = pc.bounds[eye];
     vec2 uv = mix(b.xy, b.zw, local);
-    // The eye textures are larger than the output (SteamVR supersamples, and foveation squeezes
-    // the edges further), so each output pixel covers several source texels. They are combined
-    // with a Lanczos-2 filter stretched over that footprint: it keeps the detail the output can
-    // hold and removes what it cannot (which would alias as shimmer). Four bilinear taps over
-    // the footprint, as before, measured against FFmpeg's Lanczos on a zone plate (5710 ->
-    // 2064 wide): visibly softer, mid-to-high frequencies faded to grey, 26 dB apart.
     vec3 c = eye == 0 ? resample(left_eye, uv, (b.zw - b.xy) * px) : resample(right_eye, uv, (b.zw - b.xy) * px);
     vec4 ob = pc.overlay_bounds[eye];
     if (any(notEqual(ob, vec4(0.0)))) {
