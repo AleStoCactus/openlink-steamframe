@@ -163,7 +163,7 @@ impl Target {
         let status = shared.status.lock().unwrap();
         // The size the headset was told, squeezed by foveation (SteamVR renders larger,
         // corrected for the lens, and the converter downsamples).
-        // Before a headset connects, the setting applied to a Quest 3 panel so the pipeline
+        // Before a headset connects, the setting applied to a Quest 3 so the pipeline
         // can be tested.
         let (eye_width, eye_height, foveation, fov, fps) = match &status.headset {
             Some(h) => {
@@ -171,8 +171,17 @@ impl Target {
                 (w, h2, h.stream.foveation, Some(h.info.fov), h.stream.refresh_rate)
             }
             None => {
-                let even = |v: u32| (((v * settings.resolution_percent.max(1) + 50) / 100) & !1).max(2);
-                (even(2064), even(2208), None, None, settings.refresh_rate)
+                // A Quest 3's stream (`HeadsetInfo::render_size`, the FOV its runtime reports),
+                // foveated like a real one: unfoveated, its 3172x3428 eyes took 24 ms to encode,
+                // running flat out while SteamVR was open without a headset.
+                let even = |v: u32| (((v * settings.center_resolution_percent.max(1) + 50) / 100) & !1).max(2);
+                let full = (even(3172), even(3428));
+                let left = proto::Fov { angle_left: -0.942, angle_right: 0.698, angle_up: 0.768, angle_down: -0.960 };
+                let fov = [left, proto::Fov { angle_left: -left.angle_right, angle_right: -left.angle_left, ..left }];
+                let fraction = settings.foveation_band_percent.clamp(20, 100) as f32 / 100.0;
+                let foveation = proto::foveation::Foveation::new(fraction, &fov, full);
+                let (w, h) = foveation.map_or(full, |f| f.coded_eye_size());
+                (w, h, foveation, Some(fov), settings.refresh_rate)
             }
         };
         Self {

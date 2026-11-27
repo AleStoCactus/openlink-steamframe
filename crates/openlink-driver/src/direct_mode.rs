@@ -26,7 +26,7 @@ use openlink_protocol::time::monotonic_ns;
 use openlink_protocol::video_ipc::{self as vipc, DriverVideoMsg, RawAttachment};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -479,11 +479,43 @@ unsafe extern "C" fn present(_this: *mut c_void, sync_texture: SharedTextureHand
     })
 }
 
-unsafe extern "C" fn post_present(_this: *mut c_void, _throttling: *const Throttling_t) {}
+/// The running application's per-app "Throttling Behavior" in SteamVR's video settings, as
+/// `PostPresent` last gave it: vsyncs the application skips between frames, and frames of
+/// additional prediction.
+static FRAMES_TO_THROTTLE: AtomicU32 = AtomicU32::new(0);
+static FRAMES_TO_PREDICT: AtomicU32 = AtomicU32::new(0);
 
+/// Called after every `Present` with the running application's throttling choice (enabled by
+/// `Prop_Hmd_SupportsAppThrottling_Bool`). Throttling and prediction themselves are SteamVR's:
+/// the driver acknowledges them in `GetFrameTiming`, and the compositor then paces the
+/// application every (1 + throttle)th vsync and predicts its poses that many frames further.
+unsafe extern "C" fn post_present(_this: *mut c_void, throttling: *const Throttling_t) {
+    crate::guard((), || {
+        // SAFETY: SteamVR passes a valid pointer, or null.
+        let Some(t) = (unsafe { throttling.as_ref() }) else { return };
+        let throttle = t.nFramesToThrottle.min(0xF);
+        let predict = t.nAdditionalFramesToPredict.min(0xF);
+        let old = (FRAMES_TO_THROTTLE.swap(throttle, Ordering::AcqRel), FRAMES_TO_PREDICT.swap(predict, Ordering::AcqRel));
+        if old != (throttle, predict) {
+            log::info!(
+                "application throttling: {throttle} frame(s) skipped per frame, {predict} frame(s) of additional prediction"
+            );
+        }
+    })
+}
+
+/// Reports what the driver applies: the throttle and prediction counts from `PostPresent` in
+/// the reprojection flags. Anything else SteamVR put there (motion smoothing bits, which overlap
+/// the throttle mask) is cleared, as the header asks, or it would be read as throttling.
 unsafe extern "C" fn get_frame_timing(_this: *mut c_void, timing: *mut DriverDirectMode_FrameTiming) {
-    // Per the header: clear the reprojection flags or they are read as throttling requests.
-    (*timing).m_nReprojectionFlags = 0;
+    crate::guard((), || {
+        // SAFETY: SteamVR passes a valid pointer, or null.
+        let Some(t) = (unsafe { timing.as_mut() }) else { return };
+        let throttle = FRAMES_TO_THROTTLE.load(Ordering::Acquire);
+        let predict = FRAMES_TO_PREDICT.load(Ordering::Acquire);
+        t.m_nReprojectionFlags =
+            (predict << 4 & VRCompositor_PredictionMask) | (throttle << 8 & VRCompositor_ThrottleMask);
+    })
 }
 
 /// When the last vsync event fired and the period, for stamping frames with the vsync they

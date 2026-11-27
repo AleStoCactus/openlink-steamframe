@@ -28,17 +28,18 @@ pub enum ConnectionMode {
 pub struct Settings {
     pub codec: CodecPreference,
     pub bitrate_mbps: u32,
-    /// Encoded (streamed) per-eye resolution, in percent of the headset's panel resolution
-    /// ([`openlink_protocol::HeadsetInfo::encoded_size`]). SteamVR is told that size as its
-    /// recommended render size; its own render resolution setting then scales what games render
-    /// relative to it. (Replaces `resolution_scale`, a multiplier on the headset's much smaller
-    /// recommended size; an old value is ignored rather than reinterpreted.)
-    pub resolution_percent: u32,
+    /// Encoded density at the centre of view, in percent of SteamVR's 100% render size (the
+    /// panel enlarged for the lens, [`openlink_protocol::HeadsetInfo::encoded_size`]): 100 is
+    /// 1:1. Applies live; SteamVR's render size does not depend on it. (Replaces
+    /// `resolution_percent`, which was relative to the panel, so 100 there meant 0.65x here; an
+    /// old value is ignored rather than reinterpreted.)
+    pub center_resolution_percent: u32,
     /// Foveated encoding: percent of each eye's width and height, around the lens's center,
     /// encoded at full resolution; outside it resolution falls off to a quarter at the edges
-    /// ([`openlink_protocol::foveation`]). 100 turns it off. Applies live, without restarting
-    /// SteamVR (its render size does not depend on it).
-    pub foveation_percent: u32,
+    /// ([`openlink_protocol::foveation`]). 100 turns it off. Applies live. (Replaces
+    /// `foveation_percent`: the same fraction of a 1.54x larger picture codes 2.4x the pixels,
+    /// so an old value is not carried over either.)
+    pub foveation_band_percent: u32,
     pub refresh_rate: f32,
     pub connection: ConnectionMode,
     /// Draw SteamVR's own layer (dashboard, laser, controllers) over a game's. Off where
@@ -59,9 +60,12 @@ impl Default for Settings {
         Self {
             codec: CodecPreference::Auto,
             bitrate_mbps: 200,
-            // Panel resolution (Quest 3: 2064x2208 per eye).
-            resolution_percent: 100,
-            foveation_percent: 100,
+            // The centre 1:1 with SteamVR's 100% (Quest 3: 3172x3428 per eye at full resolution)...
+            center_resolution_percent: 100,
+            // ...and the periphery squeezed so the coded picture stays affordable (Quest 3:
+            // 1746x1886 per eye, 6.6 MP for both: about 7.8 ms to encode on an RX 6800, which
+            // fits 90 Hz; a 40% band's 8.9 MP took 10.2 ms and skipped frames).
+            foveation_band_percent: 25,
             refresh_rate: 90.0,
             connection: ConnectionMode::WiFi,
             steamvr_layer_over_games: true,

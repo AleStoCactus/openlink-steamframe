@@ -8,7 +8,7 @@
 use crate::decoder::{self, Output};
 use crate::egl;
 use crate::render::Renderer;
-use android_activity::{AndroidApp, MainEvent, PollEvent};
+use android_activity::{AndroidApp, InputStatus, MainEvent, PollEvent};
 use glam::Vec3;
 use openlink_client::{Client, ClientState, FrameReporter};
 use openlink_protocol::{Fov, HeadsetInfo};
@@ -77,6 +77,7 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let _ = instance.graphics_requirements::<xr::OpenGlEs>(system).map_err(e("GLES requirements"))?;
 
     crate::audio::request_microphone_permission(app);
+    crate::wifi::hold_low_latency_lock(app);
 
     let egl = egl::Context::new()?;
     let mut renderer = Renderer::new(egl.gl())?;
@@ -140,6 +141,8 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     let client: Arc<OnceLock<Connected>> = Arc::new(OnceLock::new());
     let mut last_present_ns = None;
     let mut applied_rate: Option<f32> = None;
+    // When the rate was last asked for, to ask again while the display has not followed.
+    let mut rate_requested_at = std::time::Instant::now();
     let stop = Arc::new(AtomicBool::new(false));
     let mut ipd = 0.063f32;
     let mut fov = [xr::Fovf::default(); 2];
@@ -164,6 +167,14 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                 quit = true;
             }
         });
+        // Android delivers key presses (the volume buttons among them) to the app first and
+        // waits for each to be finished. The controllers come through OpenXR, so none is ours:
+        // handing them back unhandled lets the system change the volume and show its overlay.
+        // Left unread, the volume keys did nothing and Android reported the app as not
+        // responding after 5 s ("Input dispatching timed out ... Waited 5000ms for KeyEvent").
+        if let Ok(mut input) = app.input_events_iter() {
+            while input.next(|_| InputStatus::Unhandled) {}
+        }
 
         // OpenXR lifecycle.
         while let Some(event) = instance.poll_event(&mut event_storage).map_err(e("poll event"))? {
@@ -184,6 +195,9 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         xr::SessionState::EXITING | xr::SessionState::LOSS_PENDING => quit = true,
                         _ => {}
                     }
+                }
+                DisplayRefreshRateChangedFB(r) => {
+                    log::info!("display switched from {} to {} Hz", r.from_display_refresh_rate(), r.to_display_refresh_rate());
                 }
                 InstanceLossPending(_) => quit = true,
                 _ => {}
@@ -274,9 +288,24 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
             }
         }
         if let Some(cfg) = welcome {
-            if exts.fb_display_refresh_rate && applied_rate != Some(cfg.refresh_rate) {
+            let retry = applied_rate == Some(cfg.refresh_rate)
+                && rate_requested_at.elapsed() >= Duration::from_secs(1)
+                && (current_rate(&session, exts.fb_display_refresh_rate) - cfg.refresh_rate).abs() >= 0.5;
+            if retry {
+                log::warn!(
+                    "display still at {} Hz, not the requested {} Hz; asking again",
+                    current_rate(&session, true),
+                    cfg.refresh_rate
+                );
+            }
+            if exts.fb_display_refresh_rate && (applied_rate != Some(cfg.refresh_rate) || retry) {
+                rate_requested_at = std::time::Instant::now();
                 match session.request_display_refresh_rate(cfg.refresh_rate) {
-                    Ok(()) => log::info!("display refresh rate {} Hz", cfg.refresh_rate),
+                    Ok(()) => {
+                        log::info!("display refresh rate {} Hz", cfg.refresh_rate);
+                        // Measure the new rate's period from scratch, not across the switch.
+                        period_window = None;
+                    }
                     Err(err) => log::warn!("cannot switch to {} Hz: {err}", cfg.refresh_rate),
                 }
                 applied_rate = Some(cfg.refresh_rate);
@@ -483,19 +512,20 @@ fn system_property(name: &str) -> Option<String> {
 }
 
 /// How the Quest compositor filters our eye images onto the display
-/// (`XR_FB_composition_layer_settings`). They are encoded at about the panel's size, and the lens
-/// shows the center of view at about 1.5x the panel's density, so the compositor enlarges them
-/// there: plain bilinear looks soft next to Virtual Desktop and Steam Link, which both turn on its
-/// sharpening. Quality sharpening by default; `adb shell setprop debug.openlink.layer_filter`
-/// `none`, `sharpen` (normal), `supersample` or `quality-supersample` to compare, live.
+/// (`XR_FB_composition_layer_settings`). Plainly by default: the eye images carry the centre of
+/// view at the lens's density (`HeadsetInfo::encoded_size`), so there is nothing to sharpen, and
+/// the compositor's quality sharpening drew halos around text (Beat Saber's). It was the default
+/// while the stream was panel-sized and the compositor enlarged it 1.5x. `adb shell setprop
+/// debug.openlink.layer_filter` `sharpen` (normal), `quality-sharpen`, `supersample` or
+/// `quality-supersample` to compare, live.
 fn layer_filter() -> xr::sys::CompositionLayerSettingsFlagsFB {
     use xr::sys::CompositionLayerSettingsFlagsFB as F;
     match system_property("debug.openlink.layer_filter").as_deref() {
-        Some("none") => F::EMPTY,
         Some("sharpen") => F::NORMAL_SHARPENING,
+        Some("quality-sharpen") => F::QUALITY_SHARPENING,
         Some("supersample") => F::NORMAL_SUPER_SAMPLING,
         Some("quality-supersample") => F::QUALITY_SUPER_SAMPLING,
-        _ => F::QUALITY_SHARPENING,
+        _ => F::EMPTY,
     }
 }
 
