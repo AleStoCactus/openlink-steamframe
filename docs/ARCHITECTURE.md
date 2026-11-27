@@ -108,15 +108,29 @@ report `/proximity` false once they have neither moved (1 cm, 2°) nor been touc
 Encode must be zero-copy: the texture SteamVR hands the driver is encoded on the same GPU,
 without a round trip through system memory.
 
-**Display filtering.** The Quest app submits eye images at the encoded size (about the panel's
-at 100%), and the lens shows the center of view at about 1.5x the panel's density, so the
-Quest compositor enlarges them there. It does so bilinearly unless the layer asks otherwise
-(`XR_FB_composition_layer_settings`); Virtual Desktop and Steam Link ask for sharpening, and
-without it the picture looked soft next to theirs at the same settings. The app asks for
-quality sharpening (`debug.openlink.layer_filter` switches it live, for comparisons).
+**Resolution: the center of view is streamed 1:1.** The lens shows the center of view at
+about 1.5x the panel's density, so SteamVR's 100% is the panel enlarged for the lens (as a
+native headset's is) and the stream's full-resolution size is measured against it: at the
+default 100% the center is encoded 1:1 with what SteamVR renders, and foveation squeezes the
+periphery, where the lens spreads the panel's pixels out (default 25% band: 1746x1886 coded per
+eye on a Quest 3, 6.6 MP for both eyes, about 7.8 ms to encode on an RX 6800; a 40% band's 8.9 MP
+took 10.2 ms and skipped frames at 90 Hz on Linux, where encodes are not pipelined). The stream used to be the panel's size everywhere
+(SteamVR's 100% was that enlarged for the lens), which sent the center at 0.65x of what SteamVR
+rendered there; the Quest compositor then spread each streamed pixel over ~1.5 panel pixels and
+text looked soft next to other streamers. A dump of the stream (`--dump-video`) showed it crisp,
+and a headset screenshot showed the same text 1.5x larger and blurred, so the loss was resolution,
+not filtering: none of these made a visible difference, each measured in the headset: the
+compositor's quality sharpening (halos around text), its normal sharpening, contrast-adaptive
+sharpening on the PC, and a Catmull-Rom upscale to the lens's density on the Quest (+5.5 ms of
+Quest GPU). Supersampling in SteamVR could not help either: whatever it renders is shrunk to the
+stream's size. SteamVR's render size now depends only on the headset, so a resolution change
+applies live. The Quest compositor filters the eye images plainly: with the center at the lens's
+density there is nothing to sharpen, and its quality sharpening (the default while the stream was
+panel-sized) drew halos around text (`debug.openlink.layer_filter` switches it live, for
+comparisons).
 
-**Downscaling.** SteamVR renders larger than the stream (its 100% is enlarged for the lens,
-and games supersample further), so the converter shrinks each eye. It filters with Lanczos-2
+**Downscaling.** Outside the foveation band, and wherever SteamVR or a game supersamples, the
+converter shrinks each eye. It filters with Lanczos-2
 stretched over each output pixel's footprint, so detail a supersampled render adds reaches the
 stream instead of being averaged away. The first converter averaged four bilinear taps over
 the footprint; against FFmpeg's Lanczos on a zone plate it was 26 dB off at both 1.5x and
@@ -125,7 +139,11 @@ clearly softer than other streamers at the same settings. Now: 33 dB at 1.5x, 36
 exact at 1:1 (`openlink --convert-selftest`). Cost on an RX 6800, both eyes: 0.8 ms at 1:1,
 1.4 ms from SteamVR's 100% (3174x3430), 3.9 ms from a 1.8x supersampled eye (5710x6172), against
 0.4-0.9 ms before; above 2 texels per output pixel each bilinear read covers a pair of texels
-on both axes, which is what makes that affordable.
+on both axes, which is what makes that affordable. Where a pixel maps 1:1 onto a texel centre
+(the whole foveation band when SteamVR renders at its 100%, which is exactly the stream's
+full-resolution size: `HeadsetInfo::render_size` rounds to even sizes for this) the other taps'
+weights are 0 and the texel is read alone: 3172x3428 per eye 1:1 took 2.35 ms with the full
+kernel and 0.95 ms with this (14 of 10.9 million bytes off by 1, float rounding).
 
 **Windows capture.** The driver creates every swap texture (the compositor's and each
 application's) as a D3D11 texture with `D3D11_RESOURCE_MISC_SHARED`, on the adapter it names in
@@ -266,19 +284,17 @@ preferred wired path.
   therefore saves the last headset's info (`last-headset.bin` in the platform config dir),
   describes that display from SteamVR's start, and asks SteamVR to restart
   (`IVRServerDriverHost::RequestRestart`) when a headset with a different size or FOV connects.
-  The size the driver is given is the *encoded* per-eye size (the desktop app's "Encoded
-  Resolution" percentage of the headset's panel resolution, looked up by model since OpenXR only
+  The size the driver is given is the headset's panel size (looked up by model since OpenXR only
   reports the runtime's much smaller recommended size), enlarged for the lens. The lens
   concentrates the panel's pixels at the center of view, so a flat render target over the same
   FOV must be larger than the panel to match that density, which is why native headsets' 100% is
   above their panel size (Index: 1.4x). The matching size is the center pixels per radian times
   the FOV's tangent span; the lens profile is not queryable through OpenXR, so the center density
   comes from Meta's published PPD per model (`HeadsetInfo::render_size`; Quest 3: 25 PPD, 1.54x,
-  about 3174x3429 at 100%; an unknown headset gets 1x). The converter downsamples SteamVR's
-  frames to the encoded size, and SteamVR's render resolution setting scales from there. The
-  server re-checks the settings every 100 ms while a headset is connected and, when the stream
-  changes, sends the headset a new `Welcome` (it rebuilds its swapchains and decoder) and the
-  driver a new `HeadsetConnected`, so saving a new resolution restarts SteamVR.
+  3172x3428, rounded to even sizes; an unknown headset gets 1x). It does not depend on the
+  stream's resolution, so only a different headset restarts SteamVR. The server re-checks the
+  settings every 100 ms while a headset is connected and, when the stream changes, sends the
+  headset a new `Welcome` (it rebuilds its swapchains and decoder).
 - **Refresh rate at runtime.** Unlike the render size, the rate changes live. The HMD lists the
   headset's rates in `DisplayAvailableFrameRates` (with `DisplaySupportsMultipleFramerates` and
   `DisplaySupportsRuntimeFramerateChange`), which puts a refresh rate picker in SteamVR's video

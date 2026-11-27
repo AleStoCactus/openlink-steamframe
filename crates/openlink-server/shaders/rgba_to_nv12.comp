@@ -107,6 +107,15 @@ const float PAIR_FROM = 2.0;
 vec3 resample(sampler2D tex, vec2 uv, vec2 footprint) {
     vec2 size = vec2(textureSize(tex, 0));
     vec2 center = uv * size - 0.5;
+    // 1:1 on a texel centre: every other tap's weight is 0, so read that texel alone. This is
+    // the whole foveation band when SteamVR renders at its 100%, which is exactly the
+    // full-resolution stream size (HeadsetInfo::render_size, even on purpose): the centre of
+    // view, a third of the picture or more, for one read per pixel instead of 16.
+    vec2 snapped = floor(center + 0.5);
+    if (all(lessThan(footprint * size, vec2(1.001))) && all(lessThan(abs(center - snapped), vec2(1e-3)))) {
+        ivec2 last = ivec2(size) - 1;
+        return texelFetch(tex, clamp(ivec2(snapped), ivec2(0), last), 0).rgb;
+    }
     vec2 scale = clamp(footprint * size, vec2(1.0), vec2(float(MAX_TAPS) / 4.0));
     ivec2 lo = ivec2(floor(center - 2.0 * scale)) + 1;
     ivec2 hi = ivec2(floor(center + 2.0 * scale));

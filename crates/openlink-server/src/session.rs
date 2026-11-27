@@ -288,7 +288,7 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
     // its decoder then reports the failure.
     let codec = crate::encoder::negotiate(crate::encoder::CODECS, &info.decoders, pref)
         .unwrap_or(Codec::H265);
-    let (eye_width, eye_height) = info.encoded_size(settings.resolution_percent.clamp(25, 200));
+    let (eye_width, eye_height) = info.encoded_size(settings.center_resolution_percent.clamp(25, 200));
     // The configured rate if the headset has it, else its closest one.
     let refresh_rate = info
         .refresh_rates
@@ -297,7 +297,7 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
         .min_by(|a, b| (a - settings.refresh_rate).abs().total_cmp(&(b - settings.refresh_rate).abs()))
         .unwrap_or(settings.refresh_rate);
     let foveation = proto::foveation::Foveation::new(
-        settings.foveation_percent.clamp(20, 100) as f32 / 100.0,
+        settings.foveation_band_percent.clamp(20, 100) as f32 / 100.0,
         &info.fov,
         (eye_width, eye_height),
     );
@@ -313,15 +313,13 @@ fn stream_config(settings: &Settings, info: &HeadsetInfo) -> StreamConfig {
     }
 }
 
-/// The headset as SteamVR should see it: its recommended render size is the encoded size
-/// enlarged for the headset's lens ([`HeadsetInfo::render_size`]), as a native headset's is its
-/// panel size enlarged for its lens. SteamVR's 100% then matches the stream's pixel density at
-/// the center of the view, where the lens concentrates the panel's pixels, and the encoder
-/// downsamples to the encoded size. SteamVR's render resolution setting scales from there. The
-/// driver keeps whatever size SteamVR started with and restarts SteamVR when it changes, so
-/// saving a new encoded resolution while a headset is connected restarts SteamVR.
-fn driver_info(info: &HeadsetInfo, stream: &StreamConfig) -> HeadsetInfo {
-    let (eye_width, eye_height) = info.render_size((stream.eye_width, stream.eye_height));
+/// The headset as SteamVR should see it: its recommended render size is the panel enlarged for
+/// the headset's lens ([`HeadsetInfo::render_size`]), as a native headset's is, so SteamVR's
+/// 100% matches the panel's pixel density at the center of the view. It depends only on the
+/// headset, not on the stream: the driver keeps whatever size SteamVR started with and
+/// restarts SteamVR when it changes, which now happens only for a different headset.
+fn driver_info(info: &HeadsetInfo) -> HeadsetInfo {
+    let (eye_width, eye_height) = info.render_size();
     HeadsetInfo {
         eye_width,
         eye_height,
@@ -347,7 +345,7 @@ fn welcome(
     let _ = sock.send_to(&proto::encode(&ServerMessage::Welcome(cfg.clone())), to);
     *shared.stream.lock().unwrap() = Some(cfg.clone());
     *shared.headset_addr.lock().unwrap() = Some(to);
-    let for_driver = driver_info(&info, &cfg);
+    let for_driver = driver_info(&info);
     *shared.headset_info.lock().unwrap() = Some(for_driver.clone());
     to_driver(driver_sock, &ToDriver::HeadsetConnected(for_driver));
     let mut status = shared.status.lock().unwrap();
