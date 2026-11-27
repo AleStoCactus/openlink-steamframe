@@ -77,6 +77,7 @@ pub mod prop {
     pub const CurrentUniverseId_Uint64: i32 = 2004;
     pub const IsOnDesktop_Bool: i32 = 2007;
     pub const DriverDirectModeSendsVsyncEvents_Bool: i32 = 2043;
+    pub const Hmd_SupportsAppThrottling_Bool: i32 = 2106;
     pub const GraphicsAdapterLuid_Uint64: i32 = 2045;
     pub const DisplayAvailableFrameRates_Float_Array: i32 = 2080;
     pub const DisplaySupportsMultipleFramerates_Bool: i32 = 2081;
@@ -352,6 +353,11 @@ pub struct DmabufAttributes_t {
     pub unPlaneCount: u32,
     pub plane: [DmabufPlane_t; MaxDmabufPlaneCount],
 }
+
+/// `DriverDirectMode_FrameTiming::m_nReprojectionFlags`: additional predicted frames (bits 4-7)
+/// and throttled frames (bits 8-11), as the driver applies them.
+pub const VRCompositor_PredictionMask: u32 = 0xF0;
+pub const VRCompositor_ThrottleMask: u32 = 0xF00;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

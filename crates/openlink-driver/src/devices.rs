@@ -122,6 +122,10 @@ unsafe extern "C" fn hmd_activate(_this: *mut c_void, id: u32) -> EVRInitError {
         h.set_u64(c, prop::CurrentUniverseId_Uint64, 0x4F4C_4E4B); // "OLNK"
         h.set_bool(c, prop::IsOnDesktop_Bool, false);
         h.set_bool(c, prop::DriverDirectModeSendsVsyncEvents_Bool, use_direct_mode());
+        // Per-application "Throttling Behavior" in SteamVR's video settings (frame rate and
+        // additional prediction), as a native headset and Steam Link offer: SteamVR only shows
+        // it for headsets that say they support it, and hands the choice to `PostPresent`.
+        h.set_bool(c, prop::Hmd_SupportsAppThrottling_Bool, use_direct_mode());
         h.set_bool(c, prop::DeviceIsWireless_Bool, true);
         h.set_bool(c, prop::DeviceProvidesBatteryStatus_Bool, true);
         // Windows: SteamVR renders on the adapter the HMD names. Ours is the one the swap
