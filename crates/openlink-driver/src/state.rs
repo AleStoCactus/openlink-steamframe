@@ -146,6 +146,8 @@ pub struct ControllerHandles {
     pub grip_touch: VRInputComponentHandle_t,
     pub thumbrest_touch: VRInputComponentHandle_t,
     pub haptic: VRInputComponentHandle_t,
+    /// False while the controller rests untouched, which SteamVR shows as standby.
+    pub proximity: VRInputComponentHandle_t,
 }
 
 pub struct ControllerSlot {
@@ -161,7 +163,8 @@ pub struct Shared {
     pub startup_display: DisplayConfig,
     /// A SteamVR restart was requested for a headset whose display differs from the startup one.
     pub restart_requested: std::sync::atomic::AtomicBool,
-    pub controller_model: Mutex<ControllerModel>,
+    /// Per hand (left, right): what the controllers are shown as.
+    pub controller_model: Mutex<[ControllerModel; 2]>,
     pub prediction: PredictionConfig,
     /// The headset display's measured frame period, once known (0 until then): the vsync we
     /// give SteamVR runs at exactly this rate, not the nominal refresh rate.
@@ -184,13 +187,14 @@ pub fn shared() -> &'static Shared {
             Some(info) => DisplayConfig::from_headset(&info),
             None => DisplayConfig::default(),
         };
+        let controller_model = ControllerModel::from_headset_model(&display.model);
         Shared {
             startup_display: display.clone(),
             restart_requested: std::sync::atomic::AtomicBool::new(false),
             hmd_id: AtomicU32::new(k_unTrackedDeviceIndexInvalid),
             controllers: [slot(), slot()],
             display: Mutex::new(display),
-            controller_model: Mutex::new(ControllerModel::QuestPlus),
+            controller_model: Mutex::new([controller_model; 2]),
             prediction: PredictionConfig::default(),
             vsync_period_ns: std::sync::atomic::AtomicI64::new(0),
             photon_latency_us: AtomicU32::new(0),

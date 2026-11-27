@@ -4,16 +4,20 @@ PC VR streaming for standalone headsets that behaves like a native SteamVR heads
 
 ## Why
 
-Streaming SteamVR to a standalone headset today means compromises. Steam Link is closed source
-and does not work reliably on Linux, Virtual Desktop is Windows-only, and ALVR and similar
-streamers predict controllers on the headset, so fast swings overshoot and snap back.
+Streaming SteamVR to a standalone headset today means compromises.
+Oculus (Meta Quest) Link has the worst encoding performance your GPU will ever see.
+Steam Link is closed source and pretty broken, with issues that have existed since forever.
+Virtual Desktop is Windows-only and predicts controllers on the headset, which is bad for Beat Saber.
+ALVR works situationally and it's just a pain to deal with.
+
 OpenLink aims for:
 
-- **Tracking that feels like Link or Lighthouse:** the headset samples poses at "now" and SteamVR
-  does the predicting, as it does for Index controllers. No floppy sabers.
+- **Cross-platform:** Windows and Linux are equal targets
+- **SteamVR predictions:** the headset samples poses at "now" and SteamVR
+  does the predicting, as it does for Index controllers. No floppy sabers!
 - **A real SteamVR headset:** the driver sits in SteamVR's direct mode, so games, the dashboard
-  and overlays behave as on a wired headset.
-- **Zero-copy hardware encoding** on every GPU vendor, with **Linux and Windows** as equal targets.
+  and overlays behave as on a native SteamVR headset.
+- **Super high performance zero-copy hardware encoding** on every GPU vendor.
 - **Open source** (GPL-3.0): a new codebase, not derived from ALVR.
 
 ## Status
@@ -48,8 +52,8 @@ headset-side rows only differ where the PC side does.
 | Quest GUI | 📋 Planned | 📋 Planned |
 | AMD GPU support | ✅ Done (RX 6800) | ✅ Done (RADV, RX 6000+) |
 | NVIDIA GPU support | ❔ Untested | ❔ Untested |
-| Battery status in SteamVR | 📋 Planned | 📋 Planned |
-| Correct headset model in SteamVR and games | 📋 Planned | 📋 Planned |
+| Battery status in SteamVR | 🟡 Headset works; Quest controllers' charge is not available to apps | 🟡 Headset works; Quest controllers' charge is not available to apps |
+| Correct headset model in SteamVR and games | ✅ Done | ✅ Done |
 | Quest app requests the correct refresh rate | 🟡 Server side works; the Quest app does not request the rate correctly | 🟡 Server side works; the Quest app does not request the rate correctly |
 | Statistics screen | 📋 Planned | 📋 Planned |
 
@@ -85,9 +89,16 @@ What the rows mean:
   verified on both systems (on Linux also an RX 9070 XT); NVIDIA and Intel are not tested yet.
   On Linux with a second GPU (an integrated one, say) the driver uses the one SteamVR's
   compositor renders on; `OPENLINK_RENDER_NODE=/dev/dri/renderDN` overrides it.
-- **Headset model:** SteamVR shows a generic OpenLink HMD instead of the real headset (e.g.
-  Quest 3), which some games use to pick controller models and bindings.
-- **Battery status:** the headset's and both controllers' charge in the SteamVR dashboard.
+- **Headset model:** the headset and controllers are named as Meta's own driver (Link) names
+  them, with the Quest status icons, so SteamVR and games see e.g. a Meta Quest 3 with Touch
+  Plus controllers. The controllers are the ones actually in use (Touch, Touch Plus or Touch
+  Pro, from the OpenXR interaction profile), not guessed from the headset.
+- **Battery status:** the headset's and both controllers' charge in the SteamVR dashboard (and
+  the desktop app), sent every 5 s. The headset's comes from Android's `BatteryManager`; the
+  controllers' only from runtimes with `XR_EXT_interaction_profile_battery_state_display`, and
+  without it they show no battery rather than a wrong one. Meta's runtime does not offer that
+  extension, and the system service that knows the controllers' charge refuses other apps, so
+  on a Quest only the headset's battery shows until Meta adds it.
 - **Refresh rate:** 72 to 120 Hz, plus 144, 165, 207 and 240 Hz on a Quest 3 (Horizon OS v2.7
   or later; 240 Hz only in developer mode with display scaling on). The Quest runtime does not
   list the higher rates but accepts them when asked; the stream uses the closest rate the

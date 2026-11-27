@@ -3,8 +3,8 @@
 
 use openlink_client::TrackingSource;
 use openlink_protocol::{
-    buttons, ControllerInput, ControllerState, HapticPulse, HeadsetInfo, Motion, MotionFlags, Pose,
-    TrackingSample,
+    buttons, Batteries, BatteryState, ControllerInput, ControllerModel, ControllerState, HapticPulse, HeadsetInfo, Motion,
+    MotionFlags, Pose, TrackingSample,
 };
 use openxr as xr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -86,6 +86,21 @@ impl Actions {
         // Only the left controller has a bindable menu button (the right one is the system button).
         b.push(xr::Binding::new(&a.menu_click, p("/user/hand/left/input/menu/click")?));
         instance.suggest_interaction_profile_bindings(p("/interaction_profiles/oculus/touch_controller")?, &b)?;
+        // The same bindings for Touch Plus and Touch Pro (both profiles have every path above),
+        // so the runtime binds the profile of the controllers actually in use and
+        // `XrTracking::controllers` can tell them apart; with the plain Touch profile alone it
+        // reports that one for every generation.
+        let exts = instance.exts();
+        for (have, profile) in [
+            (exts.meta_touch_controller_plus.is_some(), "/interaction_profiles/meta/touch_controller_plus"),
+            (exts.fb_touch_controller_pro.is_some(), "/interaction_profiles/facebook/touch_controller_pro"),
+        ] {
+            if have {
+                if let Err(e) = instance.suggest_interaction_profile_bindings(p(profile)?, &b) {
+                    log::warn!("cannot bind {profile}: {e}");
+                }
+            }
+        }
         Ok(a)
     }
 }
@@ -109,6 +124,9 @@ pub struct XrTracking {
     pub last_hmd: Option<Motion>,
     /// Head samples OpenXR could not locate since the last log, and when that was.
     pub lost_hmd: (u32, Option<std::time::Instant>),
+    /// Reads the headset's own battery, which OpenXR does not report (on a Quest through JNI);
+    /// `None` where the app has no way to read it.
+    pub headset_battery: Option<Box<dyn Fn() -> Option<BatteryState> + Send>>,
 }
 
 impl XrTracking {
@@ -225,6 +243,23 @@ impl TrackingSource for XrTracking {
             hmd,
             controllers: [self.controller(0, t), self.controller(1, t)],
         }
+    }
+
+    fn controllers(&mut self) -> Option<[Option<ControllerModel>; 2]> {
+        Some([0, 1].map(|hand| {
+            let profile = self.session.current_interaction_profile(self.actions.hands[hand]).ok()?;
+            if profile == xr::Path::NULL {
+                return None;
+            }
+            let name = self.instance.path_to_string(profile).ok()?;
+            ControllerModel::from_interaction_profile(&name, &self.info.model)
+        }))
+    }
+
+    fn battery(&mut self) -> Option<Batteries> {
+        let controllers =
+            [0, 1].map(|hand| crate::battery::controller(&self.instance, &self.session, self.actions.hands[hand]));
+        Some(Batteries { hmd: self.headset_battery.as_ref().and_then(|read| read()), controllers })
     }
 
     fn haptics(&mut self, p: HapticPulse) {

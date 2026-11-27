@@ -79,6 +79,14 @@ pub mod prop {
     pub const GraphicsAdapterLuid_Uint64: i32 = 2045;
     pub const ControllerRoleHint_Int32: i32 = 3007;
     pub const ControllerType_String: i32 = 7000;
+    pub const NamedIconPathDeviceOff_String: i32 = 5001;
+    pub const NamedIconPathDeviceSearching_String: i32 = 5002;
+    pub const NamedIconPathDeviceSearchingAlert_String: i32 = 5003;
+    pub const NamedIconPathDeviceReady_String: i32 = 5004;
+    pub const NamedIconPathDeviceReadyAlert_String: i32 = 5005;
+    pub const NamedIconPathDeviceNotReady_String: i32 = 5006;
+    pub const NamedIconPathDeviceStandby_String: i32 = 5007;
+    pub const NamedIconPathDeviceAlertLow_String: i32 = 5008;
 }
 
 pub const IServerTrackedDeviceProvider_Version: &[u8] = b"IServerTrackedDeviceProvider_004\0";

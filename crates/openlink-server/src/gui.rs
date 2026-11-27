@@ -128,6 +128,11 @@ impl App {
                         h.tracking_hz, h.sample_age_ms
                     ));
                     ui.end_row();
+                    if let Some(b) = &h.battery {
+                        ui.label("Battery");
+                        ui.label(battery_text(b));
+                        ui.end_row();
+                    }
                     ui.label("Video");
                     let (pw, ph) = h.info.panel_size();
                     let (rw, rh) = h.info.render_size((h.stream.eye_width, h.stream.eye_height));
@@ -438,4 +443,17 @@ fn codec_label(c: CodecPreference) -> &'static str {
         CodecPreference::Fixed(Codec::H265) => "HEVC (H.265)",
         CodecPreference::Fixed(Codec::H264) => "H.264",
     }
+}
+
+/// "headset 80% (charging), left 60%, right –".
+fn battery_text(b: &openlink_protocol::Batteries) -> String {
+    let one = |name: &str, s: &Option<openlink_protocol::BatteryState>| match s {
+        Some(s) => format!(
+            "{name} {:.0}%{}",
+            s.level * 100.0,
+            if s.charging { " (charging)" } else { "" }
+        ),
+        None => format!("{name} –"),
+    };
+    [one("headset", &b.hmd), one("left", &b.controllers[0]), one("right", &b.controllers[1])].join(", ")
 }

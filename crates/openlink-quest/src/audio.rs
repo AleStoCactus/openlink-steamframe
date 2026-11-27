@@ -64,7 +64,7 @@ pub fn microphone_allowed(app: &AndroidApp) -> bool {
     .unwrap_or(false)
 }
 
-fn with_activity<T>(
+pub(crate) fn with_activity<T>(
     app: &AndroidApp,
     f: impl FnOnce(&mut jni::Env, &JObject) -> jni::errors::Result<T>,
 ) -> jni::errors::Result<T> {

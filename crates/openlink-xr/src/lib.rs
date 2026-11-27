@@ -5,6 +5,7 @@
 //! Nothing here depends on the graphics API; each app brings its own swapchains and renderer.
 #![cfg(any(target_os = "android", target_os = "linux"))]
 
+pub mod battery;
 pub mod tracking;
 
 use glam::{Quat, Vec3};

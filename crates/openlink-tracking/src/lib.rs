@@ -21,6 +21,7 @@
 //! reprojecting each frame from the pose it was rendered with to the actual display pose.
 
 use glam::{DQuat, DVec3, EulerRot};
+pub use openlink_protocol::ControllerModel;
 use openlink_protocol::{Hand, Motion, MotionFlags};
 
 /// A rigid transform.
@@ -171,43 +172,6 @@ pub fn to_driver_pose(
     }
 }
 
-/// SteamVR controller model a headset's controllers should appear as.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControllerModel {
-    /// Quest 2 Touch.
-    Quest2,
-    /// Quest 3 / 3S Touch Plus.
-    QuestPlus,
-    /// Touch Pro.
-    QuestPro,
-}
-
-impl ControllerModel {
-    pub fn render_model(self, hand: Hand) -> &'static str {
-        match (self, hand) {
-            (Self::Quest2, Hand::Left) => "oculus_quest2_controller_left",
-            (Self::Quest2, Hand::Right) => "oculus_quest2_controller_right",
-            (Self::QuestPlus, Hand::Left) => "oculus_quest_plus_controller_left",
-            (Self::QuestPlus, Hand::Right) => "oculus_quest_plus_controller_right",
-            (Self::QuestPro, Hand::Left) => "oculus_quest_pro_controller_left",
-            (Self::QuestPro, Hand::Right) => "oculus_quest_pro_controller_right",
-        }
-    }
-
-    pub fn from_headset_model(model: &str) -> Self {
-        let m = model.to_ascii_lowercase();
-        if m.contains("pro") {
-            Self::QuestPro
-        } else if m.contains("quest 3") || m.contains("quest3") || m.contains("steam frame") {
-            // The Steam Frame's controllers reach the PC as Touch (SteamVR on the headset maps
-            // them); the current Touch Plus model is the closest match.
-            Self::QuestPlus
-        } else {
-            Self::Quest2
-        }
-    }
-}
-
 /// Transform from the OpenXR grip pose to the controller's SteamVR "raw" pose.
 ///
 /// We report controllers as `oculus_touch` devices so every game's existing Touch bindings and
@@ -244,14 +208,6 @@ mod tests {
             angular_velocity: w,
             flags: MotionFlags::ALL,
         }
-    }
-
-    #[test]
-    fn controller_models_follow_the_headset() {
-        assert_eq!(ControllerModel::from_headset_model("Meta Quest Pro"), ControllerModel::QuestPro);
-        assert_eq!(ControllerModel::from_headset_model("Meta Quest 3S"), ControllerModel::QuestPlus);
-        assert_eq!(ControllerModel::from_headset_model("Steam Frame"), ControllerModel::QuestPlus);
-        assert_eq!(ControllerModel::from_headset_model("Oculus Quest2"), ControllerModel::Quest2);
     }
 
     #[test]

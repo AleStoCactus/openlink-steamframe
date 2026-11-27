@@ -49,6 +49,14 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
     exts.fb_display_refresh_rate = available.fb_display_refresh_rate;
     exts.ext_performance_settings = available.ext_performance_settings;
     exts.fb_composition_layer_settings = available.fb_composition_layer_settings;
+    exts.ext_interaction_profile_battery_state_display = available.ext_interaction_profile_battery_state_display;
+    // Interaction profiles that tell Touch Plus and Touch Pro apart from Quest 2 Touch.
+    exts.meta_touch_controller_plus = available.meta_touch_controller_plus;
+    exts.fb_touch_controller_pro = available.fb_touch_controller_pro;
+    log::info!(
+        "controller battery: {}",
+        if available.ext_interaction_profile_battery_state_display { "reported" } else { "not available from this runtime" }
+    );
     let instance = entry
         .create_instance(
             &xr::ApplicationInfo {
@@ -246,6 +254,10 @@ pub fn run(app: &AndroidApp) -> Result<(), String> {
                         info,
                         last_hmd: None,
                         lost_hmd: (0, None),
+                        headset_battery: Some(Box::new({
+                            let app = app.clone();
+                            move || crate::battery::headset(&app)
+                        })),
                     };
                     start_client(app.clone(), tracking, output.clone(), client.clone(), stop.clone());
                 }

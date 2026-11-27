@@ -277,6 +277,7 @@ pub fn run(options: Options) -> Result<(), String> {
                         info,
                         last_hmd: None,
                         lost_hmd: (0, None),
+                        headset_battery: None,
                     };
                     start_client(tracking, options.server, output.clone(), client.clone(), stop.clone());
                 }
