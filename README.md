@@ -100,11 +100,13 @@ Known issue (Linux Only): SteamVR's own scene (the SteamVR void, or the dashboar
 with head motion, while games are smooth.
 
 Already working on both systems: tracking (head and controllers, predicted by SteamVR),
-buttons, haptics, the SteamVR dashboard and overlays, and foveated encoding. The encoded
-resolution is set in percent of the headset's panel (Quest 3 at 100%: 2064×2208 per eye);
-SteamVR's 100% is that size enlarged for the lens, like a native headset's, and its render
-resolution setting scales from there. On Windows, check SteamVR's render resolution if the
-picture looks softer than on Linux.
+buttons, haptics, the SteamVR dashboard and overlays, and foveated encoding. SteamVR's 100%
+is the panel enlarged for the lens, like a native headset's (Quest 3: 3172×3428 per eye), and
+the stream's "Center resolution" is relative to it: at 100% the center of view is streamed
+1:1, as sharp as the lens shows it, while foveation squeezes the edges (default 25%: a
+1746×1886 picture per eye, smaller than the panel). SteamVR's render resolution setting
+supersamples on top. On Windows, check SteamVR's render resolution if the picture looks softer
+than on Linux.
 
 After 1.0.0: H.264 and AV1 encoding, and automatic detection of the refresh rates and
 resolutions the headset supports. A Steam Frame or Pico client is not planned.

@@ -560,19 +560,20 @@ fn system_property(name: &str) -> Option<String> {
 }
 
 /// How the Quest compositor filters our eye images onto the display
-/// (`XR_FB_composition_layer_settings`). They are encoded at about the panel's size, and the lens
-/// shows the center of view at about 1.5x the panel's density, so the compositor enlarges them
-/// there: plain bilinear looks soft next to Virtual Desktop and Steam Link, which both turn on its
-/// sharpening. Quality sharpening by default; `adb shell setprop debug.openlink.layer_filter`
-/// `none`, `sharpen` (normal), `supersample` or `quality-supersample` to compare, live.
+/// (`XR_FB_composition_layer_settings`). Plainly by default: the eye images carry the centre of
+/// view at the lens's density (`HeadsetInfo::encoded_size`), so there is nothing to sharpen, and
+/// the compositor's quality sharpening drew halos around text (Beat Saber's). It was the default
+/// while the stream was panel-sized and the compositor enlarged it 1.5x. `adb shell setprop
+/// debug.openlink.layer_filter` `sharpen` (normal), `quality-sharpen`, `supersample` or
+/// `quality-supersample` to compare, live.
 fn layer_filter() -> xr::sys::CompositionLayerSettingsFlagsFB {
     use xr::sys::CompositionLayerSettingsFlagsFB as F;
     match system_property("debug.openlink.layer_filter").as_deref() {
-        Some("none") => F::EMPTY,
         Some("sharpen") => F::NORMAL_SHARPENING,
+        Some("quality-sharpen") => F::QUALITY_SHARPENING,
         Some("supersample") => F::NORMAL_SUPER_SAMPLING,
         Some("quality-supersample") => F::QUALITY_SUPER_SAMPLING,
-        _ => F::QUALITY_SHARPENING,
+        _ => F::EMPTY,
     }
 }
 
